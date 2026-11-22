@@ -2,6 +2,30 @@
 title: Changelog
 description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.4.
 ---
+## Unreleased
+
+An application WebSocket close now reaches a peer that is still sending, and
+the release smoke gate's 32 MiB check is stable. No configuration, data, or
+bucket-format changes.
+
+- **A loud WebSocket close survives a peer that is still sending** (#120). When the
+  edge closed a socket after writing its own 1009 (a message past the 32 MiB
+  cap) or 1011 (a flooded pipe) while the peer's bytes sat unread in the
+  receive buffer, dropping the transport made Linux answer with RST instead of
+  FIN, and an RST can discard data the peer has not read yet -- including the
+  close frame. A real client then saw an unclean 1006 or `ECONNRESET` instead
+  of the close the edge sent; `check 4` of the release smoke gate failed this
+  way in about 3 of 20 runs, and so did v0.2.3. Every path that drops a
+  WebSocket transport after a close frame -- the loud 1009 and 1011, a cell's
+  own close, and the echo of a peer's close -- now flushes the final frame,
+  half-closes the write side (`shutdown(Write)`), and reads and discards what
+  the peer still sends until EOF or a 2 s / 4 MiB bound, so the peer reads
+  the close frame and then a clean EOF. The drain runs after the pump rather
+  than in it, is bounded in time and bytes, discards each byte instead of
+  buffering it, and never delays the close dispatch by more than the bound.
+  The smoke client also no longer fails on the `EPIPE` that its own refused
+  oversize write expects, while an `ECONNRESET` stays fatal.
+
 ## v0.2.4
 
 A `TransformStream` now applies backpressure, a `tee()` bounds the skew
