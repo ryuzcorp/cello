@@ -34,6 +34,16 @@ function _readResult(value, done) {
   return r;
 }
 
+// A byte read settles one microtask after the stream produced the value,
+// exactly like the default reader's: workerd's native binding converts the
+// read result through an extra promise hop, so the pull that fulfilled the
+// read can run its follow-up before the awaiting read resumes. This module
+// is a separate prelude file, so the helper is repeated rather than
+// imported (see `_readSettled` in streams.js).
+function _readSettled(promise) {
+  return promise.then((result) => result);
+}
+
 class ReadableStreamBYOBRequest {
   constructor(brand, controller, view) {
     if (brand !== _brand)
@@ -502,14 +512,14 @@ class ByteDefaultReader extends ReadableStreamDefaultReader {
   read() {
     const s = this._s;
     if (s._reader !== this)
-      return Promise.reject(new TypeError(RELEASED));
+      return _readSettled(Promise.reject(new TypeError(RELEASED)));
     s._disturbed = true;
-    if (s._errored) return Promise.reject(s._error);
+    if (s._errored) return _readSettled(Promise.reject(s._error));
     const c = s._byteCtl;
     if (c._queueTotalSize > 0)
-      return Promise.resolve(_readResult(c._drain(), false));
+      return _readSettled(Promise.resolve(_readResult(c._drain(), false)));
     if (s._closed)
-      return Promise.resolve(_readResult(undefined, true));
+      return _readSettled(Promise.resolve(_readResult(undefined, true)));
     const p = new Promise((resolve, reject) =>
       s._readRequests.push({ resolve, reject }));
     const auto = c._autoAlloc;
@@ -527,7 +537,7 @@ class ByteDefaultReader extends ReadableStreamDefaultReader {
         req: null,
       });
     c._pull();
-    return p;
+    return _readSettled(p);
   }
 }
 
@@ -553,23 +563,23 @@ class ReadableStreamBYOBReader {
 
   read(view, options) {
     if (this._released)
-      return Promise.reject(new TypeError(RELEASED));
+      return _readSettled(Promise.reject(new TypeError(RELEASED)));
     if (!ArrayBuffer.isView(view) || view.byteLength === 0 ||
         view.buffer.byteLength === 0)
-      return Promise.reject(new TypeError(
-        'read() requires a non-empty ArrayBufferView'));
+      return _readSettled(Promise.reject(new TypeError(
+        'read() requires a non-empty ArrayBufferView')));
     let min = 1;
     if (options !== undefined && options !== null &&
         options.min !== undefined) {
       min = Number(options.min);
       const elements = view.length ?? view.byteLength; // DataView
       if (!Number.isInteger(min) || min < 1 || min > elements)
-        return Promise.reject(new TypeError('invalid min'));
+        return _readSettled(Promise.reject(new TypeError('invalid min')));
     }
     const s = this._s;
     s._disturbed = true;
-    if (s._errored) return Promise.reject(s._error);
-    return this._c._pullInto(view, min);
+    if (s._errored) return _readSettled(Promise.reject(s._error));
+    return _readSettled(this._c._pullInto(view, min));
   }
 
   // Workerd extension: resolve only once at least `min` bytes are in

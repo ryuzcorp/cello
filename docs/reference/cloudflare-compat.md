@@ -242,10 +242,11 @@ The `tail` and `email` handlers are unavailable.
   text: `pull()` is called when a read request is registered and again while
   an `enqueue` leaves the desired size positive, but not after a `read()`
   dequeues an already-buffered chunk (the spec's `[[PullSteps]]` pulls
-  there too; V8 does, Workerd does not). `read()` resolves one microtask
-  later than a plain JS promise, as Workerd's native binding does, so a
-  pull that fulfils a pending read and its follow-up pull both run before
-  the awaiting `read()` resumes. A source that prefetches, charges quota, or
+  there too; V8 does, Workerd does not). Every `read()` -- a default reader,
+  a byte stream's default reader, or a BYOB reader -- resolves one microtask
+  later than a plain JS promise, as Workerd's native binding does, so a pull
+  that fulfils a pending read and its follow-up pull both run before the
+  awaiting `read()` resumes. A source that prefetches, charges quota, or
   advances a cursor in `pull` therefore sees the same pull count per read as
   on Workerd.
 - `tee()` cancels its source with the cancellation reason of the branch

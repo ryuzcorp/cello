@@ -7,6 +7,7 @@ export const cases = [
   { name: "readable-basics", fixture: "streams", path: "/readable-basics" },
   { name: "readable-pull-order", fixture: "streams", path: "/readable-pull-order" },
   { name: "readable-byob", fixture: "streams", path: "/readable-byob" },
+  { name: "byte-read-order", fixture: "streams", path: "/byte-read-order" },
   { name: "writable-order", fixture: "streams", path: "/writable-order" },
   { name: "transform-error", fixture: "streams", path: "/transform-error" },
   { name: "gzip-large", fixture: "streams", path: "/gzip-large" },
