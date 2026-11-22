@@ -54,6 +54,14 @@ function _readResult(value, done) {
   return r;
 }
 
+// A read settles one microtask after the stream produced the value, as
+// every reader's does: workerd's native binding converts the read result
+// through an extra promise hop (see `_readSettled` in streams.js). This
+// module is a separate prelude file, so the helper is repeated.
+function _readSettled(promise) {
+  return promise.then((result) => result);
+}
+
 // The pipe itself: at most one unconsumed write and one pending read.
 // Implements the `_pullInto` surface ReadableStreamBYOBReader drives
 // (see byte_streams.js), so the global BYOB reader works on the
@@ -274,9 +282,9 @@ class InternalDefaultReader extends ReadableStreamDefaultReader {
 
   read() {
     if (this._released)
-      return Promise.reject(new TypeError(RELEASED));
+      return _readSettled(Promise.reject(new TypeError(RELEASED)));
     this._s._disturbed = true;
-    return this._c._read();
+    return _readSettled(this._c._read());
   }
 
   cancel(reason) {
