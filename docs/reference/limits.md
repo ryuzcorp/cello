@@ -92,6 +92,78 @@ services, APIs, and Wrangler configuration.
   `RangeError`. A stream stops counting once it finishes, is cancelled or
   aborted, errors, or is garbage-collected after it becomes unreachable.
 
+## Cap memory per isolate
+
+- An isolate holds at most `CELLO_V8_EXTERNAL_LIMIT_MB` of `ArrayBuffer`
+  memory: four times its V8 heap limit by default, 512 MiB with the default
+  128 MiB heap. The budget covers the backing stores V8 allocates through the
+  isolate's allocator — plain `ArrayBuffer`s and typed arrays,
+  `SharedArrayBuffer`s without `maxByteLength`, every `structuredClone` of
+  one, and the buffers the host hands to JavaScript (response bodies,
+  WebSocket messages, RPC arguments, `/tmp` reads, D1 blobs).
+- **A resizable `ArrayBuffer`, a growable `SharedArrayBuffer` and
+  `WebAssembly.Memory` are not capped by this budget.** V8 backs them with
+  the platform page allocator, which is outside every embedder hook: no
+  allocator can refuse their construction or a `resize`/`grow`, and wasm
+  memory is not even counted as external memory. They count against nothing
+  here, and crossing the cap with them does not condemn the isolate. Each is
+  still bounded on its own: `--wasm-max-mem-pages` fails every `grow` past the
+  isolate's whole budget in pages (8192 pages of 64 KiB, 512 MiB, by default),
+  including a grow performed by wasm code; a declared `maximum` above that is
+  accepted and simply cannot be reached. A resizable or growable buffer is
+  limited only by V8's own `maxByteLength` range and the node's
+  `CELLO_MAX_RSS_MB` pressure shedding.
+  What bounds the *number* of such buffers is the same node pressure
+  shedding, so do not rely on this budget against a Worker that loops
+  `new ArrayBuffer(8 << 10, { maxByteLength: 1 << 30 })`. V8 does count a
+  resized `ArrayBuffer` in `external_memory` (measured: +32 MiB; a growable
+  `SharedArrayBuffer` and a wasm memory are not counted at all), so V8's own
+  heap heuristics — including the heap limit's condemnation — can still react
+  to one; the budget is not what reacts. A page-allocator hook in the V8
+  binding is the change that would cover them; until then the gap is stated
+  here rather than claimed.
+- Past the cap an allocator-backed allocation is refused, and the failure
+  reaches the guest as a `RangeError` whose message is V8's
+  `Array buffer allocation failed`. A refused host store throws
+  `Array buffer allocation failed: the isolate's ArrayBuffer memory budget is
+  exhausted (..., see CELLO_V8_EXTERNAL_LIMIT_MB); free buffers before
+  allocating more`. A `structuredClone` of a plain buffer that the allocator
+  refuses fails inside V8's deserializer with `Unable to deserialize cloned
+  data`.
+- A refusal condemns the isolate the way a heap-limit hit does: it takes on
+  no new hibernatable socket and no new SQL result set materializes, and it
+  serves again once a collection finds both the heap and the budget under 75
+  percent of their limits. Two kinds of refusal count as evidence: a refused
+  host store (a response body, a WebSocket message, a `/tmp` read, a D1
+  blob), and a plain allocation larger than the whole budget, which no
+  collection can make room for. A smaller allocation that V8 collects and
+  retries successfully never reaches the guest, so it does not count. A turn
+  that begins with retained buffers over 75 percent of the budget is
+  condemned too, after a rate-limited collection — so an isolate that merely
+  asked for more than was free once, and dropped it, is not condemned. The
+  isolate is not retired for memory it holds: the cell keeps serving on it at
+  reduced admission, exactly as it does after a heap-limit hit.
+- A refused host store is never presented as a partial value. A stream chunk
+  that does not fit rejects the `read()` promise with the budget's
+  `RangeError`; a host buffer for a synchronous host call throws at that
+  call; a row whose BLOB does not fit throws one `RangeError` and its SQL
+  cursor is closed, so the refused statement is not retained on the cell's
+  connection.
+- Bytes come back when the collector frees the object: V8 frees a backing
+  store through the allocator's `free`, which returns the bytes to the
+  budget. Churn is therefore never refused — an allocate-and-drop loop is
+  answered by a collection and a retry — however much it allocates in total.
+- The limit covers the whole isolate, not one request. A `tee()` chain, a
+  clone, a WebSocket message and a `.arrayBuffer()` call share it, so a
+  handler that holds several 32 MiB payloads at once can reach it while
+  every payload on its own is well under it. An isolate at the limit cannot
+  allocate at all, including the buffer a response body is built from; free
+  what you no longer need before you allocate more.
+- The budget is per isolate, not per node: `CELLO_MAX_CELLS_PER_ISOLATE`
+  cells share one, and a node runs as many isolates as its pools allow. Size
+  it against `CELLO_MAX_RSS_MB` and the isolate count, not against the
+  fleet's memory.
+
 ## Run on Linux or Apple Silicon
 
 The installer supplies binaries for Linux x86-64, Linux ARM64, and Apple
