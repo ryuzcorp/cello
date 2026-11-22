@@ -43,6 +43,33 @@ checks.
   `CELLO_ESBUILD=/path/to/real/esbuild cargo test --profile release`.
   The Docker test stage needs no knob: it installs the real esbuild at
   `/usr/local/bin/esbuild`.
+- Long stream timelines are tested in **virtual time**, not wall time.
+  `crates/cello/tests/virtual_clock_conformance.rs` runs the real driver
+  in-process on a Tokio runtime built with `start_paused(true)`, so a
+  five-minute SSE that must outlive the 30-second background budget, a
+  60-second idle body, and a stalled `TransformStream` producer finish in
+  milliseconds, reproducibly. Run a scenario with
+  `cargo test -p cello --test virtual_clock_conformance <name>`.
+  - Every request deadline reads one clock, `asyncrt::mono_now` (a
+    `tokio::time::Instant`), or a Tokio timer: handler and background
+    budgets, response-stream idle expiry, JS timers. Never add
+    `std::time::Instant` to one of those: a paused clock does not move it.
+    Some timers are deliberately wall-clock and stay on `std`: the SQL
+    statement deadline (`storage.rs`), the egress DNS TTL
+    (`egress.rs`), the cache-prune and handoff windows in
+    `main.rs`, and the CPU watchdog's per-thread CPU sampler. A virtual
+    clock must not stretch or compress those.
+  - Each scenario asserts its own wall time (under one second), which is
+    the guard against a deadline drifting back onto the real clock.
+  - Perturbations are seeded. The tee property in the same file draws
+    chunk sizes and drain orders from proptest and prints the seed and
+    minimal input on failure. The recorded failing case also has its own
+    fixed test, because seeds are random: replay it there.
+  - A driven request must be awaited to retire (`retire` in that file), not
+    dropped: a detached drive keeps polling its isolate, and its timers,
+    into the next scenario.
+  - A new stream scenario belongs there when it needs minutes of clock,
+    a deterministic interleaving, or a fail-before against a timing bug.
 
 ## What to change where
 
