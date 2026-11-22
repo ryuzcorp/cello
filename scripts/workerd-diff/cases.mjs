@@ -1,0 +1,36 @@
+// The gate: every case here must produce the same transcript on workerd and
+// on cello. A divergence is filed as an issue and its case removed until it
+// passes; there are no expected-diff allowlists. `requests` is the scripted
+// sequence, `body` an array of chunks sent as a chunked upload.
+
+export const cases = [
+  { name: "readable-basics", fixture: "streams", path: "/readable-basics" },
+  { name: "readable-byob", fixture: "streams", path: "/readable-byob" },
+  { name: "writable-order", fixture: "streams", path: "/writable-order" },
+  { name: "transform-error", fixture: "streams", path: "/transform-error" },
+  { name: "gzip-large", fixture: "streams", path: "/gzip-large" },
+  { name: "writable-backpressure", fixture: "streams", path: "/writable-backpressure" },
+  { name: "tee-basic", fixture: "streams", path: "/tee-basic" },
+  { name: "tee-of-tee", fixture: "streams", path: "/tee-of-tee" },
+  { name: "tee-a-then-b", fixture: "streams", path: "/tee-a-then-b" },
+  { name: "tee-cancel-branch", fixture: "streams", path: "/tee-cancel-branch" },
+  { name: "clone-both", fixture: "streams", path: "/clone-both" },
+  { name: "transform-order", fixture: "streams", path: "/transform-order" },
+  { name: "transform-backpressure", fixture: "streams", path: "/transform-backpressure" },
+  { name: "identity-transform", fixture: "streams", path: "/identity-transform" },
+  { name: "fixed-length", fixture: "streams", path: "/fixed-length" },
+  { name: "gzip-roundtrip", fixture: "streams", path: "/gzip-roundtrip" },
+  { name: "deflate-roundtrip", fixture: "streams", path: "/deflate-roundtrip" },
+  { name: "text-encoder-stream", fixture: "streams", path: "/text-encoder-stream" },
+  { name: "text-decoder-stream", fixture: "streams", path: "/text-decoder-stream" },
+  { name: "pipe-to-abort", fixture: "streams", path: "/pipe-to-abort" },
+  { name: "pipe-through-chain", fixture: "streams", path: "/pipe-through-chain" },
+  { name: "pipe-to-error", fixture: "streams", path: "/pipe-to-error" },
+  { name: "sse", fixture: "streams", path: "/sse" },
+  { name: "error-in-stream", fixture: "streams", path: "/error-in-stream" },
+  {
+    name: "streamed-request-body",
+    fixture: "streams",
+    requests: [{ method: "POST", path: "/streamed-request-body", body: ["alpha", "be", "ta"] }],
+  },
+];
