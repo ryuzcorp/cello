@@ -99,4 +99,9 @@ nix.workspace = true
 [dev-dependencies]
 futures = "0.3"
 lz4_flex.workspace = true
+proptest.workspace = true
 rustls-pemfile = "2.2"
+# `test-util` makes `tokio::time::Instant::now()` follow `time::pause()`, so
+# the in-process conformance tests can drive long stream timelines in virtual
+# time. It is a dev-only feature: the shipped binary never pauses its clock.
+tokio = { workspace = true, features = ["test-util"] }

@@ -3723,11 +3723,11 @@ pub struct InFlight {
     unrefed_ops: std::collections::HashSet<u64>,
     /// The alarm bookkeeping this entry still owes, if it is one.
     alarm: Option<AlarmClaim>,
-    started: Instant,
+    started: tokio::time::Instant,
     /// When the post-response background phase began, once the handler has
     /// settled (upstream #275). Stamped on first observation so the budget
     /// bounds leftover work even when no wake ever fires again.
-    background_since: Option<Instant>,
+    background_since: Option<tokio::time::Instant>,
     /// The propagation context for this entry. A rejected foreign context
     /// stays here with `sampled` clear, so continuations can forward it
     /// without treating it as permission to record spans or logs.
@@ -4168,7 +4168,9 @@ impl InFlight {
     /// checks this only once the handler has settled, so the stamp is the
     /// background phase's start, not the event's.
     pub fn background_expired(&mut self, budget: Duration) -> bool {
-        let since = *self.background_since.get_or_insert_with(Instant::now);
+        let since = *self
+            .background_since
+            .get_or_insert_with(crate::asyncrt::mono_now);
         since.elapsed() >= budget
     }
 
@@ -5366,7 +5368,7 @@ fn begin<'s>(
                 io_context_ops: std::collections::HashSet::new(),
                 unrefed_ops: std::collections::HashSet::new(),
                 alarm: None,
-                started: Instant::now(),
+                started: crate::asyncrt::mono_now(),
                 background_since: None,
                 trace: None,
                 failure: None,
@@ -5447,7 +5449,7 @@ fn begin_entrypoint_rpc(
             Err(_) => resolved_promise(tc, ret),
         }
     })();
-    let event_started = Instant::now();
+    let event_started = crate::asyncrt::mono_now();
     match started {
         Ok(promise) => {
             tc.perform_microtask_checkpoint();
@@ -5715,7 +5717,7 @@ fn begin_queue(
                 io_context_ops: std::collections::HashSet::new(),
                 unrefed_ops: std::collections::HashSet::new(),
                 alarm: None,
-                started: Instant::now(),
+                started: crate::asyncrt::mono_now(),
                 background_since: None,
                 trace: None,
                 failure: None,
@@ -5868,7 +5870,7 @@ fn start_cell_event<'s>(
     if capture_frames {
         ws_capture_begin();
     }
-    let event_started = Instant::now();
+    let event_started = crate::asyncrt::mono_now();
     let started = (|| {
         begin_event_context(tc)?;
         let ret = call(tc)?;

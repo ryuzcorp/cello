@@ -21,9 +21,24 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 static PROCESS_DOMAIN: OnceLock<ProductionDomain> = OnceLock::new();
+
+/// The one monotonic clock the execution domain measures against.
+///
+/// Tokio's clock rather than `std::time::Instant`, because it is the clock
+/// every wait in the runtime already uses (`tokio::time::sleep`,
+/// `timeout`). With the dev-only `test-util` feature a test that pauses
+/// Tokio's clock therefore moves every deadline in the runtime — handler and
+/// background budgets, response-stream idle expiry, JS timers — together, so
+/// hours of stream timeline run in milliseconds. In a shipped build (and in
+/// any runtime that never paused) it reads the same monotonic clock `std`
+/// does; this is the seam, not a behaviour change.
+pub fn mono_now() -> tokio::time::Instant {
+    tokio::time::Instant::now()
+}
+
 static FALLBACK_SERVICES: OnceLock<Arc<HostServices>> = OnceLock::new();
 static RUNTIME_SERVICES: OnceLock<Mutex<HashMap<tokio::runtime::Id, Weak<HostServices>>>> =
     OnceLock::new();
@@ -70,15 +85,21 @@ fn current_domain() -> &'static ProductionDomain {
 
 struct ProductionDomainOwner {
     handle: tokio::runtime::Handle,
-    started_at: Instant,
+    started_at: tokio::time::Instant,
 }
 
 impl ProductionDomainOwner {
     fn new(handle: tokio::runtime::Handle) -> Self {
-        Self {
-            handle,
-            started_at: Instant::now(),
-        }
+        // Stamp inside the domain's own runtime: Tokio resolves
+        // `Instant::now()` against the *current* runtime's clock, and a
+        // paused test clock is only visible from inside it. Outside, the
+        // stamp would be real time and every `elapsed()` — which always
+        // reads Tokio's clock — would be measured from the wrong origin.
+        let started_at = {
+            let _entered = handle.enter();
+            mono_now()
+        };
+        Self { handle, started_at }
     }
 }
 
