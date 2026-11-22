@@ -1,8 +1,8 @@
 ---
 title: Changelog
-description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.4.
+description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.5.
 ---
-## Unreleased
+## v0.2.5
 
 An application WebSocket close now reaches a peer that is still sending, and
 the release smoke gate's 32 MiB check is stable. No configuration, data, or
