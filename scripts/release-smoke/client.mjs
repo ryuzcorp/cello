@@ -237,6 +237,13 @@ function connectWebSocket(path) {
     let buffered = 0;
     let closed = null;
     let wake = null;
+    // An EPIPE from our own frame write is expected once the edge refuses a
+    // declared length and stops reading: the oversize check deliberately
+    // declares 32 MiB + 1 and then keeps writing. It must not fail the
+    // check by itself — the close frame still has to be read — while an
+    // ECONNRESET is the server bug (an RST that discarded the close frame)
+    // and stays fatal.
+    let refusedWrite = null;
     const ping = () => {
       const resume = wake;
       wake = null;
@@ -252,7 +259,30 @@ function connectWebSocket(path) {
       ping();
     });
     socket.on('end', () => fail(new Error('the socket ended')));
-    socket.on('error', (error) => fail(error));
+    socket.on('error', (error) => {
+      if (error.code === 'EPIPE') {
+        // Our own write, refused after the edge stopped reading. Keep
+        // waiting for the close frame; `close` below reports the socket if
+        // it goes away without one.
+        refusedWrite ??= error;
+        return;
+      }
+      fail(error);
+    });
+    socket.on('close', () => {
+      if (closed) return;
+      // A socket that went away without a close frame must fail the check
+      // instead of hanging it, and say whether our own refused write was
+      // the last thing it saw.
+      fail(
+        refusedWrite
+          ? new Error(
+              `the socket closed after our write was refused (${refusedWrite.code}) ` +
+                'before a close frame arrived',
+            )
+          : new Error('the socket closed before a close frame arrived'),
+      );
+    });
     socket.setNoDelay(true);
 
     const read = async (n) => {

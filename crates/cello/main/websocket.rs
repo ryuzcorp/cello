@@ -986,7 +986,7 @@ pub(crate) async fn outbound_websocket_task(
     // Ping and Close are answered by the reader's auto-pong and auto-close, as
     // the previous client library also did unprompted. The pump writes those
     // replies on the same socket, so nothing about that changes here.
-    let (close, _writer, _outputs, _budget) = {
+    let (close, writer, _outputs, _budget) = {
         let sink = &sink;
         pump_cell_socket(
             socket,
@@ -1000,6 +1000,9 @@ pub(crate) async fn outbound_websocket_task(
     let _ = sink
         .closed(id, close.state.0, close.state.1, close.state.2)
         .await;
+    // The peer's echo or the cell's close is the last frame: linger so a
+    // peer still sending cannot answer it with an RST that discards it.
+    writer.linger_close().await;
     cello::js::ws_unregister(id);
     Ok(())
 }
@@ -1024,13 +1027,156 @@ fn websocket_close_details(payload: &[u8]) -> (u16, String) {
     }
 }
 
+/// Bound on one phase of the lingering close — the flush and half-close of
+/// the write side, and the read-and-discard drain — so a peer that stopped
+/// reading or never closes cannot pin the connection or its task.
+const LINGER_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Bound on the bytes the dangling close discards. A peer may keep sending
+/// after its close is refused; past this the transport is dropped anyway, so
+/// the discard never grows host memory or the wait without end.
+const LINGER_CLOSE_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// The pump's read stream: the split read half behind a lock shared with the
+/// transport teardown. The reader parses frames through it while the pump
+/// runs; after the pump stops reading, the lingering close drains and
+/// discards through the same half, so a peer still sending cannot turn the
+/// final close frame into an RST that discards it.
+struct SharedRead<R> {
+    inner: std::sync::Arc<std::sync::Mutex<R>>,
+}
+
+impl<R> SharedRead<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner: std::sync::Arc::new(std::sync::Mutex::new(inner)),
+        }
+    }
+}
+
+impl<R> Clone for SharedRead<R> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<R> tokio::io::AsyncRead for SharedRead<R>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::pin::Pin::new(&mut *inner).poll_read(cx, buf)
+    }
+}
+
+/// The pump's write stream: the split write half behind a lock shared with
+/// the transport teardown, so teardown can flush and half-close (TCP
+/// `shutdown(Write)`) after the final frame without writing another one.
+struct HalfCloseWrite<W> {
+    inner: std::sync::Arc<std::sync::Mutex<W>>,
+}
+
+impl<W> HalfCloseWrite<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner: std::sync::Arc::new(std::sync::Mutex::new(inner)),
+        }
+    }
+}
+
+impl<W> Clone for HalfCloseWrite<W> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<W> tokio::io::AsyncWrite for HalfCloseWrite<W>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::pin::Pin::new(&mut *inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::pin::Pin::new(&mut *inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::pin::Pin::new(&mut *inner).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::pin::Pin::new(&mut *inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.is_write_vectored()
+    }
+}
+
+/// The halves a teardown still owns after the pump returns: the read half the
+/// lingering close drains, the write half it half-closes, and whether it ran.
+struct PumpTearDown<S> {
+    read: SharedRead<tokio::io::ReadHalf<S>>,
+    write: HalfCloseWrite<tokio::io::WriteHalf<S>>,
+    lingered: std::sync::atomic::AtomicBool,
+}
+
 /// The write half of a cell socket, shared by the reader and the writer.
 ///
 /// The reader needs it because auto-pong and auto-close hand their reply back to
 /// the caller once a socket is split. The writer needs it for the cell's own
 /// frames, and the close path needs it after both directions stop.
-type SocketWriter<S> =
-    std::sync::Arc<tokio::sync::Mutex<fastwebsockets::WebSocketWrite<tokio::io::WriteHalf<S>>>>;
+type SocketWriter<S> = std::sync::Arc<
+    tokio::sync::Mutex<fastwebsockets::WebSocketWrite<HalfCloseWrite<tokio::io::WriteHalf<S>>>>,
+>;
 
 /// Close details: the code, the reason, and whether the close was clean.
 type CloseState = (u16, String, bool);
@@ -1066,6 +1212,7 @@ struct PumpClose {
 struct PumpWriter<S> {
     writer: SocketWriter<S>,
     poisoned: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    teardown: std::sync::Arc<PumpTearDown<S>>,
 }
 
 impl<S> Clone for PumpWriter<S> {
@@ -1073,6 +1220,7 @@ impl<S> Clone for PumpWriter<S> {
         Self {
             writer: self.writer.clone(),
             poisoned: self.poisoned.clone(),
+            teardown: self.teardown.clone(),
         }
     }
 }
@@ -1081,6 +1229,111 @@ impl<S> PumpWriter<S> {
     fn poisoned(&self) -> bool {
         self.poisoned.load(std::sync::atomic::Ordering::SeqCst)
     }
+}
+
+impl<S> PumpWriter<S>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    /// Close the transport without discarding the final close frame.
+    ///
+    /// Dropping a TCP transport that still has unread inbound data makes
+    /// Linux answer with RST instead of FIN, and an RST discards data the
+    /// peer has not read yet — including the close frame just written. So
+    /// after the last frame: flush and half-close the write side (FIN), then
+    /// read and discard whatever the peer is still sending until it ends or
+    /// the bound trips. Bounded in time and bytes, and every byte is
+    /// discarded rather than buffered, so a peer that keeps sending or never
+    /// closes cannot pin the connection, the task, or host memory.
+    ///
+    /// Runs once per socket, after the caller's final write. A poisoned
+    /// writer still lingers: no further frame may follow the possibly
+    /// partial one, but the flush, the FIN, and the drain all keep whatever
+    /// did cross readable for the peer.
+    async fn linger_close(&self) {
+        if self
+            .teardown
+            .lingered
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        let mut write = self.teardown.write.clone();
+        let _ = cello::asyncrt::timeout(
+            LINGER_CLOSE_TIMEOUT,
+            tokio::io::AsyncWriteExt::flush(&mut write),
+        )
+        .await;
+        let _ = cello::asyncrt::timeout(
+            LINGER_CLOSE_TIMEOUT,
+            tokio::io::AsyncWriteExt::shutdown(&mut write),
+        )
+        .await;
+        drop(write);
+        let mut read = self.teardown.read.clone();
+        let mut buf = [0u8; 16 * 1024];
+        let mut discarded = 0usize;
+        let deadline = cello::asyncrt::sleep(LINGER_CLOSE_TIMEOUT);
+        tokio::pin!(deadline);
+        loop {
+            let step = cello::asyncrt::select! {
+                _ = &mut deadline => break,
+                result = tokio::io::AsyncReadExt::read(&mut read, &mut buf) => result,
+            };
+            match step {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    discarded = discarded.saturating_add(n);
+                    if discarded >= LINGER_CLOSE_MAX_BYTES {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Split a handshaken socket into the pump's reader and writer, keeping the
+/// shared read and write halves the lingering close needs after the pump
+/// returns. The reader parses frames through its share while the pump runs;
+/// teardown later drains the same read half and half-closes the same write
+/// half, never while a pump future still polls them.
+fn split_pump_socket<S>(
+    socket: fastwebsockets::WebSocket<S>,
+) -> (
+    fastwebsockets::WebSocketRead<SharedRead<tokio::io::ReadHalf<S>>>,
+    PumpWriter<S>,
+)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    type SharedHalves<S> = (
+        SharedRead<tokio::io::ReadHalf<S>>,
+        HalfCloseWrite<tokio::io::WriteHalf<S>>,
+    );
+    let halves: std::cell::RefCell<Option<SharedHalves<S>>> = std::cell::RefCell::new(None);
+    let (reader, writer) = socket.split(|stream| {
+        let (read, write) = tokio::io::split(stream);
+        let read = SharedRead::new(read);
+        let write = HalfCloseWrite::new(write);
+        *halves.borrow_mut() = Some((read.clone(), write.clone()));
+        (read, write)
+    });
+    let (read, write) = halves
+        .into_inner()
+        .expect("the socket splits its halves exactly once");
+    (
+        reader,
+        PumpWriter {
+            writer: std::sync::Arc::new(tokio::sync::Mutex::new(writer)),
+            poisoned: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            teardown: std::sync::Arc::new(PumpTearDown {
+                read,
+                write,
+                lingered: std::sync::atomic::AtomicBool::new(false),
+            }),
+        },
+    )
 }
 
 /// Marks the pump writer poisoned unless the write it guards completes: a
@@ -1265,7 +1518,7 @@ type PumpReply = Box<dyn for<'f> FnMut(fastwebsockets::Frame<'f>) -> PumpReplyFu
 /// with every outcome, so arming a read moves values instead of borrowing
 /// the pump loop's locals across iterations.
 struct PumpReader<S> {
-    reader: cello::ws_message::CappedFragmentReader<tokio::io::ReadHalf<S>>,
+    reader: cello::ws_message::CappedFragmentReader<SharedRead<tokio::io::ReadHalf<S>>>,
     reply: PumpReply,
 }
 
@@ -1421,12 +1674,8 @@ where
     use cello::ws_message::CappedFragmentReader;
     use fastwebsockets::{Frame as WsFrame, Payload};
 
-    let (reader, writer) = socket.split(tokio::io::split);
+    let (reader, writer) = split_pump_socket(socket);
     let reader = CappedFragmentReader::new(reader);
-    let writer: PumpWriter<S> = PumpWriter {
-        writer: std::sync::Arc::new(tokio::sync::Mutex::new(writer)),
-        poisoned: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-    };
 
     let mut close = PumpClose {
         state: (1006, String::new(), false),
@@ -1945,6 +2194,10 @@ async fn worker_websocket_task<S>(
     let _ = worker
         .inbound()
         .send_close(close.state.0, close.state.1, close.state.2);
+    // The close frame the worker or its peer observed is the last write on
+    // the socket: linger so a peer still sending cannot answer it with an
+    // RST that discards it. The worker already got the close above.
+    writer.linger_close().await;
 }
 
 /// Drain the close handler's queued frames after the pump: the handler runs
@@ -2091,6 +2344,10 @@ pub(super) async fn websocket_task<S>(
     if let Some(writer) = &writer {
         let handler_sent_close = drain_close_outputs(writer, &mut outputs, &budget).await;
         echo_websocket_close(writer, &close.state, handler_sent_close).await;
+        // The last close frame is on the wire; half-close the write side and
+        // drain what the peer still sends, so its kernel does not answer the
+        // frame with an RST that can discard it before the peer reads it.
+        writer.linger_close().await;
     }
     app.websocket_closed(route.cell().to_string(), target.id);
     cello::js::ws_unregister(target.id);
@@ -2389,11 +2646,7 @@ mod overload_tests {
             let (mut client, server) = tokio::io::duplex(64 * 1024);
             let socket =
                 fastwebsockets::WebSocket::after_handshake(server, fastwebsockets::Role::Server);
-            let (_reader, writer) = socket.split(tokio::io::split);
-            let writer: PumpWriter<tokio::io::DuplexStream> = PumpWriter {
-                writer: std::sync::Arc::new(tokio::sync::Mutex::new(writer)),
-                poisoned: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            };
+            let (_reader, writer) = split_pump_socket(socket);
             let open = write_ws_out(&writer, cello::js::WsOut::Overload).await;
             assert!(!open, "the overload marker ends the socket");
             drop(writer);
@@ -2875,6 +3128,172 @@ mod pump_tests {
                 "the pump reports the application-sent 1009"
             );
             sender.abort();
+        });
+    }
+
+    /// The loud 1009 close must reach a real TCP peer that is still sending.
+    ///
+    /// A client declares one byte past the 32 MiB cap and queues a 1 MiB
+    /// prefix before the pump starts. The pump refuses the header, writes
+    /// 1009 and ends. Dropping the transport with that prefix unread makes
+    /// Linux answer with RST instead of FIN, and an RST discards data the
+    /// peer has not read yet — often the close frame itself — so a real
+    /// client sees ECONNRESET or an unclean 1006 instead of 1009. The
+    /// lingering close half-closes the write side and drains the prefix, so
+    /// the client reads the close frame and then EOF.
+    ///
+    /// The order is enforced, not timed: the client queues the prefix first,
+    /// the test waits until the listener's receive buffer holds part of it,
+    /// and only then does the pump read the header. Five iterations repeat
+    /// the observation; the drop-with-unread-data path fails every one of
+    /// them, which is what a reverted linger (a no-op `linger_close`) shows.
+    #[test]
+    fn oversize_close_reaches_a_tcp_peer_still_sending() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Big enough that the header read cannot consume it all: the pump
+        // reads a few header bytes, so the rest stays unread at drop time.
+        const QUEUED_PREFIX_BYTES: usize = 64 * 1024;
+        const PREFIX_BYTES: usize = 1024 * 1024;
+        test_runtime().block_on(async {
+            for iteration in 0..5 {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("the test listener binds");
+                let addr = listener.local_addr().expect("the listener address");
+                let (queued_tx, queued_rx) = tokio::sync::oneshot::channel::<()>();
+                let server = tokio::spawn(async move {
+                    let (stream, _) = listener.accept().await.expect("the client connects");
+                    stream.set_nodelay(true).expect("nodelay on the server");
+                    queued_rx.await.expect("the client queues its prefix");
+                    // The pump starts only once the prefix sits in this
+                    // socket's receive buffer: the drop below then always
+                    // has unread data, which is what turns it into an RST.
+                    let mut probe = [0u8; QUEUED_PREFIX_BYTES];
+                    loop {
+                        stream
+                            .readable()
+                            .await
+                            .expect("the prefix arrives on the listener socket");
+                        match stream.peek(&mut probe).await {
+                            Ok(0) => panic!("the client ended without queueing a prefix"),
+                            Ok(n) if n >= QUEUED_PREFIX_BYTES => break,
+                            Ok(_) => continue,
+                            Err(error) => panic!("peeking the queued prefix failed: {error}"),
+                        }
+                    }
+                    let mut socket = fastwebsockets::WebSocket::after_handshake(
+                        stream,
+                        fastwebsockets::Role::Server,
+                    );
+                    socket.set_auto_close(false);
+                    let (_outbound, outputs) = mpsc::unbounded_channel();
+                    let (close, writer, _outputs, _budget) = pump_cell_socket(
+                        socket,
+                        outputs,
+                        false,
+                        |_: cello::js::WsIn| std::future::pending::<anyhow::Result<()>>(),
+                        cello::js::WsPipeBudget::new(ISOLATE_PIPE_MAX_STAGED_BYTES),
+                    )
+                    .await;
+                    assert_eq!(
+                        close.state.0,
+                        cello::ws_message::WS_MESSAGE_TOO_BIG_CODE,
+                        "iteration {iteration}: the pump refuses the oversize header"
+                    );
+                    writer.linger_close().await;
+                });
+
+                let stream = tokio::net::TcpStream::connect(addr)
+                    .await
+                    .expect("the test client connects");
+                stream.set_nodelay(true).expect("nodelay on the client");
+                let (mut reader, mut write_half) = stream.into_split();
+                let declared = cello::ws_message::WS_MAX_MESSAGE_BYTES + 1;
+                let mask = [0x12u8, 0x34, 0x56, 0x78];
+                let mut head = Vec::with_capacity(14);
+                head.push(0x82);
+                head.push(0x80 | 127);
+                head.extend_from_slice(&(declared as u64).to_be_bytes());
+                head.extend_from_slice(&mask);
+                write_half
+                    .write_all(&head)
+                    .await
+                    .expect("the frame header writes");
+                let mut prefix = vec![0u8; PREFIX_BYTES];
+                for (i, byte) in prefix.iter_mut().enumerate() {
+                    *byte = (i & 0xff) as u8 ^ mask[i & 3];
+                }
+                // The client may block once kernel buffers fill while the
+                // pump still has not read; the write runs beside the reader.
+                let prefix_writer = tokio::spawn(async move {
+                    let _ = write_half.write_all(&prefix).await;
+                    let _ = write_half.shutdown().await;
+                });
+                queued_tx.send(()).expect("the server starts the pump");
+
+                let mut frame_head = [0u8; 2];
+                let read = tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    reader.read_exact(&mut frame_head),
+                )
+                .await
+                .expect("the close frame must arrive within 30 s");
+                if let Err(error) = read {
+                    panic!(
+                        "iteration {iteration}: the socket ended with {error} before the \
+                         close frame; a drop with the prefix unread sent an RST"
+                    );
+                }
+                assert_eq!(frame_head[0], 0x88, "iteration {iteration}: close frame");
+                assert_eq!(frame_head[1] & 0x80, 0, "server frames are unmasked");
+                let length = match frame_head[1] & 0x7f {
+                    126 => {
+                        let mut ext = [0u8; 2];
+                        reader.read_exact(&mut ext).await.expect("extended length");
+                        u16::from_be_bytes(ext) as usize
+                    }
+                    127 => {
+                        let mut ext = [0u8; 8];
+                        reader.read_exact(&mut ext).await.expect("extended length");
+                        u64::from_be_bytes(ext) as usize
+                    }
+                    len => len as usize,
+                };
+                let mut payload = vec![0u8; length];
+                reader
+                    .read_exact(&mut payload)
+                    .await
+                    .expect("the close payload follows its frame");
+                assert_eq!(
+                    u16::from_be_bytes([payload[0], payload[1]]),
+                    cello::ws_message::WS_MESSAGE_TOO_BIG_CODE,
+                    "iteration {iteration}: loud 1009 close"
+                );
+                assert_eq!(
+                    &payload[2..],
+                    cello::ws_message::WS_MESSAGE_TOO_BIG_REASON.as_bytes(),
+                    "iteration {iteration}: message-too-big reason"
+                );
+                let mut tail = [0u8; 1];
+                let tail = tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    reader.read(&mut tail),
+                )
+                .await
+                .expect("iteration {iteration}: the socket must end within 30 s");
+                match tail {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        panic!("iteration {iteration}: {n} unexpected bytes follow the close frame")
+                    }
+                    Err(error) => panic!(
+                        "iteration {iteration}: the socket ended with {error}, not EOF: \
+                         the lingering close did not drain what the peer was sending"
+                    ),
+                }
+                server.await.expect("the server task joins");
+                prefix_writer.await.expect("the prefix writer joins");
+            }
         });
     }
 
@@ -3695,11 +4114,7 @@ mod pump_tests {
                     GateStream { gate: gate.clone() },
                     fastwebsockets::Role::Server,
                 );
-                let (_reader, writer) = socket.split(tokio::io::split);
-                let pump_writer = PumpWriter {
-                    writer: std::sync::Arc::new(tokio::sync::Mutex::new(writer)),
-                    poisoned: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                };
+                let (_reader, pump_writer) = split_pump_socket(socket);
                 // A acquires the lock and parks mid-write; the gate stays
                 // closed so its frame never completes.
                 let a_writer = pump_writer.clone();
@@ -4102,11 +4517,7 @@ mod pump_tests {
                 FailingStream,
                 fastwebsockets::Role::Server,
             );
-            let (_reader, writer) = socket.split(tokio::io::split);
-            let pump_writer = PumpWriter {
-                writer: std::sync::Arc::new(tokio::sync::Mutex::new(writer)),
-                poisoned: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            };
+            let (_reader, pump_writer) = split_pump_socket(socket);
             // A one-frame budget: only the staged frame fits, so a later
             // charge succeeds exactly when the drain refunded it.
             let frame = cello::js::WsOut::Text("one".into());
@@ -4157,11 +4568,7 @@ mod pump_tests {
             let (mut client_stream, server) = tokio::io::duplex(64 * 1024);
             let socket =
                 fastwebsockets::WebSocket::after_handshake(server, fastwebsockets::Role::Server);
-            let (_reader, writer) = socket.split(tokio::io::split);
-            let pump_writer = PumpWriter {
-                writer: std::sync::Arc::new(tokio::sync::Mutex::new(writer)),
-                poisoned: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            };
+            let (_reader, pump_writer) = split_pump_socket(socket);
             let first = cello::js::WsOut::Text("one".into());
             let second = cello::js::WsOut::Text("two".into());
             // A two-frame budget: a later charge succeeds exactly when the
@@ -4214,11 +4621,10 @@ mod pump_tests {
                     server,
                     fastwebsockets::Role::Server,
                 );
-                let (_reader, writer) = socket.split(tokio::io::split);
-                let pump_writer = PumpWriter {
-                    writer: std::sync::Arc::new(tokio::sync::Mutex::new(writer)),
-                    poisoned: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(poisoned)),
-                };
+                let (_reader, pump_writer) = split_pump_socket(socket);
+                pump_writer
+                    .poisoned
+                    .store(poisoned, std::sync::atomic::Ordering::SeqCst);
                 // A clean peer close the handler did not answer: the echo
                 // would carry the peer's own code back.
                 let reply_sent =
