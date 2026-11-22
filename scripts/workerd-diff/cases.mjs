@@ -5,6 +5,7 @@
 
 export const cases = [
   { name: "readable-basics", fixture: "streams", path: "/readable-basics" },
+  { name: "readable-pull-order", fixture: "streams", path: "/readable-pull-order" },
   { name: "readable-byob", fixture: "streams", path: "/readable-byob" },
   { name: "writable-order", fixture: "streams", path: "/writable-order" },
   { name: "transform-error", fixture: "streams", path: "/transform-error" },
@@ -14,6 +15,7 @@ export const cases = [
   { name: "tee-of-tee", fixture: "streams", path: "/tee-of-tee" },
   { name: "tee-a-then-b", fixture: "streams", path: "/tee-a-then-b" },
   { name: "tee-cancel-branch", fixture: "streams", path: "/tee-cancel-branch" },
+  { name: "tee-cancel-reason", fixture: "streams", path: "/tee-cancel-reason" },
   { name: "clone-both", fixture: "streams", path: "/clone-both" },
   { name: "transform-order", fixture: "streams", path: "/transform-order" },
   { name: "transform-backpressure", fixture: "streams", path: "/transform-backpressure" },

@@ -56,6 +56,29 @@ and a published `<version>` or Release is still never replaced. The publish
 shell moved to `scripts/publish-release.sh`, with a stubbed-registry test for
 the retry decisions.
 
+A pull source now runs on Workerd's schedule and a `tee()` cancels its
+source with Workerd's reason. No configuration, data, or bucket-format
+changes.
+
+- **A pull source runs Workerd's pull schedule** (#113). After the first
+  `read()` dequeued a buffered chunk, Cello had already called `pull()` a
+  second time, so a source that prefetches, charges quota, or advances a
+  cursor did that work one chunk earlier than the same code on Workerd.
+  Cello no longer refills after a dequeue: `pull()` runs for a registered
+  read request and from an `enqueue` that leaves the desired size positive,
+  which is what Workerd's controller does (the WHATWG text also pulls after
+  a dequeue; V8 does, Workerd does not). `read()` also settles one
+  microtask later, mirroring Workerd's native read-result binding, so the
+  pull that fulfils a pending read and its follow-up pull both run before
+  the awaiting `read()` continues. The pull count and ordering now match
+  Workerd, down to the per-read `pull()` counts a source observes.
+- **`tee()` cancels its source with the last branch's reason** (#114). The
+  source's `cancel` used to receive the spec's joined `[reason1, reason2]`
+  array, so a source that stringified it saw `"first,second"` where Workerd
+  passes the last branch's reason (`"second"`). The last cancelling branch's
+  reason is now passed through unchanged, byte for byte, and the tee's
+  internal error path no longer cancels with a duplicate array either.
+
 ## v0.2.6
 
 The same code as v0.2.5, released again with complete provenance: the v0.2.5

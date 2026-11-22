@@ -17,6 +17,18 @@ function _readResult(value, done) {
   return r;
 }
 
+// Workerd hands a read result to JS across its native binding, so the
+// promise `read()` returns settles one microtask after the stream produced
+// the value: the binding's promise conversion is an extra `.then`. That hop
+// is observable whenever a pull fulfils the pending read: the pull's own
+// continuation (which re-runs CallPullIfNeeded via [[pullAgain]]) is queued
+// before the awaiting read resumes, so a source that enqueues from `pull`
+// sees two pulls by the time the second `read()` continues (issue #113).
+// Mirror the hop on every read result.
+function _readSettled(promise) {
+  return promise.then((result) => result);
+}
+
 // Brand-check sentinel for internal construction.
 const _rsc_brand = Symbol("ReadableStreamController");
 
@@ -213,20 +225,20 @@ class ReadableStreamDefaultReader {
 
   read() {
     if (this.#released)
-      return Promise.reject(
-        new TypeError(RELEASED));
+      return _readSettled(Promise.reject(
+        new TypeError(RELEASED)));
     const s = this.#stream;
     s._disturbed = true;
     if (s._errored)
-      return Promise.reject(s._error);
+      return _readSettled(Promise.reject(s._error));
     // Check _closed first: a stream that was closed
     // re-entrantly (e.g. close() called from sizeFn) may
     // still have a stuck chunk in its queue which must
     // never be emitted. Only drain the queue while the
     // stream is still readable.
     if (s._closed)
-      return Promise.resolve(
-        _readResult(undefined, true));
+      return _readSettled(Promise.resolve(
+        _readResult(undefined, true)));
     if (s._queue.length > 0) {
       const chunk = s._queue.shift();
       const sz = s._queueSizes.shift() ?? 0;
@@ -234,15 +246,27 @@ class ReadableStreamDefaultReader {
       if (s._queueTotalSize < 0) s._queueTotalSize = 0;
       if (s._queue.length === 0 && s._closeRequested)
         s._finishClose();
-      s._maybePull();
-      return Promise.resolve(
-        _readResult(chunk, false));
+      // A stream layered on this one can need the desired-size change a
+      // dequeue causes even though no pull runs. TransformStream's readable
+      // side is such a layer: workerd's transform controller updates its
+      // writable-side backpressure from the queue itself (a native
+      // backpressure listener), so a read that frees a queue slot must
+      // release a parked write here too (see writable_stream.js).
+      if (s._onDequeue) s._onDequeue();
+      // Workerd does not refill after dequeuing a buffered chunk: a pull
+      // runs only for a registered read request (below) or from an
+      // enqueue. The spec's [[PullSteps]] calls CallPullIfNeeded here,
+      // which is why V8 reports one more pull per read. Matching workerd
+      // keeps a source's side effects (a prefetch, a quota charge, a
+      // cursor advance) on workerd's schedule -- issue #113.
+      return _readSettled(Promise.resolve(
+        _readResult(chunk, false)));
     }
     // Queue a read request.
-    return new Promise((resolve, reject) => {
+    return _readSettled(new Promise((resolve, reject) => {
       s._readRequests.push({ resolve, reject });
       s._maybePull();
-    });
+    }));
   }
 
   releaseLock() {
@@ -293,6 +317,9 @@ class ReadableStream {
   _pulling = false;
   _pullAgain = false;
   _started = false;
+  // Optional observer run after a read dequeues a queued chunk (a layer
+  // such as TransformStream releases its writable-side backpressure).
+  _onDequeue = null;
 
   // Closed promise + resolver.
   _closedPromise;
@@ -460,10 +487,14 @@ class ReadableStream {
         this._errored || this._closeRequested)
       return;
     if (!this._pullFn) return;
-    const desiredSize = this._hwm -
-      this._queue.length;
-    if (desiredSize <= 0 &&
-        this._readRequests.length === 0)
+    // Spec ShouldCallPull: a registered read request pulls regardless of
+    // backpressure, then a positive desiredSize does. Workerd checks the
+    // same two signals. desiredSize is the strategy highWaterMark minus
+    // the queued *bytes*, not the queued chunk count: a strategy.size
+    // (tee branches charge real chunk bytes) must hold back a pull that
+    // still leaves the queue over its mark.
+    if (this._readRequests.length === 0 &&
+        this._hwm - this._queueTotalSize <= 0)
       return;
     if (this._pulling) {
       this._pullAgain = true;
@@ -569,14 +600,18 @@ class ReadableStream {
     const live2 = () => !canceled2 && !failed2;
 
     // Both branches are gone (cancelled or failed), so nothing can read
-    // this tee again: cancel the source with the composite reason instead
-    // of holding its reader forever. Workerd's cancel settles a branch
-    // immediately rather than waiting for the other, and the source is
-    // cancelled only once both are gone -- the same here.
-    function release() {
+    // this tee again: cancel the source with the reason the last removed
+    // branch used, instead of holding its reader forever. Workerd's own
+    // tee passes that last reason through unchanged, not the spec's
+    // joined `[reason1, reason2]` array -- a source that branches on the
+    // cancellation reason would otherwise read "first,second" here and
+    // "second" there. Workerd's cancel settles a branch immediately
+    // rather than waiting for the other, and the source is cancelled only
+    // once both are gone -- the same here.
+    function release(reason) {
       if (closed || live1() || live2()) return;
       closed = true;
-      return reader.cancel([reason1, reason2]);
+      return reader.cancel(reason);
     }
 
     const makeBranch = (first) => {
@@ -585,7 +620,7 @@ class ReadableStream {
         cancel: (reason) => {
           if (first) { canceled1 = true; reason1 = reason; }
           else { canceled2 = true; reason2 = reason; }
-          return release();
+          return release(reason);
         },
       };
       if (isBytes) {
@@ -634,7 +669,8 @@ class ReadableStream {
     function failLagging() {
       for (;;) {
         if (!live1() && !live2()) {
-          const released = release();
+          const released = release(
+            reason2 !== undefined ? reason2 : reason1);
           if (released !== undefined) released.catch(() => {});
           return false;
         }
@@ -707,7 +743,8 @@ class ReadableStream {
             closed = true;
             if (live1()) controllers[0].error(e);
             if (live2()) controllers[1].error(e);
-            const released = reader.cancel([e, e]);
+            // One reason, as workerd's tee does: no composite array.
+            const released = reader.cancel(e);
             if (released !== undefined) released.catch(() => {});
           }
         },
