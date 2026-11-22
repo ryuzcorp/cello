@@ -15,7 +15,7 @@ The full process, including what goes where and the license notices, lives in [`
 gh run rerun <run-id> --failed
 ```
 
-The retry accepts the already-published `<version>` only when it is exactly the image index stitched from the per-arch digests the first attempt uploaded; a different index is refused, and a published `<version>` or Release is never replaced — for those, cut a new tag. A failure while promoting leaves the channel tags that already moved and no Release; the retry finishes them, and a channel tag that already holds a newer version is never rolled back. Use "Re-run failed jobs", not a full re-run: the per-arch build refuses an already-published `<version>`.
+The retry accepts the already-published `<version>` only when it is exactly the image index stitched from the per-arch digests the first attempt uploaded; a different index is refused, and a published `<version>` or Release is never replaced — for those, cut a new tag. A failure while promoting leaves the channel tags that already moved and no Release; the retry finishes them, and a channel tag that already holds a newer version (a release outranks its own prereleases) is never rolled back. Use "Re-run failed jobs", not a full re-run: the per-arch build refuses an already-published `<version>`. The retry window is 7 days, the retention of the per-arch artifacts a retry re-stitches from.
 
 ## Run the test suite locally
 

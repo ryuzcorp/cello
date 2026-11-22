@@ -124,15 +124,97 @@ version_from_tag() {
   MINOR_TAG=${VERSION%%.*}.${rest%%.*}
 }
 
-# The versions this repository publishes carry digits, dots and at most one
-# prerelease suffix, which `sort -V` orders as semver does: numeric parts
-# numerically, `-beta.2` before `-beta.10`, a prerelease before its release.
+# Compares two versions the way semver does, for the forms `verify` admits
+# (`<major>.<minor>.<patch>` with an optional `-<prerelease>`): the numeric
+# core first, then, on equal cores, a version without a prerelease suffix ranks
+# above one with it (a release is newer than its own prereleases), then the
+# suffix identifiers -- numeric ones numerically, a numeric identifier below an
+# alphanumeric one, alphanumerics in ASCII order, a shorter prefix below its
+# extension. Sets SEMVER_CMP to -1, 0 or 1. A plain `sort -V` gets the
+# same-core case backwards (`0.2.7` sorts before `0.2.7-beta.2`), which would
+# freeze `beta` at a prerelease of the version being released.
+SEMVER_CMP=0
+semver_cmp() {
+  local a=$1 b=$2 a_core=${1%%-*} b_core=${2%%-*} a_pre="" b_pre=""
+  case $a in *-*) a_pre=${a#*-} ;; esac
+  case $b in *-*) b_pre=${b#*-} ;; esac
+  local -a a_core_parts b_core_parts a_ids b_ids
+  IFS=. read -r -a a_core_parts <<<"$a_core"
+  IFS=. read -r -a b_core_parts <<<"$b_core"
+  local i
+  for i in 0 1 2; do
+    if ((10#${a_core_parts[$i]:-0} < 10#${b_core_parts[$i]:-0})); then
+      SEMVER_CMP=-1
+      return 0
+    fi
+    if ((10#${a_core_parts[$i]:-0} > 10#${b_core_parts[$i]:-0})); then
+      SEMVER_CMP=1
+      return 0
+    fi
+  done
+  if [ -z "$a_pre" ] || [ -z "$b_pre" ]; then
+    if [ -z "$a_pre" ] && [ -z "$b_pre" ]; then
+      SEMVER_CMP=0
+    elif [ -z "$a_pre" ]; then
+      SEMVER_CMP=1
+    else
+      SEMVER_CMP=-1
+    fi
+    return 0
+  fi
+  IFS=. read -r -a a_ids <<<"$a_pre"
+  IFS=. read -r -a b_ids <<<"$b_pre"
+  local shared=${#a_ids[@]} x y
+  if [ "${#b_ids[@]}" -lt "$shared" ]; then
+    shared=${#b_ids[@]}
+  fi
+  for ((i = 0; i < shared; i++)); do
+    x=${a_ids[$i]} y=${b_ids[$i]}
+    if [[ $x =~ ^[0-9]+$ && $y =~ ^[0-9]+$ ]]; then
+      if ((10#$x < 10#$y)); then
+        SEMVER_CMP=-1
+        return 0
+      fi
+      if ((10#$x > 10#$y)); then
+        SEMVER_CMP=1
+        return 0
+      fi
+    elif [[ $x =~ ^[0-9]+$ ]]; then
+      SEMVER_CMP=-1
+      return 0
+    elif [[ $y =~ ^[0-9]+$ ]]; then
+      SEMVER_CMP=1
+      return 0
+    else
+      if [[ $x < $y ]]; then
+        SEMVER_CMP=-1
+        return 0
+      fi
+      if [[ $x > $y ]]; then
+        SEMVER_CMP=1
+        return 0
+      fi
+    fi
+  done
+  if [ "${#a_ids[@]}" -lt "${#b_ids[@]}" ]; then
+    SEMVER_CMP=-1
+  elif [ "${#a_ids[@]}" -gt "${#b_ids[@]}" ]; then
+    SEMVER_CMP=1
+  else
+    SEMVER_CMP=0
+  fi
+}
+
+# Whether $1 is at least as new as $2.
 at_least() {
-  [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1)" = "$1" ]
+  semver_cmp "$1" "$2"
+  [ "$SEMVER_CMP" -ge 0 ]
 }
 
 # Sets CHANNEL_VERSION to the version annotation on `tag`, empty when the tag
-# does not exist or predates the annotation.
+# does not exist or predates the annotation. A tag written by the pipeline
+# before the annotation existed therefore reads as unknown and is moved, so the
+# forward-only guard does not cover those legacy channel tags.
 CHANNEL_VERSION=""
 channel_version() {
   local tag=$1
@@ -170,13 +252,16 @@ stitched_digest() {
 
 # Refuses when the GitHub Release for the tag exists, and when its existence
 # cannot be established: a transient `gh` failure must never read as "no
-# release yet" and let a released version's channel tags move again.
+# release yet" and let a released version's channel tags move again. Asks the
+# single-release endpoint, where an HTTP 404 is the only answer that means "no
+# release": `gh release view`'s prose is not a reliable signal.
 release_guard() {
   local out
-  if out=$(gh release view "$GITHUB_REF_NAME" 2>&1); then
+  need GH_REPO
+  if out=$(gh api "repos/$GH_REPO/releases/tags/$GITHUB_REF_NAME" 2>&1); then
     refuse "release $GITHUB_REF_NAME already exists; cut a new tag"
   fi
-  grep -qiE 'release not found|not found|http 404' <<<"$out" ||
+  grep -qE 'HTTP 404' <<<"$out" ||
     refuse "cannot tell whether release $GITHUB_REF_NAME exists: $out"
 }
 
@@ -280,6 +365,12 @@ promote() {
   done
   (cd "$dist" && sha256sum -c SHA256SUMS)
 
+  # The ordering guarantee is mechanical: read the image attestation back
+  # before a single channel tag moves, so a promote cannot promote an index the
+  # attest step did not cover.
+  gh attestation verify "oci://$image@$index" --repo "$GH_REPO" >/dev/null ||
+    refuse "no attestation for $image@$index; not moving a channel tag"
+
   local tags=("beta") moved=() tag claim_latest=true
   if [ "$PRERELEASE" != "true" ]; then
     tags+=("$MINOR_TAG" "latest")
@@ -361,14 +452,18 @@ promote() {
   fi
 }
 
-case "${1:-}" in
-  stitch)
-    stitch
-    ;;
-  promote)
-    promote
-    ;;
-  *)
-    usage
-    ;;
-esac
+# Sourced tests (scripts/tests) call the helpers directly; running the script
+# still dispatches on its subcommand.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  case "${1:-}" in
+    stitch)
+      stitch
+      ;;
+    promote)
+      promote
+      ;;
+    *)
+      usage
+      ;;
+  esac
+fi

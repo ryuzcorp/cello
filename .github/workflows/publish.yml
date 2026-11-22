@@ -48,7 +48,14 @@
 # The retry runs `scripts/publish-release.sh stitch` again against the
 # artifacts the first attempt uploaded, which accepts the existing `<version>`
 # only when it is exactly the index this run stitches from its own arch
-# digests; anything else is refused.
+# digests; anything else is refused. The per-arch artifacts are kept for 7
+# days, which is therefore the retry window: `stitch` refuses when they are
+# gone, so a retry after that publishes nothing.
+#
+# The whole workflow runs in one concurrency group, so two tags never promote
+# at once: `promote` reads each channel tag and then moves it, and a shared
+# group is what keeps "channels only move forward" from being a check-then-act
+# race between parallel tag runs.
 #
 # A published `<version>` is never overwritten and a published Release is
 # never replaced: once the release exists, a run refuses and the only
@@ -63,7 +70,11 @@ permissions:
   contents: read
 
 concurrency:
-  group: publish-${{ github.ref }}
+  # One group for the whole workflow, not per tag: `promote` reads a channel
+  # tag and then moves it, so two tag runs writing `beta`/`latest` at once
+  # could still interleave. Never cancel: a half-finished publish is worse than
+  # a queued one.
+  group: publish-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
@@ -171,8 +182,14 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
           fetch-tags: true
-      # Registry cache export needs the docker-container driver.
+      # Registry cache export needs the docker-container driver. buildx is
+      # pinned here and in `publish`, where the retry decision hashes the bytes
+      # `imagetools create --dry-run` prints and compares them with what the
+      # first attempt pushed: a runner-image bump must not silently change
+      # either side of that comparison.
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+        with:
+          version: v0.39.1
       - name: Log in to GHCR
         env:
           GHCR_TOKEN: ${{ github.token }}
@@ -253,11 +270,14 @@ jobs:
           tar -czf "dist/$tarball" -C stage cello LICENSE NOTICE
           (cd dist && sha256sum "$tarball" > "SHA256SUMS-${{ matrix.suffix }}")
           cat "dist/SHA256SUMS-${{ matrix.suffix }}"
+      # 7 days is the retry window: a re-run re-downloads these artifacts, and
+      # `stitch` refuses when they are gone, so a retry after expiry cannot
+      # publish its release.
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-${{ matrix.suffix }}
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 7
           path: |
             dist/cello-*.tar.gz
             dist/SHA256SUMS-${{ matrix.suffix }}
@@ -275,10 +295,18 @@ jobs:
       attestations: write
     steps:
       # The publish steps run `scripts/publish-release.sh` from the tagged
-      # tree, so a retry of this job runs the same logic the first attempt did.
+      # tree, at the SHA the run started with, so a re-run executes exactly the
+      # code the first attempt did even if the tag's branch moved.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+          ref: ${{ github.sha }}
+      # Pinned like `push`: the retry decision hashes the bytes this buildx
+      # prints with `--dry-run`, so it must be the same binary that pushed the
+      # first attempt's index.
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+        with:
+          version: v0.39.1
       - name: Log in to GHCR
         env:
           GHCR_TOKEN: ${{ github.token }}
@@ -311,8 +339,9 @@ jobs:
         with:
           subject-path: dist/cello-*.tar.gz, dist/SHA256SUMS
       # Only now, with both attestations in place, do the channel tags move and
-      # the GitHub Release appear, so a failure above leaves nothing a user can
-      # pull on the new version.
+      # the GitHub Release appear, so a failure above leaves the channel tags
+      # and the Release untouched (`<version>` itself is published by step 1)
+      # and the same tag is retried.
       - name: Promote and release
         env:
           GH_TOKEN: ${{ github.token }}

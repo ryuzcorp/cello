@@ -35,15 +35,22 @@ gh run rerun <run-id> --failed
 The retry re-stitches from the per-arch digests the first attempt uploaded and
 accepts the already-published `<version>` only when it is exactly that index;
 anything else is refused. Both attestations run again, so a digest can end up
-with more than one provenance bundle — each verifies on its own. A failure
-inside `promote` leaves the channel tags that already moved (each already the
-attested index) and no Release; the retry re-runs those carbon copies and
-finishes. Channel tags only move forward, so a retry of an older version
-releases that version without rolling `beta`/`latest` back over a newer one.
-Use "Re-run failed jobs" (`--failed`), not a full re-run: `push` still refuses
-an already-published `<version>`. A published `<version>` and a published
-Release are never replaced, so once the Release exists the only recovery is a
-new tag — which is why v0.2.6 was cut for v0.2.5 rather than re-running it.
+with more than one provenance bundle — each verifies on its own. `promote` reads
+the image attestation back before it moves the first channel tag, so the
+ordering is enforced, not just intended. A failure inside `promote` leaves the
+channel tags that already moved (each already the attested index) and no
+Release; the retry re-runs those carbon copies and finishes. Channel tags only
+move forward (a release outranks its own prereleases), so a retry of an older
+version releases that version without rolling `beta`/`latest` back over a newer
+one. Use "Re-run failed jobs" (`--failed`), not a full re-run: `push` still
+refuses an already-published `<version>`. A published `<version>` and a
+published Release are never replaced, so once the Release exists the only
+recovery is a new tag — which is why v0.2.6 was cut for v0.2.5 rather than
+re-running it.
+
+The retry window is 7 days: that is how long the per-arch artifacts (digests and
+tarballs) are kept, and `stitch` refuses to publish without them. The whole
+workflow also runs in one concurrency group, so two tags never promote at once.
 
 ## Required checks
 

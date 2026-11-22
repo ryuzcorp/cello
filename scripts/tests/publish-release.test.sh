@@ -7,7 +7,7 @@
 #
 # Each case runs the script in a cleared environment (`env -i`) against its own
 # state directory, so no case can see another's registry or release.
-# shellcheck disable=SC1091 # the stub registry library is generated at run time
+# shellcheck disable=SC1090,SC1091 # the sourced files are generated at run time
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/../.." && pwd)
@@ -16,6 +16,7 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
 image=ghcr.io/ryuzcorp/cello
+repo=ryuzcorp/cello
 version=0.2.7
 minor=0.2
 amd="sha256:$(printf '1%.0s' {1..64})"
@@ -139,16 +140,29 @@ cat >"$tmp/bin/gh" <<'STUB'
 set -euo pipefail
 state=${STUB_STATE:?}
 printf 'gh %s\n' "$*" >>"$state/gh.log"
-case "${1:-} ${2:-}" in
-  'release view')
-    if [ -f "$state/release" ]; then
-      exit 0
-    fi
-    # An injected `gh` failure (auth, outage) must not read as "no release".
-    cat "$state/gh-view-error" 2>/dev/null || echo "release not found"
-    exit 1
+case "${1:-}" in
+  api)
+    case "${2:-}" in
+      */releases/tags/*)
+        [ ! -f "$state/release" ] || exit 0
+        # An injected `gh` failure (auth, outage) must not read as "no release".
+        if [ -f "$state/api-error" ]; then
+          cat "$state/api-error" >&2
+          exit 1
+        fi
+        echo "gh: Not Found (HTTP 404)" >&2
+        exit 1
+        ;;
+      *) echo "gh stub: unsupported api path: ${2:-}" >&2; exit 1 ;;
+    esac
     ;;
-  'release create')
+  attestation)
+    [ "${2:-}" = verify ] || { echo "gh stub: unsupported: $*" >&2; exit 1; }
+    [ ! -f "$state/attestation-missing" ] ||
+      { echo "no attestations found for the subject" >&2; exit 1; }
+    ;;
+  release)
+    [ "${2:-}" = create ] || { echo "gh stub: unsupported: $*" >&2; exit 1; }
     [ ! -f "$state/release" ] || { echo "release already exists" >&2; exit 1; }
     shift 2
     : >"$state/release"
@@ -219,7 +233,8 @@ run() { # dir subcommand [extra env as NAME=value ...]
     cd "$dir" || exit 1
     env -i PATH="$tmp/bin:$PATH" HOME="$tmp" TMPDIR="$tmp" \
       STUB_STATE="$dir" IMAGE="$image" GITHUB_REF_NAME="$(cat "$dir/tag")" \
-      GITHUB_OUTPUT="$dir/out" DIST="$dir/dist" "$@" "$script" "$sub"
+      GH_REPO="$repo" GITHUB_OUTPUT="$dir/out" DIST="$dir/dist" \
+      "$@" "$script" "$sub"
   ) >"$dir/stdout" 2>"$dir/stderr"
 }
 
@@ -301,7 +316,7 @@ case_stitch_refuses_an_existing_release() {
 case_stitch_refuses_an_unreadable_release_state() {
   local dir rc=0
   dir=$(new_case release-error)
-  printf 'HTTP 401: Bad credentials (https://api.github.com/graphql)\n' >"$dir/gh-view-error"
+  printf 'HTTP 401: Bad credentials (https://api.github.com/graphql)\n' >"$dir/api-error"
   run "$dir" stitch || rc=$?
   [ "$rc" -ne 0 ] || { fail "release-error: expected a refusal"; return; }
   grep -q 'refusing: cannot tell whether release v0.2.7 exists' "$dir/stderr" ||
@@ -314,7 +329,7 @@ case_promote_refuses_an_unreadable_release_state() {
   local dir rc=0 index
   dir=$(new_case promote-release-error)
   index=$(prepare_stitched "$dir") || return
-  printf 'HTTP 401: Bad credentials (https://api.github.com/graphql)\n' >"$dir/gh-view-error"
+  printf 'HTTP 401: Bad credentials (https://api.github.com/graphql)\n' >"$dir/api-error"
   run "$dir" promote INDEX_DIGEST="$index" || rc=$?
   [ "$rc" -ne 0 ] || { fail "promote-release-error: expected a refusal"; return; }
   grep -q 'refusing: cannot tell whether release v0.2.7 exists' "$dir/stderr" ||
@@ -354,7 +369,7 @@ BROKEN
     cd "$dir" || exit 1
     env -i PATH="$dir/bin:$tmp/bin:$PATH" HOME="$tmp" TMPDIR="$tmp" \
       STUB_STATE="$dir" IMAGE="$image" GITHUB_REF_NAME="$(cat "$dir/tag")" \
-      GITHUB_OUTPUT="$dir/out" DIST="$dir/dist" "$script" stitch
+      GH_REPO="$repo" GITHUB_OUTPUT="$dir/out" DIST="$dir/dist" "$script" stitch
   ) >"$dir/stdout" 2>"$dir/stderr" || rc=$?
   [ "$rc" -ne 0 ] || { fail "registry-error: expected a refusal"; return; }
   grep -q 'refusing: cannot tell whether' "$dir/stderr" ||
@@ -450,6 +465,38 @@ case_promote_releases_even_when_every_channel_is_newer() {
   ok "an older retry releases its own version without touching a newer channel"
 }
 
+case_promote_moves_beta_off_a_same_version_prerelease() {
+  local dir rc=0 index
+  dir=$(new_case promote-beta-prerelease)
+  index=$(prepare_stitched "$dir") || return
+  # A release outranks its own prereleases: 0.2.7 beats 0.2.7-beta.2, where a
+  # plain `sort -V` would rank the longer string higher and freeze `beta`.
+  seed_channel "$dir" beta 0.2.7-beta.2
+  run "$dir" promote INDEX_DIGEST="$index" || rc=$?
+  [ "$rc" -eq 0 ] || { fail "promote-beta-prerelease: exit $rc: $(cat "$dir/stderr")"; return; }
+  if grep -q "not moving" "$dir/stdout"; then
+    fail "promote-beta-prerelease: skipped a channel: $(cat "$dir/stdout")"
+  fi
+  [ "$(creates "$dir")" = "create $image:beta <- $image@$index
+create $image:$minor <- $image@$index
+create $image:latest <- $image@$index" ] ||
+    fail "promote-beta-prerelease: creates were: $(creates "$dir")"
+  ok "promote moves beta off a prerelease of the version being released"
+}
+
+case_promote_refuses_without_an_image_attestation() {
+  local dir rc=0 index
+  dir=$(new_case promote-no-attestation)
+  index=$(prepare_stitched "$dir") || return
+  : >"$dir/attestation-missing"
+  run "$dir" promote INDEX_DIGEST="$index" || rc=$?
+  [ "$rc" -ne 0 ] || { fail "promote-no-attestation: expected a refusal"; return; }
+  grep -q "refusing: no attestation for $image@$index; not moving a channel tag" "$dir/stderr" ||
+    fail "promote-no-attestation: stderr was: $(cat "$dir/stderr")"
+  [ -z "$(creates "$dir")" ] || fail "promote-no-attestation: moved: $(creates "$dir")"
+  ok "promote refuses to move a channel without the image attestation"
+}
+
 case_promote_refuses_an_existing_release() {
   local dir rc=0 index
   dir=$(new_case promote-release-exists)
@@ -490,6 +537,40 @@ case_promote_refuses_a_missing_release_file() {
 # The order is the fix: a release or a moved channel tag before the
 # attestations is exactly the failure this pipeline had, and nothing else in
 # the repo would notice it.
+# The channel guard only moves a tag when the version is at least as new, so
+# the comparator itself is checked against the semver cases the pipeline can
+# meet -- including the one a `sort -V` gets backwards.
+case_channel_order_compares_versions_as_semver() {
+  local bad
+  # Sourced in a subshell: the script installs its own EXIT trap, and a trap
+  # set inside a function does not survive the function's return.
+  bad=$(
+    . "$script"
+    while read -r lower higher; do
+      [ -n "$lower" ] || continue
+      at_least "$higher" "$lower" || echo "$higher is not at least $lower"
+      at_least "$lower" "$higher" && echo "$lower is at least $higher"
+    done <<'TABLE'
+0.2.6 0.2.7
+0.2.7-beta.2 0.2.7
+0.2.7-beta.2 0.2.7-beta.10
+0.2.7-alpha 0.2.7-beta
+0.2.7-beta 0.2.7-beta.1
+0.2.7-beta.9 0.2.7-rc.1
+0.2.7-9 0.2.7-11
+0.2.7-1 0.2.7-alpha
+0.9.0 0.10.0
+0.2.9 0.2.10
+1.0.0-rc.1 1.0.0
+TABLE
+    at_least 0.2.7 0.2.7 || echo "0.2.7 is not at least itself"
+  ) || true
+  if [ -n "$bad" ]; then
+    fail "wrong ordering: $bad"
+  fi
+  ok "channel ordering follows semver, including releases above their prereleases"
+}
+
 case_workflow_attests_before_it_promotes() {
   local workflow=$root/.github/workflows/publish.yml stitch attest_image attest_files promote
   stitch=$(grep -n 'run: scripts/publish-release.sh stitch' "$workflow" | cut -d: -f1)
@@ -522,6 +603,11 @@ case_bad_subcommand() {
 for test in $(declare -F | awk '$3 ~ /^case_/ { print $3 }'); do
   "$test"
 done
+
+# Removed here as well as in the EXIT trap: a shell that sources this file
+# instead of executing it (which some harnesses do) never runs the trap, and a
+# leaked case directory is a bug in its own right.
+rm -rf "$tmp"
 
 if [ "$failures" -ne 0 ]; then
   echo "$failures failure(s)" >&2
