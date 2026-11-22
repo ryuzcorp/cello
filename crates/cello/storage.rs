@@ -2636,8 +2636,7 @@ pub fn sql_cursor_next(cursor_id: u64) -> Result<(Option<Vec<SqlValue>>, u64), S
             // let a caller retry and duplicate the write, so a write cursor
             // reports that its effects were not rolled back. A read cursor
             // keeps the rollback message: it has nothing to duplicate.
-            // SAFETY: the cursor exclusively owns its live statement.
-            let wrote = unsafe { rusqlite::ffi::sqlite3_stmt_readonly(cursor.statement) == 0 };
+            let wrote = cursor_is_write(cursor);
             if let Some(query) = cursor.cache_query.take() {
                 let scope = cursor.scope.clone();
                 cursors.remove(&cursor_id);
@@ -2710,11 +2709,17 @@ pub fn sql_cursor_close(cursor_id: u64) {
 /// cursor, which has nothing to report.
 pub fn sql_cursor_is_write(cursor_id: u64) -> bool {
     sql_cursors(|cursors| {
-        cursors.borrow().get(&cursor_id).is_some_and(|cursor| {
-            // SAFETY: the cursor exclusively owns its live statement.
-            unsafe { rusqlite::ffi::sqlite3_stmt_readonly(cursor.statement) == 0 }
-        })
+        cursors
+            .borrow()
+            .get(&cursor_id)
+            .is_some_and(cursor_is_write)
     })
+}
+
+/// The one predicate behind every guest-visible "the write stands" report.
+fn cursor_is_write(cursor: &SqlCursor) -> bool {
+    // SAFETY: the cursor exclusively owns its live statement.
+    unsafe { rusqlite::ffi::sqlite3_stmt_readonly(cursor.statement) == 0 }
 }
 
 /// The scope that opened a SQL cursor, if it is still active. The op

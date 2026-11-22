@@ -7276,7 +7276,9 @@ impl Worker {
                 //   state is a raw pointer into the `HeapLimitState` above;
                 // - `host_import_module_dynamically`, a bare fn pointer that
                 //   captures nothing;
-                // - a default `CreateParams` allocator, owned by V8.
+                // - the budget's Rust `ArrayBuffer` allocator
+                //   (`array_buffer_budget::allocator`), whose only state is an
+                //   `Arc<BackingStoreBudget>` of atomics, so `Send + Sync`.
                 //
                 // Nothing else is attached, and the assertion fails the build
                 // if a slot type ever stops being thread-safe.

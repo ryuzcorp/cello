@@ -394,3 +394,32 @@ fn array_buffer_growth_is_refused_at_the_budget() {
         "the node stopped serving after the refusals"
     );
 }
+
+/// An RPC abort whose reason the receiving isolate cannot pay for still
+/// aborts. The Durable Object holds 296 of its 320 MiB while it waits on a
+/// signal its caller passed, and the caller aborts with a 40 MiB reason: the
+/// reason is a host store the receiver's budget refuses. The live wait
+/// rejects with the budget's `RangeError`, and the abort must reach the
+/// signal as the standard `AbortError` instead of being dropped with the
+/// payload, which left a cancelled operation running until its own timeout.
+#[test]
+fn unpayable_rpc_abort_reason_still_aborts() {
+    let dir = fixture_tempdir("cello-array-buffer-abort-");
+    let project = dir.path().join("app");
+    copy_dir(&fixture_dir(), &project);
+    let node = TestNode::boot(&project);
+
+    let (status, _, body) = get(&node, "/unpayable-abort").expect("abort route answers");
+    assert_eq!(status, 200, "{body}");
+    let outcome: serde_json::Value = serde_json::from_str(&body).expect("json outcome");
+    assert_eq!(
+        outcome["aborted"], true,
+        "the abort was dropped with its refused reason: {outcome}"
+    );
+    assert_eq!(outcome["name"], "AbortError", "{outcome}");
+    assert_eq!(outcome["message"], "The operation was aborted", "{outcome}");
+    assert!(
+        probe(&node.public, "/health"),
+        "the node stopped serving after the refused abort reason"
+    );
+}

@@ -109,8 +109,9 @@ services, APIs, and Wrangler configuration.
   memory is not even counted as external memory. They count against nothing
   here, and crossing the cap with them does not condemn the isolate. Each is
   still bounded on its own: `--wasm-max-mem-pages` fails every `grow` past the
-  isolate's whole budget in pages (8192 pages of 64 KiB, 512 MiB, by default),
-  including a grow performed by wasm code; a declared `maximum` above that is
+  isolate's whole budget in pages (8192 pages of 64 KiB, 512 MiB, by default;
+  clamped to V8's own 65536 pages, 4 GiB, for a larger budget), including a
+  grow performed by wasm code; a declared `maximum` above that is
   accepted and simply cannot be reached. A resizable or growable buffer is
   limited only by V8's own `maxByteLength` range and the node's
   `CELLO_MAX_RSS_MB` pressure shedding.
