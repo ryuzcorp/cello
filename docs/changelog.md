@@ -1,8 +1,8 @@
 ---
 title: Changelog
-description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.3.
+description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.4.
 ---
-## Unreleased
+## v0.2.4
 
 A `TransformStream` now applies backpressure, a `tee()` bounds the skew
 between its branches, compression streams no longer leak native memory, and
@@ -85,7 +85,6 @@ changes; `CELLO_V8_EXTERNAL_LIMIT_MB` is new and optional.
   `operation timed out`, or the tee skew message when a streamed request body
   was a tee copy the budget ended. Code that matched the old wrapper text
   should match the cause instead.
-
 - **An isolate's `ArrayBuffer` memory is capped** (#110). V8's default
   ArrayBuffer allocator is `malloc`, so `new ArrayBuffer(n)` in a Worker was
   an unbounded allocation inside the shared process: `near_heap_limit`
