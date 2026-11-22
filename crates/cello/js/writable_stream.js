@@ -689,6 +689,16 @@ class TransformStream {
       highWaterMark: readableStrategy?.highWaterMark ?? 0,
       size: readableStrategy?.size,
     });
+    // Workerd's transform readable updates the writable side's backpressure
+    // from its queue directly (a native backpressure listener), so a read
+    // that frees a queue slot releases a parked write. This readable is a
+    // generic ReadableStream, which no longer pulls on a dequeue (workerd's
+    // generic controller does not either), so observe the dequeue instead:
+    // with highWaterMark > 0 a read can leave desiredSize positive without
+    // any pull running, and the parked write must resume.
+    this.readable._onDequeue = () => {
+      setBackpressure(!(rsc.desiredSize > 0));
+    };
     // Workerd extension: expectedLength on the
     // transformer feeds Content-Length when the
     // readable becomes a fetch body.

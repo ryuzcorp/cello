@@ -56,6 +56,27 @@ const routes = {
     return report({ seen, locked: rs.locked, end: await reader.read() });
   },
 
+  async "/readable-pull-order"() {
+    // Issue #113: a pull source runs one pull per read request, and the tee/
+    // enqueue pull chain advances in microtasks. Cello used to refill after
+    // the first `read()` dequeued, so it reported a second pull already.
+    let pulls = 0;
+    const rs = new ReadableStream({
+      pull(controller) {
+        pulls += 1;
+        controller.enqueue(`c${pulls}`);
+        if (pulls === 3) controller.close();
+      },
+    });
+    const reader = rs.getReader();
+    const order = [];
+    for (let index = 0; index < 3; index += 1) {
+      const { value } = await reader.read();
+      order.push([value, pulls]);
+    }
+    return report({ order, pulls, end: (await reader.read()).done });
+  },
+
   async "/readable-byob"() {
     const rs = new ReadableStream({
       type: "bytes",
@@ -158,6 +179,20 @@ const routes = {
     const cancelA = await cancellingA.then(() => "ok", (error) => errorInfo(error));
     const cancelB = await b.cancel("b done").then(() => "ok", (error) => errorInfo(error));
     return report({ head, cancelA, rest, sourceCancelled, cancelB });
+  },
+
+  async "/tee-cancel-reason"() {
+    // Issue #114: the source is cancelled with the reason of the last branch
+    // that cancels, not the spec's joined [reason1, reason2] composite.
+    let cancelled = null;
+    const source = new ReadableStream({
+      pull: (c) => c.enqueue(new TextEncoder().encode("chunk")),
+      cancel: (reason) => (cancelled = String(reason)),
+    });
+    const [a, b] = source.tee();
+    const cancelA = await a.cancel("first").then(() => "ok", (error) => errorInfo(error));
+    const cancelB = await b.cancel("second").then(() => "ok", (error) => errorInfo(error));
+    return report({ cancelA, cancelB, cancelled });
   },
 
   async "/clone-both"() {
