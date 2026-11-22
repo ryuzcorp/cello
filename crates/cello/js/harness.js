@@ -4801,10 +4801,19 @@ const __rpcSignalSubscribe = (receiver) => {
   if (signal === undefined) return false;
   const pending = __rpc_signal_wait(receiver.id);
   receiver.subscription = pending.__celloRpcSignalSubscription;
+  // A reason the isolate's budget cannot pay for rejects with a RangeError
+  // (see __rpcSignalRefresh): the abort is real, only its payload is
+  // unreadable, so deliver the standard AbortError instead of dropping it.
   pending.then((reason) => {
     const target = receiver.signal.deref();
     if (target !== undefined && reason.byteLength !== 0)
       __abortSignal(target, __rpcSignalReasonIn(reason));
+  }, (error) => {
+    if (!(error instanceof RangeError)) throw error;
+    const target = receiver.signal.deref();
+    if (target !== undefined)
+      __abortSignal(target,
+        new DOMException("The operation was aborted", "AbortError"));
   });
   // A wait belongs to the request that installed it. A retained signal needs
   // a fresh wait in each later request, and its finalizer must unsubscribe the

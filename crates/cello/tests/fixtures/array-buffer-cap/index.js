@@ -18,6 +18,43 @@ export class Cap extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
     this.held = [];
+    this.filled = new Promise((resolve) => {
+      this.markFilled = resolve;
+    });
+  }
+
+  // Fill this isolate's budget to `fill` bytes, then wait up to `ms` for
+  // `signal` to abort. The caller aborts with a reason this isolate cannot
+  // pay for, so the abort has to arrive as a standard AbortError instead of
+  // being dropped with the refused payload.
+  async holdUntilAborted(signal, fill, ms) {
+    const step = 8 * MIB;
+    const keep = [];
+    for (let got = 0; got + step <= fill; got += step) {
+      keep.push(new Uint8Array(step).fill(1));
+    }
+    this.markFilled(true);
+    const outcome = await new Promise((resolve) => {
+      const timer = setTimeout(() => resolve({ aborted: false }), ms);
+      const done = () => {
+        clearTimeout(timer);
+        const reason = signal.reason;
+        resolve({
+          aborted: true,
+          name: reason instanceof Error ? reason.name : typeof reason,
+          message: reason instanceof Error ? reason.message : "",
+        });
+      };
+      if (signal.aborted) done();
+      else signal.addEventListener("abort", done, { once: true });
+    });
+    keep.length = 0;
+    return outcome;
+  }
+
+  // Resolves once `holdUntilAborted` holds its memory and is subscribed.
+  whenFilled() {
+    return this.filled;
   }
 
   answer() {
@@ -104,6 +141,19 @@ export default {
     // The node has no `/health` of its own; every black-box suite serves one
     // from its fixture, which is what boot waits for.
     if (url.pathname === "/health") return new Response("ok");
+    // An abort whose reason the receiving isolate cannot pay for: the Durable
+    // Object holds most of its budget while it waits on the signal, and the
+    // reason is larger than what is left.
+    if (url.pathname === "/unpayable-abort") return unpayableAbort(env);
     return env.CAP.get(env.CAP.idFromName("budget")).fetch(request);
   },
 };
+
+async function unpayableAbort(env) {
+  const stub = env.CAP.get(env.CAP.idFromName("signal"));
+  const controller = new AbortController();
+  const pending = stub.holdUntilAborted(controller.signal, 296 * MIB, 10000);
+  await stub.whenFilled();
+  controller.abort(new Uint8Array(40 * MIB));
+  return Response.json(await pending);
+}
