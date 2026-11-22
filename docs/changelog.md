@@ -21,8 +21,11 @@ bucket-format changes.
   half-closes the write side (`shutdown(Write)`), and reads and discards what
   the peer still sends until EOF or a 2 s / 4 MiB bound, so the peer reads
   the close frame and then a clean EOF. The drain runs after the pump rather
-  than in it, is bounded in time and bytes, discards each byte instead of
-  buffering it, and never delays the close dispatch by more than the bound.
+  than in it; the flush, the half-close, and the drain share one 2 s deadline,
+  every byte is discarded instead of buffered, at most 256 sockets drain at
+  once node-wide (past that the frame is flushed and half-closed, then the
+  transport drops at once), and a draining node skips the drain entirely, so
+  no close dispatch or shutdown waits longer than that bound.
   The smoke client also no longer fails on the `EPIPE` that its own refused
   oversize write expects, while an `ECONNRESET` stays fatal.
 

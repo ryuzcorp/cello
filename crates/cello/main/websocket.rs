@@ -858,6 +858,9 @@ pub(crate) async fn outbound_websocket_task(
     if let Some(target) = target {
         return local_websocket_pipe(app, id, target, pull, reply).await;
     }
+    // Read before `app` moves into the cell sink below: a draining node
+    // flushes and half-closes the client socket without waiting on a drain.
+    let draining = app.is_draining();
     let sink = match pull {
         Some(pull) => OutboundWebSocketSink::Isolate(pull),
         None => OutboundWebSocketSink::Cell {
@@ -1001,8 +1004,11 @@ pub(crate) async fn outbound_websocket_task(
         .closed(id, close.state.0, close.state.1, close.state.2)
         .await;
     // The peer's echo or the cell's close is the last frame: linger so a
-    // peer still sending cannot answer it with an RST that discards it.
-    writer.linger_close().await;
+    // peer still sending cannot answer it with an RST that discards it. A
+    // poisoned writer lingers too — no further frame may follow the partial
+    // one, but the flush, FIN, and drain keep whatever did cross readable.
+    // A draining node skips the drain.
+    writer.linger_close(!draining).await;
     cello::js::ws_unregister(id);
     Ok(())
 }
@@ -1027,21 +1033,43 @@ fn websocket_close_details(payload: &[u8]) -> (u16, String) {
     }
 }
 
-/// Bound on one phase of the lingering close — the flush and half-close of
-/// the write side, and the read-and-discard drain — so a peer that stopped
-/// reading or never closes cannot pin the connection or its task.
-const LINGER_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// Longest one lingering close may take: the flush, the half-close, and the
+/// read-and-discard drain share this one deadline, so a socket that lingers
+/// pins its task and descriptor for at most this long. 500 ms under
+/// `cfg(test)` so the deadline test still runs at test speed with margin for
+/// a loaded suite; production keeps 2 s.
+const LINGER_CLOSE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(if cfg!(test) { 500 } else { 2_000 });
 
-/// Bound on the bytes the dangling close discards. A peer may keep sending
+/// Bound on the bytes a dangling close discards. A peer may keep sending
 /// after its close is refused; past this the transport is dropped anyway, so
 /// the discard never grows host memory or the wait without end.
 const LINGER_CLOSE_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// How many sockets may drain at once, process-wide. A peer makes an
+/// oversize header or a close cheaply, and each linger would otherwise hold
+/// one descriptor and one task for up to `LINGER_CLOSE_TIMEOUT`; the cap
+/// keeps a peer opening connections in a loop from pinning the node's
+/// descriptors and tasks for the bound in bulk. Over the cap, teardown
+/// flushes and half-closes but drops without draining, which costs only the
+/// best-effort RST avoidance. Every close still gets its frame.
+const LINGER_CLOSE_MAX_LINGERERS: usize = 256;
+
+/// The process-wide linger permits, shared by every socket task of every
+/// runtime, so the cap holds for the node rather than per runtime.
+static LINGER_CLOSE_PERMITS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(LINGER_CLOSE_MAX_LINGERERS);
 
 /// The pump's read stream: the split read half behind a lock shared with the
 /// transport teardown. The reader parses frames through it while the pump
 /// runs; after the pump stops reading, the lingering close drains and
 /// discards through the same half, so a peer still sending cannot turn the
 /// final close frame into an RST that discards it.
+///
+/// The lock is never contended: the reader polls at most one read at a time,
+/// and the teardown's drain starts only after the pump's futures are
+/// dropped. A `try_lock` → `Pending` path would need a waker registry to
+/// avoid a lost wakeup, so the invariant keeps the blocking lock instead.
 struct SharedRead<R> {
     inner: std::sync::Arc<std::sync::Mutex<R>>,
 }
@@ -1082,6 +1110,11 @@ where
 /// The pump's write stream: the split write half behind a lock shared with
 /// the transport teardown, so teardown can flush and half-close (TCP
 /// `shutdown(Write)`) after the final frame without writing another one.
+///
+/// The lock is never contended: every pump write serialises on the pump
+/// writer's own mutex before it reaches this half, `is_write_vectored` runs
+/// inside such a write, and the teardown flushes and half-closes only after
+/// the pump's writers are gone. Same `try_lock` reasoning as `SharedRead`.
 struct HalfCloseWrite<W> {
     inner: std::sync::Arc<std::sync::Mutex<W>>,
 }
@@ -1242,39 +1275,63 @@ where
     /// peer has not read yet — including the close frame just written. So
     /// after the last frame: flush and half-close the write side (FIN), then
     /// read and discard whatever the peer is still sending until it ends or
-    /// the bound trips. Bounded in time and bytes, and every byte is
-    /// discarded rather than buffered, so a peer that keeps sending or never
-    /// closes cannot pin the connection, the task, or host memory.
+    /// the bound trips. Every byte is discarded rather than buffered, and one
+    /// deadline covers the whole linger, so a peer that keeps sending or
+    /// never closes cannot pin the connection or the task past it.
     ///
-    /// Runs once per socket, after the caller's final write. A poisoned
-    /// writer still lingers: no further frame may follow the possibly
-    /// partial one, but the flush, the FIN, and the drain all keep whatever
-    /// did cross readable for the peer.
-    async fn linger_close(&self) {
+    /// `drain` false (node shutdown) still flushes and half-closes but skips
+    /// the drain, so teardown is not delayed the way `ws_await_flushes` is
+    /// skipped while draining. Past `LINGER_CLOSE_MAX_LINGERERS` concurrent
+    /// drains the permit is refused and the same flush-and-half-close-only
+    /// path runs: the close frame is already on the wire, and only the
+    /// best-effort RST avoidance is lost.
+    ///
+    /// Runs once per socket, after the caller's final write, and returns the
+    /// bytes discarded (zero when it did not drain). A poisoned writer still
+    /// lingers: no further frame may follow the possibly partial one, but the
+    /// flush, the FIN, and the drain all keep whatever did cross readable.
+    async fn linger_close(&self, drain: bool) -> usize {
         if self
             .teardown
             .lingered
             .swap(true, std::sync::atomic::Ordering::SeqCst)
         {
-            return;
+            return 0;
         }
+        // One deadline for the flush, the half-close, and the drain.
+        let deadline = cello::asyncrt::sleep(LINGER_CLOSE_TIMEOUT);
+        tokio::pin!(deadline);
         let mut write = self.teardown.write.clone();
-        let _ = cello::asyncrt::timeout(
-            LINGER_CLOSE_TIMEOUT,
-            tokio::io::AsyncWriteExt::flush(&mut write),
-        )
-        .await;
-        let _ = cello::asyncrt::timeout(
-            LINGER_CLOSE_TIMEOUT,
-            tokio::io::AsyncWriteExt::shutdown(&mut write),
-        )
-        .await;
+        let flushed = cello::asyncrt::select! {
+            _ = &mut deadline => false,
+            result = tokio::io::AsyncWriteExt::flush(&mut write) => {
+                let _ = result;
+                true
+            }
+        };
+        if !flushed {
+            return 0;
+        }
+        let half_closed = cello::asyncrt::select! {
+            _ = &mut deadline => false,
+            result = tokio::io::AsyncWriteExt::shutdown(&mut write) => {
+                let _ = result;
+                true
+            }
+        };
+        if !half_closed {
+            return 0;
+        }
         drop(write);
+        if !drain {
+            return 0;
+        }
+        let Ok(_permit) = LINGER_CLOSE_PERMITS.try_acquire() else {
+            return 0;
+        };
         let mut read = self.teardown.read.clone();
         let mut buf = [0u8; 16 * 1024];
         let mut discarded = 0usize;
-        let deadline = cello::asyncrt::sleep(LINGER_CLOSE_TIMEOUT);
-        tokio::pin!(deadline);
         loop {
             let step = cello::asyncrt::select! {
                 _ = &mut deadline => break,
@@ -1290,6 +1347,7 @@ where
                 }
             }
         }
+        discarded
     }
 }
 
@@ -1547,8 +1605,9 @@ enum PumpReadEvent {
 /// Read one frame on `state` and hand the state back with what it produced.
 /// The future owns everything it polls, so the pump loop can keep it across
 /// iterations without borrowing its own locals — and dropping it ends the
-/// pump, never a live read: the read half is dropped only once the socket
-/// is never read again.
+/// pump, never a live read. The read half itself outlives the future in the
+/// teardown, which drains it raw only after the pump's futures are dropped,
+/// so no frame is ever parsed again on a stream the drop desynchronised.
 async fn pump_read_one<S>(mut state: PumpReader<S>) -> (PumpReadEvent, PumpReader<S>)
 where
     S: tokio::io::AsyncRead + Unpin + Send,
@@ -1650,7 +1709,10 @@ type PumpReadInFlight<S> =
 /// The returned writer is still live, so the caller can write the close frames
 /// that follow — unless a write may have stopped mid-frame, which the
 /// poison flag records: after that no further frame may be written, and the
-/// caller drops the transport instead. The returned budget still covers the
+/// caller drops the transport instead. After its final frame the caller runs
+/// `PumpWriter::linger_close`, which flushes, half-closes the write side, and
+/// drains what the peer still sends under one deadline, so the close frame is
+/// not lost to an RST. The returned budget still covers the
 /// handed-back receiver: the forwarder released what it received, and the
 /// caller releases each data frame its post-pump drain removes, even when
 /// its write fails.
@@ -2113,8 +2175,9 @@ where
                             }
                         }
                         // The socket is gone: fail-closed, default close. The
-                        // read is dropped here. That is safe only because the
-                        // pump is over and the socket is never read again.
+                        // read is dropped here. That is safe because the pump
+                        // is over: the stream is never parsed again, only
+                        // drained raw by the lingering close.
                         PipeDirectionEnd::Retired => {}
                     }
                     receiver
@@ -2196,8 +2259,11 @@ async fn worker_websocket_task<S>(
         .send_close(close.state.0, close.state.1, close.state.2);
     // The close frame the worker or its peer observed is the last write on
     // the socket: linger so a peer still sending cannot answer it with an
-    // RST that discards it. The worker already got the close above.
-    writer.linger_close().await;
+    // RST that discards it. The worker already got the close above, and this
+    // path has no app handle to ask about a node drain. A poisoned writer
+    // lingers too: no further frame may follow the partial one, but the
+    // flush, the FIN, and the drain keep whatever did cross readable.
+    writer.linger_close(true).await;
 }
 
 /// Drain the close handler's queued frames after the pump: the handler runs
@@ -2346,8 +2412,12 @@ pub(super) async fn websocket_task<S>(
         echo_websocket_close(writer, &close.state, handler_sent_close).await;
         // The last close frame is on the wire; half-close the write side and
         // drain what the peer still sends, so its kernel does not answer the
-        // frame with an RST that can discard it before the peer reads it.
-        writer.linger_close().await;
+        // frame with an RST that can discard it before the peer reads it. A
+        // draining node flushes and half-closes only, like the
+        // `ws_await_flushes` wait skipped above, so shutdown is not delayed.
+        // This is the one call site that does not linger for a poisoned
+        // writer: the writer was dropped above before the close handler ran.
+        writer.linger_close(!app.is_draining()).await;
     }
     app.websocket_closed(route.cell().to_string(), target.id);
     cello::js::ws_unregister(target.id);
@@ -3150,6 +3220,7 @@ mod pump_tests {
     #[test]
     fn oversize_close_reaches_a_tcp_peer_still_sending() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _serial = linger_test_lock();
         // Big enough that the header read cannot consume it all: the pump
         // reads a few header bytes, so the rest stays unread at drop time.
         const QUEUED_PREFIX_BYTES: usize = 64 * 1024;
@@ -3200,7 +3271,7 @@ mod pump_tests {
                         cello::ws_message::WS_MESSAGE_TOO_BIG_CODE,
                         "iteration {iteration}: the pump refuses the oversize header"
                     );
-                    writer.linger_close().await;
+                    writer.linger_close(true).await;
                 });
 
                 let stream = tokio::net::TcpStream::connect(addr)
@@ -3295,6 +3366,377 @@ mod pump_tests {
                 prefix_writer.await.expect("the prefix writer joins");
             }
         });
+    }
+
+    /// Serialises the tests that exercise the process-wide linger permits:
+    /// one of them takes every permit, so the others must not run beside it.
+    static LINGER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn linger_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        LINGER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The masked header of a binary frame declaring one byte past the
+    /// message cap, plus its mask. The pump refuses it from the header alone.
+    fn oversize_frame_head() -> (Vec<u8>, [u8; 4]) {
+        let declared = cello::ws_message::WS_MAX_MESSAGE_BYTES + 1;
+        let mask = [0x12u8, 0x34, 0x56, 0x78];
+        let mut head = Vec::with_capacity(14);
+        head.push(0x82);
+        head.push(0x80 | 127);
+        head.extend_from_slice(&(declared as u64).to_be_bytes());
+        head.extend_from_slice(&mask);
+        (head, mask)
+    }
+
+    /// `bytes` of masked payload, so the frame body is well formed even
+    /// though the pump never reads it.
+    fn masked_prefix(bytes: usize, mask: [u8; 4]) -> Vec<u8> {
+        let mut prefix = vec![0u8; bytes];
+        for (i, byte) in prefix.iter_mut().enumerate() {
+            *byte = (i & 0xff) as u8 ^ mask[i & 3];
+        }
+        prefix
+    }
+
+    /// Wait until at least `bytes` sit unread in the listener socket's
+    /// receive buffer, so a later drop without a drain always has unread data
+    /// to turn into an RST.
+    async fn wait_for_queued(stream: &tokio::net::TcpStream, bytes: usize) {
+        let mut probe = vec![0u8; bytes];
+        loop {
+            stream
+                .readable()
+                .await
+                .expect("queued data arrives on the listener socket");
+            match stream.peek(&mut probe).await {
+                Ok(0) => panic!("the client ended without queueing a prefix"),
+                Ok(n) if n >= bytes => return,
+                Ok(_) => continue,
+                Err(error) => panic!("peeking the queued prefix failed: {error}"),
+            }
+        }
+    }
+
+    /// Run the pump over `stream` with a dispatch that never completes, so an
+    /// oversize header ends it loudly. Returns the close code it reported and
+    /// the writer the caller's teardown uses.
+    async fn oversize_pump(
+        stream: tokio::net::TcpStream,
+    ) -> (u16, PumpWriter<tokio::net::TcpStream>) {
+        let mut socket =
+            fastwebsockets::WebSocket::after_handshake(stream, fastwebsockets::Role::Server);
+        socket.set_auto_close(false);
+        // Kept for the whole pump so the forwarder does not retire first.
+        let (_outbound, outputs) = mpsc::unbounded_channel();
+        let (close, writer, _outputs, _budget) = pump_cell_socket(
+            socket,
+            outputs,
+            false,
+            |_: cello::js::WsIn| std::future::pending::<anyhow::Result<()>>(),
+            cello::js::WsPipeBudget::new(ISOLATE_PIPE_MAX_STAGED_BYTES),
+        )
+        .await;
+        (close.state.0, writer)
+    }
+
+    /// A peer that trickles forever is cut at the linger deadline.
+    ///
+    /// The peer never closes and never stops sending, so the drain can end
+    /// only on the deadline: without it the socket task and descriptor would
+    /// stay pinned for as long as the peer keeps writing. The bytes that did
+    /// arrive are discarded (bounded by the deadline), and the whole linger
+    /// stays inside its one time bound.
+    #[test]
+    fn linger_stops_a_trickling_peer_at_its_deadline() {
+        use tokio::io::AsyncWriteExt;
+        let _serial = linger_test_lock();
+        test_runtime().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("the test listener binds");
+            let addr = listener.local_addr().expect("the listener address");
+            let (queued_tx, queued_rx) = tokio::sync::oneshot::channel::<()>();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("the client connects");
+                stream.set_nodelay(true).expect("nodelay on the server");
+                queued_rx.await.expect("the client queues its frame");
+                wait_for_queued(&stream, 1024).await;
+                let (code, writer) = oversize_pump(stream).await;
+                assert_eq!(
+                    code,
+                    cello::ws_message::WS_MESSAGE_TOO_BIG_CODE,
+                    "the pump refuses the oversize header"
+                );
+                let started = tokio::time::Instant::now();
+                let discarded = writer.linger_close(true).await;
+                (discarded, started.elapsed())
+            });
+
+            let stream = tokio::net::TcpStream::connect(addr)
+                .await
+                .expect("the test client connects");
+            stream.set_nodelay(true).expect("nodelay on the client");
+            let (mut reader, write_half) = stream.into_split();
+            let (head, mask) = oversize_frame_head();
+            let mut write_half = write_half;
+            write_half
+                .write_all(&head)
+                .await
+                .expect("the frame header writes");
+            write_half
+                .write_all(&masked_prefix(1024, mask))
+                .await
+                .expect("the prefix writes");
+            // One byte every few milliseconds, forever as far as the linger
+            // is concerned, and no close: the drain cannot end on its own.
+            let trickle = tokio::spawn(async move {
+                let mut writer = write_half;
+                for _ in 0..600 {
+                    if writer.write_all(&[0x00]).await.is_err() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                let _ = release_rx.await;
+                drop(writer);
+            });
+            queued_tx.send(()).expect("the server starts the pump");
+
+            let (opcode, payload) = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                read_server_frame(&mut reader),
+            )
+            .await
+            .expect("the loud close must arrive");
+            assert_eq!(opcode, 0x8, "the trickle still gets the close frame");
+            assert_eq!(
+                u16::from_be_bytes([payload[0], payload[1]]),
+                cello::ws_message::WS_MESSAGE_TOO_BIG_CODE,
+                "loud 1009 close"
+            );
+
+            let (discarded, elapsed) =
+                tokio::time::timeout(std::time::Duration::from_secs(30), server)
+                    .await
+                    .expect("the linger must end on its own")
+                    .expect("the server task joins");
+            assert!(
+                discarded < LINGER_CLOSE_MAX_BYTES,
+                "the deadline, not the byte bound, ends a trickle: {discarded} bytes"
+            );
+            assert!(
+                elapsed >= LINGER_CLOSE_TIMEOUT,
+                "the drain must run until the deadline: {elapsed:?}"
+            );
+            assert!(
+                elapsed < std::time::Duration::from_secs(5),
+                "one deadline bounds the whole linger: {elapsed:?}"
+            );
+            let _ = release_tx.send(());
+            trickle.await.expect("the trickle task joins");
+        });
+    }
+
+    /// A peer that floods after the close is cut at the byte bound.
+    ///
+    /// The peer never closes and keeps writing megabytes, so only the byte
+    /// bound can end the drain this quickly; what it discards stays inside
+    /// the bound plus the one read that crossed it.
+    #[test]
+    fn linger_stops_a_flooding_peer_at_its_byte_bound() {
+        use tokio::io::AsyncWriteExt;
+        let _serial = linger_test_lock();
+        test_runtime().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("the test listener binds");
+            let addr = listener.local_addr().expect("the listener address");
+            let (queued_tx, queued_rx) = tokio::sync::oneshot::channel::<()>();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("the client connects");
+                stream.set_nodelay(true).expect("nodelay on the server");
+                queued_rx.await.expect("the client queues its prefix");
+                wait_for_queued(&stream, 64 * 1024).await;
+                let (code, writer) = oversize_pump(stream).await;
+                assert_eq!(
+                    code,
+                    cello::ws_message::WS_MESSAGE_TOO_BIG_CODE,
+                    "the pump refuses the oversize header"
+                );
+                let started = tokio::time::Instant::now();
+                let discarded = writer.linger_close(true).await;
+                (discarded, started.elapsed())
+            });
+
+            let stream = tokio::net::TcpStream::connect(addr)
+                .await
+                .expect("the test client connects");
+            stream.set_nodelay(true).expect("nodelay on the client");
+            let (mut reader, mut write_half) = stream.into_split();
+            let (head, mask) = oversize_frame_head();
+            write_half
+                .write_all(&head)
+                .await
+                .expect("the frame header writes");
+            write_half
+                .write_all(&masked_prefix(64 * 1024, mask))
+                .await
+                .expect("the first prefix writes");
+            // Eight megabytes, four times the bound, with no close: only the
+            // byte bound can end the drain.
+            let flood = tokio::spawn(async move {
+                let mut writer = write_half;
+                let chunk = vec![0x5au8; 64 * 1024];
+                for _ in 0..128 {
+                    if writer.write_all(&chunk).await.is_err() {
+                        break;
+                    }
+                }
+                let _ = release_rx.await;
+                drop(writer);
+            });
+            queued_tx.send(()).expect("the server starts the pump");
+
+            let (opcode, payload) = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                read_server_frame(&mut reader),
+            )
+            .await
+            .expect("the loud close must arrive");
+            assert_eq!(opcode, 0x8, "the flood still gets the close frame");
+            assert_eq!(
+                u16::from_be_bytes([payload[0], payload[1]]),
+                cello::ws_message::WS_MESSAGE_TOO_BIG_CODE,
+                "loud 1009 close"
+            );
+
+            let (discarded, elapsed) =
+                tokio::time::timeout(std::time::Duration::from_secs(30), server)
+                    .await
+                    .expect("the linger must end on its own")
+                    .expect("the server task joins");
+            assert!(
+                discarded >= LINGER_CLOSE_MAX_BYTES,
+                "the flood is cut at the byte bound: {discarded} bytes"
+            );
+            assert!(
+                discarded < LINGER_CLOSE_MAX_BYTES + 16 * 1024,
+                "the bound plus at most the crossing read: {discarded} bytes"
+            );
+            assert!(
+                elapsed < LINGER_CLOSE_TIMEOUT,
+                "the byte bound, not the deadline, ends a flood: {elapsed:?}"
+            );
+            let _ = release_tx.send(());
+            flood.await.expect("the flood task joins");
+        });
+    }
+
+    /// With every linger permit taken, the close still reaches the peer and
+    /// teardown does not wait for a drain.
+    ///
+    /// The permit cap exists so a peer cannot pin many descriptors and tasks
+    /// by opening connections in a loop; past it the linger flushes and
+    /// half-closes but drops at once. The client reads its 1009 before the
+    /// teardown starts, so the check does not race the RST a stateless drop
+    /// over unread data sends.
+    #[test]
+    fn linger_without_a_permit_still_closes_without_draining() {
+        use tokio::io::AsyncWriteExt;
+        let _serial = linger_test_lock();
+        // The pool starts full and no other test runs beside this one.
+        let permits: Vec<_> =
+            std::iter::from_fn(|| LINGER_CLOSE_PERMITS.try_acquire().ok()).collect();
+        assert_eq!(
+            permits.len(),
+            LINGER_CLOSE_MAX_LINGERERS,
+            "the test holds every linger permit"
+        );
+        test_runtime().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("the test listener binds");
+            let addr = listener.local_addr().expect("the listener address");
+            let (queued_tx, queued_rx) = tokio::sync::oneshot::channel::<()>();
+            let (read_tx, read_rx) = tokio::sync::oneshot::channel::<()>();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("the client connects");
+                stream.set_nodelay(true).expect("nodelay on the server");
+                queued_rx.await.expect("the client queues its prefix");
+                wait_for_queued(&stream, 64 * 1024).await;
+                let (code, writer) = oversize_pump(stream).await;
+                assert_eq!(
+                    code,
+                    cello::ws_message::WS_MESSAGE_TOO_BIG_CODE,
+                    "the pump refuses the oversize header"
+                );
+                // Without a drain the drop sends RST over the unread prefix,
+                // so the client reads the close first; that is the delivery
+                // this test asserts, not a property of the drain.
+                tokio::time::timeout(std::time::Duration::from_secs(30), read_rx)
+                    .await
+                    .expect("the client reads the close")
+                    .expect("the read signal arrives");
+                let started = tokio::time::Instant::now();
+                let discarded = writer.linger_close(true).await;
+                (discarded, started.elapsed())
+            });
+
+            let stream = tokio::net::TcpStream::connect(addr)
+                .await
+                .expect("the test client connects");
+            stream.set_nodelay(true).expect("nodelay on the client");
+            let (mut reader, write_half) = stream.into_split();
+            let (head, mask) = oversize_frame_head();
+            let mut write_half = write_half;
+            write_half
+                .write_all(&head)
+                .await
+                .expect("the frame header writes");
+            // A megabyte stays unread, so a drain would visibly discard it;
+            // the half stays open until the server is done.
+            let prefix_writer = tokio::spawn(async move {
+                let mut writer = write_half;
+                let _ = writer.write_all(&masked_prefix(1024 * 1024, mask)).await;
+                let _ = release_rx.await;
+                drop(writer);
+            });
+            queued_tx.send(()).expect("the server starts the pump");
+
+            let (opcode, payload) = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                read_server_frame(&mut reader),
+            )
+            .await
+            .expect("the close frame must arrive");
+            assert_eq!(opcode, 0x8, "the close still reaches the peer");
+            assert_eq!(
+                u16::from_be_bytes([payload[0], payload[1]]),
+                cello::ws_message::WS_MESSAGE_TOO_BIG_CODE,
+                "loud 1009 close"
+            );
+            read_tx.send(()).expect("the server lingers now");
+
+            let (discarded, elapsed) =
+                tokio::time::timeout(std::time::Duration::from_secs(30), server)
+                    .await
+                    .expect("a permit-starved linger must not hang")
+                    .expect("the server task joins");
+            assert_eq!(discarded, 0, "no permit: the linger must not drain");
+            assert!(
+                elapsed < LINGER_CLOSE_TIMEOUT,
+                "flush and half-close do not wait: {elapsed:?}"
+            );
+            let _ = release_tx.send(());
+            prefix_writer.await.expect("the prefix writer joins");
+        });
+        drop(permits);
     }
 
     /// Fragments reassemble in order below the caps: a FIN=0 frame plus two
