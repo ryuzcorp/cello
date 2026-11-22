@@ -135,6 +135,9 @@ version_from_tag() {
 # freeze `beta` at a prerelease of the version being released.
 SEMVER_CMP=0
 semver_cmp() {
+  # ASCII collation for the identifier comparisons below, whatever the caller's
+  # locale: `[[ < ]]` otherwise follows the locale's collation order.
+  local LC_ALL=C
   local a=$1 b=$2 a_core=${1%%-*} b_core=${2%%-*} a_pre="" b_pre=""
   case $a in *-*) a_pre=${a#*-} ;; esac
   case $b in *-*) b_pre=${b#*-} ;; esac
@@ -366,10 +369,14 @@ promote() {
   (cd "$dist" && sha256sum -c SHA256SUMS)
 
   # The ordering guarantee is mechanical: read the image attestation back
-  # before a single channel tag moves, so a promote cannot promote an index the
-  # attest step did not cover.
-  gh attestation verify "oci://$image@$index" --repo "$GH_REPO" >/dev/null ||
-    refuse "no attestation for $image@$index; not moving a channel tag"
+  # before a single channel tag moves, bound to this workflow and this commit,
+  # so a promote cannot promote an index attested by some other workflow (or
+  # for another commit) that happens to name the same repository.
+  need GITHUB_SHA
+  gh attestation verify "oci://$image@$index" --repo "$GH_REPO" \
+    --signer-workflow "$GH_REPO/.github/workflows/publish.yml" \
+    --source-digest "$GITHUB_SHA" >/dev/null ||
+    refuse "no attestation from this workflow for $image@$index at $GITHUB_SHA; not moving a channel tag"
 
   local tags=("beta") moved=() tag claim_latest=true
   if [ "$PRERELEASE" != "true" ]; then
