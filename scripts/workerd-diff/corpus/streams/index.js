@@ -338,6 +338,152 @@ const routes = {
     return report({ text: chunks.map((chunk) => decoder.decode(chunk)).join(""), chunks: chunks.length });
   },
 
+  async "/body-used-reader"(request) {
+    // bodyUsed observes the body stream: a reader that takes bytes disturbs
+    // it, and a guard re-checking mid-stream must see that. Merely holding a
+    // reader (locked, nothing read) is not yet a disturbance.
+    const before = request.bodyUsed;
+    const reader = request.body.getReader();
+    const lockedOnly = request.bodyUsed;
+    const first = await reader.read();
+    const during = request.bodyUsed;
+    // Drain the rest: the host may split the upload, and the transcript must
+    // name the whole body however the chunks arrived.
+    const parts = [decoder.decode(first.value)];
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) break;
+      parts.push(decoder.decode(next.value));
+    }
+    reader.releaseLock();
+    const after = request.bodyUsed;
+    return report({ before, lockedOnly, during, after, chunk: parts.join("") });
+  },
+
+  async "/res-body-used"() {
+    const buffered = new Response("abc");
+    const bufferedInit = buffered.bodyUsed;
+    const bufferedReader = buffered.body.getReader();
+    const bufferedLocked = buffered.bodyUsed;
+    const bufferedFirst = await bufferedReader.read();
+    const bufferedDuring = buffered.bodyUsed;
+    bufferedReader.releaseLock();
+    const bufferedAfter = buffered.bodyUsed;
+
+    const streamed = new Response(byteStream(["one", "two"]));
+    const streamedReader = streamed.body.getReader();
+    const streamedLocked = streamed.bodyUsed;
+    const streamedFirst = await streamedReader.read();
+    const streamedDuring = streamed.bodyUsed;
+    streamedReader.releaseLock();
+    const streamedAfter = streamed.bodyUsed;
+
+    const consumed = new Response("abc");
+    await consumed.text();
+    const consumedUsed = consumed.bodyUsed;
+
+    return report({
+      buffered: {
+        init: bufferedInit, locked: bufferedLocked, during: bufferedDuring,
+        after: bufferedAfter, chunk: decoder.decode(bufferedFirst.value),
+      },
+      streamed: {
+        locked: streamedLocked, during: streamedDuring, after: streamedAfter,
+        chunk: decoder.decode(streamedFirst.value),
+      },
+      consumed: consumedUsed,
+    });
+  },
+
+  async "/clone-consumed"() {
+    const settle = (fn) => Promise.resolve()
+      .then(() => fn())
+      .then((value) => value, errorInfo);
+    const consumedResponse = new Response("consumed");
+    await consumedResponse.text();
+    const responseClone = await settle(() => consumedResponse.clone());
+    const consumedRequest = new Request("https://diff.test/", { method: "POST", body: "consumed" });
+    await consumedRequest.text();
+    const requestClone = await settle(() => consumedRequest.clone());
+    // A body held (not read) by its own reader is refused too, with the same
+    // message: workerd reports the locked stream whatever the consumer did.
+    const lockedResponse = new Response("locked");
+    lockedResponse.body.getReader();
+    const lockedClone = await settle(() => lockedResponse.clone());
+    const empty = new Response(null).clone();
+    return report({
+      responseClone, requestClone, lockedClone, emptyStatus: empty.status,
+      emptyBodyUsed: empty.bodyUsed,
+    });
+  },
+
+  async "/string-chunks"() {
+    // A body stream must yield bytes. Every Body consumer rejects a string
+    // chunk with workerd's TypeError, and none of them hands back partial
+    // data.
+    const strings = () => new ReadableStream({
+      start: (c) => (c.enqueue("alpha"), c.enqueue("beta"), c.close()),
+    });
+    const settle = (promise) => promise.then((value) => value, errorInfo);
+    const requestOf = (body) => new Request("https://diff.test/", { method: "POST", body });
+    const text = await settle(new Response(strings()).text());
+    const arrayBuffer = await settle(new Response(strings()).arrayBuffer());
+    const json = await settle(new Response(strings()).json());
+    const formData = await settle(new Response(strings()).formData());
+    const blob = await settle(new Response(strings()).blob());
+    const bytes = await settle(new Response(strings()).bytes());
+    const requestText = await settle(requestOf(strings()).text());
+    const mixed = await settle(new Response(new ReadableStream({
+      start: (c) => (c.enqueue(encoder.encode("ok")), c.enqueue("bad"), c.close()),
+    })).text());
+    // Bytes are accepted in every shape workerd accepts them.
+    const buffer = await settle(new Response(new ReadableStream({
+      start: (c) => (c.enqueue(encoder.encode("ab").buffer), c.close()),
+    })).text());
+    const view = await settle(new Response(new ReadableStream({
+      start: (c) => (c.enqueue(encoder.encode("ab")), c.close()),
+    })).bytes().then((value) => [...value]));
+    const zero = await settle(new Response(new ReadableStream({
+      start: (c) => { c.close(); },
+    })).text());
+    return report({ text, arrayBuffer, json, formData, blob, bytes, requestText, mixed, buffer, view, zero });
+  },
+
+  async "/body-chunk-shadows"() {
+    // A chunk's window must come from internal slots. A guest can define own
+    // `buffer`, `byteOffset` and `byteLength` properties on a view; reading
+    // them off the chunk pads the body, reads another window, or throws.
+    const shadowed = (view, fake) => {
+      Object.defineProperty(view, "buffer", { value: fake });
+      Object.defineProperty(view, "byteOffset", { value: 1 });
+      Object.defineProperty(view, "byteLength", { value: 4096 });
+      return view;
+    };
+    const decode = (chunks) => {
+      const stream = new ReadableStream({
+        start: (c) => {
+          for (const chunk of chunks) c.enqueue(chunk);
+          c.close();
+        },
+      });
+      return new Response(stream).text().then((value) => value, errorInfo);
+    };
+    const filler = () => new ArrayBuffer(8192);
+    const typed = await decode([shadowed(new Uint8Array(encoder.encode("abc")), filler())]);
+    const dataView = await decode([shadowed(new DataView(encoder.encode("xyz").buffer), filler())]);
+    const small = await decode([shadowed(new DataView(encoder.encode("qrs").buffer), new ArrayBuffer(2))]);
+    const wide = await decode([shadowed(new Uint16Array([0x6261]), filler())]);
+    return report({ typed, dataView, small, wide });
+  },
+
+  async "/string-chunks-response"() {
+    // The response/host path takes the same stream: both runtimes write a
+    // string chunk out as its UTF-8 bytes.
+    return new Response(new ReadableStream({
+      start: (c) => (c.enqueue("alpha"), c.enqueue("beta"), c.close()),
+    }));
+  },
+
   async "/sse"() {
     const body = new ReadableStream({
       start: (c) => {
