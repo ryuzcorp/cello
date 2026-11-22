@@ -1821,6 +1821,33 @@ fn throw_host_store_refusal(
     scope.throw_exception(exception);
 }
 
+/// The same `RangeError`, for a refusal that arrives **after** the statement
+/// it belongs to ran.
+///
+/// A SQLite cursor yields a write statement's first `RETURNING` row only after
+/// the write itself was applied, and closing the cursor keeps that write in
+/// autocommit (and inside an open transaction it stays in that transaction).
+/// A row whose BLOB the budget cannot pay for is therefore refused after the
+/// write exists, and a guest that retries on the plain budget message would
+/// apply it twice. The distinct text says the effects stand; the budget prefix
+/// is unchanged so existing matching keeps working.
+fn throw_host_store_refusal_after_write(
+    scope: &mut v8::PinScope,
+    refusal: &array_buffer_budget::HostStoreRefusal,
+) {
+    let message = v8::String::new(
+        scope,
+        &format!(
+            "{refusal}. The statement had already executed, so its effects \
+             were applied and were not rolled back; only the returned row was \
+             refused — do not retry it"
+        ),
+    )
+    .unwrap();
+    let exception = v8::Exception::range_error(scope, message);
+    scope.throw_exception(exception);
+}
+
 /// Move `bytes` into a `Uint8Array` without copying, charged to the
 /// isolate's backing-store budget.
 ///

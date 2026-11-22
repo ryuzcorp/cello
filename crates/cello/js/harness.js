@@ -1444,7 +1444,12 @@ class SqlCursor {
       const result = this.next();
       if (result.done) return rows;
       rows.push(result.value);
-      if (__heap_limit_excessively_exceeded())
+      // `_advanceNative` prefetches the next row after this one; when that
+      // prefetch is refused, the refusal is deferred to the next `next()` so
+      // this row still arrives. Throwing the generic message here would
+      // replace it, so leave the check for the heap when a refusal is
+      // already pending.
+      if (this._deferredError === null && __heap_limit_excessively_exceeded())
         throw new Error(
           "the isolate is over its " +
           (__heap_limit_external_exceeded()
@@ -4830,17 +4835,34 @@ const __liftSignal = (signal) => {
 };
 const __rpcSignalRefresh = () => {
   for (const [id, receivers] of __rpcSignalReceivers) {
-    const state = __rpc_signal_poll(id);
+    // A poll answers the encoded abort reason (a Uint8Array), null when the
+    // source is gone, or undefined while it is still live. A reason the
+    // isolate's budget cannot pay for throws a RangeError instead: the abort
+    // is real, only its payload is unreadable. Deliver an AbortError with the
+    // standard message and drop the record -- failing here would fail an
+    // unrelated request before its handler ran, and the next request would
+    // fail the same way.
+    let state;
+    let unpayable = false;
+    try {
+      state = __rpc_signal_poll(id);
+    } catch (error) {
+      if (!(error instanceof RangeError)) throw error;
+      unpayable = true;
+    }
     const live = new Set();
     for (const receiver of receivers) {
       const signal = receiver.signal.deref();
       if (signal === undefined) continue;
       if (state instanceof Uint8Array)
         __abortSignal(signal, __rpcSignalReasonIn(state));
+      else if (unpayable)
+        __abortSignal(signal,
+          new DOMException("The operation was aborted", "AbortError"));
       else if (state !== null && __rpcSignalSubscribe(receiver))
         live.add(receiver);
     }
-    if (live.size === 0 || state === null || state instanceof Uint8Array)
+    if (unpayable || live.size === 0 || state === null || state instanceof Uint8Array)
       __rpcSignalReceivers.delete(id);
     else
       __rpcSignalReceivers.set(id, live);

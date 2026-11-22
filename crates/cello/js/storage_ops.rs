@@ -803,8 +803,16 @@ pub(super) fn cursor_row<'s>(
     match sql_row_to_v8(scope, row) {
         Ok(row) => Some(row),
         Err(refusal) => {
+            // Ask before closing: the statement is what says whether the write
+            // this row came from already ran, and the guest has to learn that
+            // or a retry duplicates it.
+            let wrote = storage::sql_cursor_is_write(cursor);
             storage::sql_cursor_close(cursor);
-            super::throw_host_store_refusal(scope, &refusal);
+            if wrote {
+                super::throw_host_store_refusal_after_write(scope, &refusal);
+            } else {
+                super::throw_host_store_refusal(scope, &refusal);
+            }
             None
         }
     }
