@@ -33,4 +33,14 @@ export const cases = [
     fixture: "streams",
     requests: [{ method: "POST", path: "/streamed-request-body", body: ["alpha", "be", "ta"] }],
   },
+  {
+    name: "body-used-reader",
+    fixture: "streams",
+    requests: [{ method: "POST", path: "/body-used-reader", body: ["alpha"] }],
+  },
+  { name: "res-body-used", fixture: "streams", path: "/res-body-used" },
+  { name: "clone-consumed", fixture: "streams", path: "/clone-consumed" },
+  { name: "string-chunks", fixture: "streams", path: "/string-chunks" },
+  { name: "string-chunks-response", fixture: "streams", path: "/string-chunks-response" },
+  { name: "body-chunk-shadows", fixture: "streams", path: "/body-chunk-shadows" },
 ];

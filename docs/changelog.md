@@ -2,6 +2,47 @@
 title: Changelog
 description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.6.
 ---
+## Unreleased
+
+Three body-lifecycle divergences from workerd, found by the workerd
+differential harness, are fixed: `bodyUsed` now reports a disturbed or
+consumed body stream, `clone()` reports workerd's message, and a body stream
+that yields a non-byte chunk fails its consumers with a `TypeError` instead
+of a `RangeError`. No configuration, data, or bucket-format changes.
+
+- **`request.bodyUsed` / `response.bodyUsed` observe the body stream**
+  (#115). The flag was plain state that only the runtime's own consumers set,
+  so a Worker that held a reader, or had read part of a live request body,
+  still saw `false` -- and any guard that re-checks `bodyUsed` mid-stream
+  before re-reading was bypassed. It is now the Fetch observation it should
+  be: true once the body stream is disturbed (a read or a cancel through any
+  reader, mounted mid-stream), or once the runtime has taken the body through
+  `text()`, `arrayBuffer()`, `bytes()`, a subrequest forward, or
+  `cache.put()`. Merely holding a reader is still not a disturbance, which is
+  what workerd reports.
+- **`clone()` of a used body reports workerd's `TypeError` message** (#116).
+  Both `Response.clone()` and `Request.clone()` still refuse a consumed,
+  disturbed or locked body, but the message is now workerd's
+  `This ReadableStream is currently locked to a reader,` instead of
+  `Body has already been consumed`, so a Worker that surfaces
+  `error.message` reports what the same Worker reports on Cloudflare. Cello
+  keeps refusing after a manual read plus `releaseLock()`, where workerd lets
+  the clone through and hands both sides empty bytes.
+- **A body stream that yields a non-byte chunk rejects with workerd's
+  `TypeError`** (#117). `text()`, `json()`, `formData()`, `blob()`,
+  `arrayBuffer()`, `bytes()`, or a subrequest body all funnel through one
+  drain; a string (or any other non-`ArrayBuffer`/view)
+  chunk there failed inside the byte arithmetic with
+  `RangeError: offset is out of bounds`, which names neither the cause nor the
+  fix. It now rejects with
+  `TypeError: This ReadableStream did not return bytes.` before any data is
+  returned, as workerd does. `ArrayBuffer` and every `ArrayBufferView` chunk
+  are accepted, and the response/host path keeps streaming string chunks as
+  their UTF-8 bytes, which is also what workerd does.
+- **`Request.prototype.bytes()` and `Response.prototype.bytes()` exist**
+  (#117). Fetch's byte accessor was missing; it returns the undecoded body as
+  a fresh `Uint8Array` and marks the body used, like the other consumers.
+
 ## v0.2.6
 
 The same code as v0.2.5, released again with complete provenance: the v0.2.5

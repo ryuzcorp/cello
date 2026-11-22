@@ -54,7 +54,7 @@
       const buffered = new Uint8Array(await response.arrayBuffer());
       return buffered.byteLength > MAX_ENTRY_BYTES ? null : buffered;
     }
-    response.bodyUsed = true;
+    __cello.__markBodyUsed(response);
     const reader = response.body.getReader();
     const chunks = [];
     let size = 0;
