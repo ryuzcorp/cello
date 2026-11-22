@@ -1446,8 +1446,11 @@ class SqlCursor {
       rows.push(result.value);
       if (__heap_limit_excessively_exceeded())
         throw new Error(
-          "the isolate is over its V8 heap limit, so it stopped " +
-          "materializing a result set (see CELLO_V8_HEAP_LIMIT_MB)");
+          "the isolate is over its " +
+          (__heap_limit_external_exceeded()
+            ? "ArrayBuffer memory limit (see CELLO_V8_EXTERNAL_LIMIT_MB)"
+            : "V8 heap limit (see CELLO_V8_HEAP_LIMIT_MB)") +
+          ", so it stopped materializing a result set");
     }
   }
   one() {
