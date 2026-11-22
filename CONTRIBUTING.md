@@ -36,8 +36,9 @@ The retry re-stitches from the per-arch digests the first attempt uploaded and
 accepts the already-published `<version>` only when it is exactly that index;
 anything else is refused. Both attestations run again, so a digest can end up
 with more than one provenance bundle — each verifies on its own. `promote` reads
-the image attestation back before it moves the first channel tag, so the
-ordering is enforced, not just intended. A failure inside `promote` leaves the
+the image attestation back before it moves the first channel tag, bound to
+`publish.yml` and the tagged commit, so the ordering is enforced, not just
+intended. A failure inside `promote` leaves the
 channel tags that already moved (each already the attested index) and no
 Release; the retry re-runs those carbon copies and finishes. Channel tags only
 move forward (a release outranks its own prereleases), so a retry of an older

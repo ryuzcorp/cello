@@ -17,6 +17,7 @@ trap 'rm -rf "$tmp"' EXIT
 
 image=ghcr.io/ryuzcorp/cello
 repo=ryuzcorp/cello
+sha=0123456789abcdef0123456789abcdef01234567
 version=0.2.7
 minor=0.2
 amd="sha256:$(printf '1%.0s' {1..64})"
@@ -158,6 +159,16 @@ case "${1:-}" in
     ;;
   attestation)
     [ "${2:-}" = verify ] || { echo "gh stub: unsupported: $*" >&2; exit 1; }
+    printf '%s\n' "$*" >>"$state/attestation.log"
+    # The read-back must be bound to this workflow and commit, not just the repo.
+    case " $* " in
+      *" --signer-workflow ryuzcorp/cello/.github/workflows/publish.yml "*) ;;
+      *) echo "gh stub: attestation verify without --signer-workflow" >&2; exit 1 ;;
+    esac
+    case " $* " in
+      *" --source-digest ${GITHUB_SHA:-} "*) ;;
+      *) echo "gh stub: attestation verify without this run's --source-digest" >&2; exit 1 ;;
+    esac
     [ ! -f "$state/attestation-missing" ] ||
       { echo "no attestations found for the subject" >&2; exit 1; }
     ;;
@@ -233,7 +244,7 @@ run() { # dir subcommand [extra env as NAME=value ...]
     cd "$dir" || exit 1
     env -i PATH="$tmp/bin:$PATH" HOME="$tmp" TMPDIR="$tmp" \
       STUB_STATE="$dir" IMAGE="$image" GITHUB_REF_NAME="$(cat "$dir/tag")" \
-      GH_REPO="$repo" GITHUB_OUTPUT="$dir/out" DIST="$dir/dist" \
+      GH_REPO="$repo" GITHUB_SHA="$sha" GITHUB_OUTPUT="$dir/out" DIST="$dir/dist" \
       "$@" "$script" "$sub"
   ) >"$dir/stdout" 2>"$dir/stderr"
 }
@@ -369,7 +380,8 @@ BROKEN
     cd "$dir" || exit 1
     env -i PATH="$dir/bin:$tmp/bin:$PATH" HOME="$tmp" TMPDIR="$tmp" \
       STUB_STATE="$dir" IMAGE="$image" GITHUB_REF_NAME="$(cat "$dir/tag")" \
-      GH_REPO="$repo" GITHUB_OUTPUT="$dir/out" DIST="$dir/dist" "$script" stitch
+      GH_REPO="$repo" GITHUB_SHA="$sha" GITHUB_OUTPUT="$dir/out" DIST="$dir/dist" \
+      "$script" stitch
   ) >"$dir/stdout" 2>"$dir/stderr" || rc=$?
   [ "$rc" -ne 0 ] || { fail "registry-error: expected a refusal"; return; }
   grep -q 'refusing: cannot tell whether' "$dir/stderr" ||
@@ -407,6 +419,8 @@ create $image:latest <- $image@$index" ] ||
     fail "promote-stable: marked a stable release prerelease"
   fi
   grep -q "$index" "$dir/notes.md" || fail "promote-stable: notes lack the index digest"
+  [ "$(cat "$dir/attestation.log")" = "attestation verify oci://$image@$index --repo $repo --signer-workflow $repo/.github/workflows/publish.yml --source-digest $sha" ] ||
+    fail "promote-stable: attestation read-back was: $(cat "$dir/attestation.log" 2>/dev/null)"
   if grep -q "refusing" "$dir/stderr"; then
     fail "promote-stable: refused: $(cat "$dir/stderr")"
   fi
@@ -491,7 +505,7 @@ case_promote_refuses_without_an_image_attestation() {
   : >"$dir/attestation-missing"
   run "$dir" promote INDEX_DIGEST="$index" || rc=$?
   [ "$rc" -ne 0 ] || { fail "promote-no-attestation: expected a refusal"; return; }
-  grep -q "refusing: no attestation for $image@$index; not moving a channel tag" "$dir/stderr" ||
+  grep -q "refusing: no attestation from this workflow for $image@$index at $sha; not moving a channel tag" "$dir/stderr" ||
     fail "promote-no-attestation: stderr was: $(cat "$dir/stderr")"
   [ -z "$(creates "$dir")" ] || fail "promote-no-attestation: moved: $(creates "$dir")"
   ok "promote refuses to move a channel without the image attestation"
@@ -559,6 +573,7 @@ case_channel_order_compares_versions_as_semver() {
 0.2.7-beta.9 0.2.7-rc.1
 0.2.7-9 0.2.7-11
 0.2.7-1 0.2.7-alpha
+0.2.7-Beta 0.2.7-alpha
 0.9.0 0.10.0
 0.2.9 0.2.10
 1.0.0-rc.1 1.0.0
