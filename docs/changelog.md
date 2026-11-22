@@ -70,8 +70,10 @@ changes.
   a dequeue; V8 does, Workerd does not). `read()` also settles one
   microtask later, mirroring Workerd's native read-result binding, so the
   pull that fulfils a pending read and its follow-up pull both run before
-  the awaiting `read()` continues. The pull count and ordering now match
-  Workerd, down to the per-read `pull()` counts a source observes.
+  the awaiting `read()` continues. The hop covers a byte stream's default
+  reader and BYOB reads too, not just the default stream. The pull count and
+  ordering now match Workerd, down to the per-read `pull()` counts a source
+  observes.
 - **`tee()` cancels its source with the last branch's reason** (#114). The
   source's `cancel` used to receive the spec's joined `[reason1, reason2]`
   array, so a source that stringified it saw `"first,second"` where Workerd

@@ -97,6 +97,34 @@ const routes = {
     return report({ sizes, bytes });
   },
 
+  async "/byte-read-order"() {
+    // A byte-stream read settles one microtask after the pull enqueued its
+    // chunk, like a default read: workerd's native binding converts the
+    // read result through an extra promise hop. Both reader kinds hop.
+    const run = async (byob) => {
+      const order = [];
+      let pulls = 0;
+      const rs = new ReadableStream({
+        type: "bytes",
+        pull(c) {
+          pulls += 1;
+          order.push(`pull${pulls}`);
+          c.enqueue(new Uint8Array([pulls]));
+        },
+      });
+      const reader = byob ? rs.getReader({ mode: "byob" }) : rs.getReader();
+      const pending = byob ? reader.read(new Uint8Array(1)) : reader.read();
+      pending.then(() => order.push("read"));
+      Promise.resolve().then(() => order.push("m1"));
+      Promise.resolve().then(() => order.push("m2"));
+      order.push("sync");
+      // Let every microtask, and the read, finish before reporting.
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      return order;
+    };
+    return report({ defaultByte: await run(false), byob: await run(true) });
+  },
+
   async "/writable-order"() {
     const order = [];
     const ws = new WritableStream({
