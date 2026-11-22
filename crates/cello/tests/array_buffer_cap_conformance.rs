@@ -148,7 +148,15 @@ impl TestNode {
         node
     }
 
-    /// Resident set size of the node process, in MiB.
+    /// Resident set size of the process that serves the isolate, in MiB.
+    ///
+    /// `cello dev` is a supervisor: it spawns the serving node as a child, and
+    /// the isolate (and every `ArrayBuffer` it allocates) lives in that child.
+    /// Sampling the supervisor alone measured its own few MiB and passed
+    /// whatever the serving node did, so the whole descendant tree is walked
+    /// and the largest RSS is taken. One serving node holds the isolate, so
+    /// "largest" is that node rather than a sum that double-counts shared
+    /// pages.
     ///
     /// The node is non-dumpable, but its own `/proc/<pid>/status` is readable
     /// by the same user that spawned it. `/proc` is Linux-only, so the RSS
@@ -156,8 +164,27 @@ impl TestNode {
     /// assertions hold on every platform.
     #[cfg(target_os = "linux")]
     fn rss_mib(&self) -> u64 {
-        let status = std::fs::read_to_string(format!("/proc/{}/status", self.child.id()))
-            .expect("node status");
+        process_tree(self.child.id())
+            .into_iter()
+            .filter_map(|pid| {
+                let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+                let kib: u64 = status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("VmRSS:"))
+                    .and_then(|value| value.split_whitespace().next())
+                    .and_then(|value| value.parse().ok())?;
+                Some(kib / 1024)
+            })
+            .max()
+            .expect("the serving node in the tree")
+    }
+
+    /// RSS of the `cello dev` supervisor itself, for the assertion that the
+    /// tree walk is what observes the growth. Test-only diagnostic.
+    #[cfg(target_os = "linux")]
+    fn supervisor_rss_mib(&self) -> u64 {
+        let status =
+            std::fs::read_to_string(format!("/proc/{}/status", self.child.id())).expect("status");
         let kib: u64 = status
             .lines()
             .find_map(|line| line.strip_prefix("VmRSS:"))
@@ -166,6 +193,35 @@ impl TestNode {
             .expect("VmRSS");
         kib / 1024
     }
+}
+
+/// Every process in a node's tree, the root included. `cello dev` forks the
+/// serving node (and the node may fork isolate runners), so a bound on "the
+/// node's memory" has to cover what it spawned.
+#[cfg(target_os = "linux")]
+fn process_tree(root: u32) -> Vec<u32> {
+    let mut found = vec![root];
+    let mut index = 0;
+    while index < found.len() {
+        let pid = found[index];
+        index += 1;
+        let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+            continue;
+        };
+        for task in tasks.filter_map(|task| task.ok()) {
+            let children = task.path().join("children");
+            let list = std::fs::read_to_string(&children).unwrap_or_default();
+            for child in list.split_whitespace() {
+                if let Ok(child) = child.parse::<u32>() {
+                    if !found.contains(&child) {
+                        found.push(child);
+                    }
+                }
+            }
+        }
+    }
+    found.sort();
+    found
 }
 
 impl Drop for TestNode {
@@ -261,10 +317,14 @@ fn array_buffer_growth_is_refused_at_the_budget() {
     // not what a previous request happened to leave charged.
     #[cfg(target_os = "linux")]
     let before = node.rss_mib();
+    #[cfg(target_os = "linux")]
+    let supervisor_before = node.supervisor_rss_mib();
     let (status, headers, body) = get(&node, "/grow?target=536870912").expect("grow answers");
     assert_eq!(status, 200, "{body}");
     #[cfg(target_os = "linux")]
     let after = node.rss_mib();
+    #[cfg(target_os = "linux")]
+    let supervisor_after = node.supervisor_rss_mib();
 
     let refused = header(&headers, "x-refused").unwrap_or("");
     assert!(
@@ -287,11 +347,30 @@ fn array_buffer_growth_is_refused_at_the_budget() {
     // overhead above it, but a run that kept growing would be 512 MiB higher.
     // `/proc` is where the RSS comes from, so this bound is Linux-only.
     #[cfg(target_os = "linux")]
-    assert!(
-        after.saturating_sub(before) <= 416,
-        "RSS grew by {} MiB for a 320 MiB budget ({before} -> {after})",
-        after.saturating_sub(before)
-    );
+    {
+        let tree_grew = after.saturating_sub(before);
+        let supervisor_grew = supervisor_after.saturating_sub(supervisor_before);
+        assert!(
+            tree_grew <= 416,
+            "the serving process grew by {tree_grew} MiB for a 320 MiB budget \
+             ({before} -> {after})"
+        );
+        // The tree walk is what observes the isolate: the serving node grew by
+        // most of the budget while the `cello dev` supervisor it was spawned
+        // by stayed small. Sampling the supervisor alone — what this test did
+        // before — could not have failed whatever the serving node did.
+        assert!(
+            tree_grew > 160,
+            "the serving process grew only {tree_grew} MiB, so the bound is \
+             not observing the isolate ({before} -> {after})"
+        );
+        assert!(
+            supervisor_grew < tree_grew / 2,
+            "the supervisor grew {supervisor_grew} MiB of the tree's \
+             {tree_grew} MiB; the sample would have to come from the tree \
+             ({supervisor_before} -> {supervisor_after})"
+        );
+    }
 
     // Churn is not growth: allocate and drop 1 GiB in total, never refused.
     let (status, headers, body) = get(&node, "/churn?count=128").expect("churn answers");

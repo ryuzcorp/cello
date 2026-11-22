@@ -106,15 +106,19 @@ changes; `CELLO_V8_EXTERNAL_LIMIT_MB` is new and optional.
   allocation that V8 collects and retries successfully never fails the
   guest, so it does not condemn. A collection returns freed buffers to the
   budget, so churn past the limit is never refused. Buffers the host hands
-  to JavaScript -- response bodies, WebSocket messages, RPC arguments,
-  `/tmp` reads, D1 blobs -- are charged to the same budget and refused the
-  same way: a refused stream chunk rejects the read promise with the
-  budget's `RangeError`, and a SQL row whose BLOB does not fit throws one
-  `RangeError` and closes its native cursor, so the refused statement is not
-  retained. Resizable `ArrayBuffer`s, growable `SharedArrayBuffer`s and
-  `WebAssembly.Memory` are **not** capped: V8 backs them with the platform
-  page allocator, which no embedder hook can see, so Cello neither charges
-  nor refuses them. A wasm memory is bounded per memory by
+  to JavaScript -- response bodies, WebSocket messages, RPC arguments, Queue
+  message bodies, `/tmp` reads, D1 blobs -- are charged to the same budget
+  and refused the same way: a refused stream chunk rejects the read promise
+  with the budget's `RangeError`, and a SQL row whose BLOB does not fit throws
+  one `RangeError` and closes its native cursor, so the refused statement is not
+  retained; when that row came from a write statement, the write had already
+  been applied and the message says not to retry it. Backing stores are
+  charged for the memory they retain, not the length the guest sees: a host
+  `Vec` with spare capacity is charged its whole allocation. Resizable
+  `ArrayBuffer`s, growable `SharedArrayBuffer`s and `WebAssembly.Memory` are
+  **not** capped: V8 backs them with the platform page allocator, which no
+  embedder hook can see, so Cello neither charges nor refuses them. A wasm
+  memory is bounded per memory by
   `--wasm-max-mem-pages` (the whole budget in pages: every `grow` past it
   fails, including one performed by wasm code; a declared `maximum` above it
   is accepted but unreachable); the number of wasm memories, and every

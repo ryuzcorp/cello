@@ -100,7 +100,8 @@ services, APIs, and Wrangler configuration.
   isolate's allocator — plain `ArrayBuffer`s and typed arrays,
   `SharedArrayBuffer`s without `maxByteLength`, every `structuredClone` of
   one, and the buffers the host hands to JavaScript (response bodies,
-  WebSocket messages, RPC arguments, `/tmp` reads, D1 blobs).
+  WebSocket messages, RPC arguments, Queue message bodies, `/tmp` reads, D1
+  blobs).
 - **A resizable `ArrayBuffer`, a growable `SharedArrayBuffer` and
   `WebAssembly.Memory` are not capped by this budget.** V8 backs them with
   the platform page allocator, which is outside every embedder hook: no
@@ -148,7 +149,11 @@ services, APIs, and Wrangler configuration.
   `RangeError`; a host buffer for a synchronous host call throws at that
   call; a row whose BLOB does not fit throws one `RangeError` and its SQL
   cursor is closed, so the refused statement is not retained on the cell's
-  connection.
+  connection. When the refused row came from a write statement
+  (`INSERT`/`UPDATE`/`DELETE ... RETURNING`), the write was already applied
+  before that row existed and closing the cursor does not undo it, so the
+  message says so explicitly ("the statement had already executed ... do not
+  retry it") — retrying after freeing buffers would apply it twice.
 - Bytes come back when the collector frees the object: V8 frees a backing
   store through the allocator's `free`, which returns the bytes to the
   budget. Churn is therefore never refused — an allocate-and-drop loop is

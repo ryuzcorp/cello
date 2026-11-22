@@ -350,7 +350,9 @@ pub(super) fn allocator(budget: &Arc<BackingStoreBudget>) -> v8::UniqueRef<v8::A
 /// What the deleter of a host-owned store releases when V8 frees the store.
 struct HostCharge {
     budget: Arc<BackingStoreBudget>,
-    len: usize,
+    /// The bytes the store's allocation was charged for: its `capacity`, not
+    /// its length.
+    charged: usize,
     /// The store's memory, kept only for its destructor: dropping this `Vec`
     /// after the `Box` is reconstructed frees the buffer V8 pointed at, and
     /// moving the `Vec` here never reallocates it.
@@ -368,7 +370,7 @@ unsafe extern "C" fn release_host_store(
     // SAFETY: `host_store` boxed exactly one `HostCharge` per store and gave
     // V8 its raw pointer as the deleter data; V8 calls this once.
     let charge = unsafe { Box::from_raw(deleter_data.cast::<HostCharge>()) };
-    charge.budget.release(charge.len);
+    charge.budget.release(charge.charged);
     // `charge` drops here, freeing the `Vec` the store presented.
 }
 
@@ -380,23 +382,32 @@ unsafe extern "C" fn release_host_store(
 /// see it: unlike a null from the allocator, there is no V8 retry that could
 /// absorb it.
 ///
-/// An empty `Vec` takes V8's own path: nothing is charged, and V8's
-/// zero-length store needs no deleter bookkeeping.
+/// What is charged is the `Vec`'s **allocation** (`capacity()`), not its
+/// length: a `Vec` of 32 MiB length and 96 MiB capacity retains 96 MiB until
+/// V8 frees the store, and a cap that charged 32 would undercount by 64. The
+/// no-copy property is unchanged — V8 is handed the same buffer the `Vec`
+/// owns, and the `Box<HostCharge>` keeps the `Vec` alive so its destructor
+/// frees it.
+///
+/// An empty `Vec` retains nothing worth accounting: any spare capacity is
+/// released here rather than handed to V8's zero-length store, so nothing is
+/// charged and no deleter bookkeeping is needed.
 pub(super) fn host_store(
     budget: &Arc<BackingStoreBudget>,
     mut bytes: Vec<u8>,
 ) -> Result<v8::UniqueRef<v8::BackingStore>, HostStoreRefusal> {
     if bytes.is_empty() {
-        return Ok(v8::ArrayBuffer::new_backing_store_from_vec(bytes));
+        return Ok(v8::ArrayBuffer::new_backing_store_from_vec(Vec::new()));
     }
     let len = bytes.len();
-    if !budget.reserve_latching(len) {
+    let retained = bytes.capacity();
+    if !budget.reserve_latching(retained) {
         return Err(HostStoreRefusal { cap: budget.cap() });
     }
     let pointer = bytes.as_mut_ptr();
     let charge = Box::new(HostCharge {
         budget: budget.clone(),
-        len,
+        charged: retained,
         _bytes: bytes,
     });
     // SAFETY: the pointer is `charge.bytes`'s buffer, which the `Box` keeps
@@ -519,6 +530,49 @@ mod tests {
             budget.exceeded(),
             "a request larger than the cap records its final refusal"
         );
+    }
+
+    /// A host store is charged for what it retains — the `Vec`'s allocation —
+    /// not for how many of those bytes the guest can see.
+    ///
+    /// A `Vec` built with more capacity than length hands V8 a short view over
+    /// a large allocation, and the allocation is what the isolate holds until
+    /// the store is freed. Charging the length would let a response body of
+    /// 32 MiB with 96 MiB of capacity sit under a 64 MiB cap while holding
+    /// 96 MiB of the process.
+    #[test]
+    fn host_store_charges_the_retained_capacity() {
+        let budget = BackingStoreBudget::new(4096);
+
+        let mut bytes = Vec::with_capacity(4096);
+        bytes.extend_from_slice(&[7_u8; 16]);
+        assert_eq!((bytes.len(), bytes.capacity()), (16, 4096));
+        let store = host_store(&budget, bytes).expect("4096 bytes fit the cap");
+        assert_eq!(
+            budget.used(),
+            4096,
+            "the retained allocation is charged, not the 16 visible bytes"
+        );
+        assert_eq!(store.byte_length(), 16, "the guest still sees 16 bytes");
+        drop(store);
+        assert_eq!(budget.used(), 0, "freeing the store returns the charge");
+
+        // The same bytes with the same length are refused when the
+        // allocation, not the length, does not fit.
+        let mut bytes = Vec::with_capacity(8192);
+        bytes.push(0);
+        assert!(
+            host_store(&budget, bytes).is_err(),
+            "8192 retained bytes do not fit a 4096-byte cap"
+        );
+        assert_eq!(budget.used(), 0, "a refused store charges nothing");
+
+        // An empty `Vec` retains nothing: its spare capacity is released
+        // rather than charged, and the store carries no bytes.
+        let bytes = Vec::<u8>::with_capacity(4096);
+        let store = host_store(&budget, bytes).expect("an empty store is free");
+        assert_eq!(store.byte_length(), 0);
+        assert_eq!(budget.used(), 0);
     }
 }
 /// The budget as a guest sees it: buffers past the ceiling are refused with a
@@ -1335,6 +1389,119 @@ export default {
                 crate::storage::sql_cursor_start_values(&scope, "SELECT count(*) FROM b", &[])
                     .expect("a later query still runs");
             crate::storage::sql_cursor_close(after);
+        });
+    }
+
+    /// A refused `RETURNING` row reports that its write already happened, and
+    /// the write is really there.
+    ///
+    /// SQLite applies an autocommit `INSERT ... RETURNING`'s write before the
+    /// first row exists, and closing the cursor finalizes the statement, which
+    /// keeps the write. A guest that saw only the plain budget message would
+    /// free buffers and retry, applying the insert twice; the message therefore
+    /// says the effects stand.
+    #[test]
+    fn refused_returning_blob_reports_the_write_was_applied() {
+        on_engine_thread(|| {
+            let (mut worker, _dir, scope) = cell_with_blobs("applied");
+            worker.set_external_limit_for_test(BLOB / 2);
+            run_sql(
+                &mut worker,
+                &scope,
+                "CREATE TABLE w(id INTEGER PRIMARY KEY, blob BLOB)",
+            );
+            {
+                let inner = worker.inner.as_mut().expect("live worker");
+                let (mut locker, _cells) = inner.lock();
+                v8::scope!(let hs, &mut *locker);
+                let realm = inner.realm(hs);
+                let context = realm.context;
+                let cs = &mut v8::ContextScope::new(hs, context);
+                let tc = std::pin::pin!(v8::TryCatch::new(cs));
+                let tc = &mut tc.init();
+                let (cursor, _columns, row, _written, _reused) =
+                    crate::storage::sql_cursor_start_values(
+                        &scope,
+                        &format!("INSERT INTO w(blob) VALUES (zeroblob({BLOB})) RETURNING blob"),
+                        &[],
+                    )
+                    .expect("cursor starts");
+                assert!(
+                    row.is_some(),
+                    "the write ran and produced its RETURNING row"
+                );
+                assert!(
+                    crate::storage::sql_cursor_is_write(cursor),
+                    "the cursor knows its statement writes"
+                );
+                let refused = super::super::storage_ops::cursor_row(tc, cursor, row.expect("row"));
+                assert!(refused.is_none(), "the 1 MiB BLOB does not fit");
+                let text = tc
+                    .exception()
+                    .expect("the refusal was thrown")
+                    .to_string(tc)
+                    .expect("exception text")
+                    .to_rust_string_lossy(tc);
+                assert!(
+                    text.starts_with("RangeError:") && text.contains("budget"),
+                    "the guest sees the budget's RangeError, got {text:?}"
+                );
+                assert!(
+                    text.contains("had already executed") && text.contains("not rolled back"),
+                    "the refusal says the write stands, got {text:?}"
+                );
+                // The insert really was applied, so a retry would duplicate it.
+                let (after, _columns, row, _written, _reused) =
+                    crate::storage::sql_cursor_start_values(&scope, "SELECT count(*) FROM w", &[])
+                        .expect("count query runs");
+                crate::storage::sql_cursor_close(after);
+                assert!(
+                    matches!(row.as_deref(), Some([crate::storage::SqlValue::Integer(1)])),
+                    "the refused RETURNING row's write stands: {row:?}"
+                );
+            }
+        });
+    }
+
+    /// A read-only statement has no write to report, and its refusal keeps the
+    /// plain budget message: telling the guest "do not retry" there would be
+    /// wrong, because nothing was applied.
+    #[test]
+    fn refused_read_only_row_reports_no_write() {
+        on_engine_thread(|| {
+            let (mut worker, _dir, scope) = cell_with_blobs("readonly");
+            worker.set_external_limit_for_test(BLOB / 2);
+            let inner = worker.inner.as_mut().expect("live worker");
+            let (mut locker, _cells) = inner.lock();
+            v8::scope!(let hs, &mut *locker);
+            let realm = inner.realm(hs);
+            let context = realm.context;
+            let cs = &mut v8::ContextScope::new(hs, context);
+            let tc = std::pin::pin!(v8::TryCatch::new(cs));
+            let tc = &mut tc.init();
+            let (cursor, _columns, row, _written, _reused) =
+                crate::storage::sql_cursor_start_values(&scope, "SELECT one FROM b", &[])
+                    .expect("cursor starts");
+            assert!(
+                !crate::storage::sql_cursor_is_write(cursor),
+                "a SELECT is not a write"
+            );
+            let refused = super::super::storage_ops::cursor_row(tc, cursor, row.expect("row"));
+            assert!(refused.is_none(), "the 1 MiB BLOB does not fit");
+            let text = tc
+                .exception()
+                .expect("the refusal was thrown")
+                .to_string(tc)
+                .expect("exception text")
+                .to_rust_string_lossy(tc);
+            assert!(
+                text.starts_with("RangeError:") && text.contains("budget"),
+                "the guest sees the budget's RangeError, got {text:?}"
+            );
+            assert!(
+                !text.contains("already executed"),
+                "a read-only refusal must not tell the guest a write stands: {text:?}"
+            );
         });
     }
 

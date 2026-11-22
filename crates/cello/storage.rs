@@ -2700,6 +2700,23 @@ pub fn sql_cursor_close(cursor_id: u64) {
     });
 }
 
+/// Whether this cursor's statement writes, as opposed to only reading.
+///
+/// Call it **before** [`sql_cursor_close`]: a live cursor that already yielded
+/// a row from a write statement (`INSERT`/`UPDATE`/`DELETE ... RETURNING`) has
+/// run that write. The caller uses this to tell a guest that a refusal to
+/// convert the returned row did not undo the write, so a retry after freeing
+/// buffers cannot duplicate it. `false` for an unknown or already closed
+/// cursor, which has nothing to report.
+pub fn sql_cursor_is_write(cursor_id: u64) -> bool {
+    sql_cursors(|cursors| {
+        cursors.borrow().get(&cursor_id).is_some_and(|cursor| {
+            // SAFETY: the cursor exclusively owns its live statement.
+            unsafe { rusqlite::ffi::sqlite3_stmt_readonly(cursor.statement) == 0 }
+        })
+    })
+}
+
 /// The scope that opened a SQL cursor, if it is still active. The op
 /// layer refuses a cursor another cell opened, so a sequential id cannot
 /// be retargeted across cells.

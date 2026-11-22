@@ -99,8 +99,9 @@ use. An unsupported feature that stays silent is a defect.
   cap covers the stores V8 allocates through the isolate: plain buffers and
   typed arrays, `SharedArrayBuffer`s without `maxByteLength`, `structuredClone`
   of one, and buffers the host hands to JavaScript (response bodies, WebSocket
-  messages, RPC arguments, `/tmp` reads, D1 blobs). Past it the allocation is
-  refused with a `RangeError` (V8's `Array buffer allocation failed`; a budget
+  messages, RPC arguments, Queue message bodies, `/tmp` reads, D1 blobs). Past
+  it the allocation is refused with a `RangeError` (V8's
+  `Array buffer allocation failed`; a budget
   message on host stores), and the isolate is condemned: it takes on no new
   hibernatable socket, exactly as after a heap-limit hit, and serves again once
   both limits are back under 75 percent. Cello's defaults are more generous
