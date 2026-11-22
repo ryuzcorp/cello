@@ -125,6 +125,28 @@ const routes = {
     return report({ defaultByte: await run(false), byob: await run(true) });
   },
 
+  async "/identity-read-order"() {
+    // IdentityTransformStream is a native byte stream in workerd, and its
+    // reads settle through the same binding hop as any other reader's:
+    // after the microtasks queued at read() time.
+    const run = async (byob) => {
+      const ts = new IdentityTransformStream();
+      const writer = ts.writable.getWriter();
+      const reader = byob ? ts.readable.getReader({ mode: "byob" }) : ts.readable.getReader();
+      const write = writer.write(new Uint8Array([1, 2, 3]));
+      write.catch(() => {});
+      const order = [];
+      const pending = byob ? reader.read(new Uint8Array(1)) : reader.read();
+      pending.then(() => order.push("read"));
+      Promise.resolve().then(() => order.push("m1"));
+      Promise.resolve().then(() => order.push("m2"));
+      order.push("sync");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      return order;
+    };
+    return report({ identityDefault: await run(false), identityByob: await run(true) });
+  },
+
   async "/writable-order"() {
     const order = [];
     const ws = new WritableStream({
