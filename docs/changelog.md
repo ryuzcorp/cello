@@ -1,7 +1,14 @@
 ---
 title: Changelog
-description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.5.
+description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.6.
 ---
+## v0.2.6
+
+The same code as v0.2.5, released again with complete provenance: the v0.2.5
+publish run attested its image, but attesting the release tarballs failed
+(the Sigstore transparency log answered 404), and a published version is
+never re-run. Use v0.2.6.
+
 ## v0.2.5
 
 An application WebSocket close now reaches a peer that is still sending, and
