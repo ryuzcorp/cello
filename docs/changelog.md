@@ -1,14 +1,16 @@
 ---
 title: Changelog
-description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.6.
+description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.7.
 ---
-## Unreleased
+## v0.2.7
 
-Three body-lifecycle divergences from workerd, found by the workerd
-differential harness, are fixed: `bodyUsed` now reports a disturbed or
-consumed body stream, `clone()` reports workerd's message, and a body stream
-that yields a non-byte chunk fails its consumers with a `TypeError` instead
-of a `RangeError`. No configuration, data, or bucket-format changes.
+Five stream and body divergences from workerd are fixed, all found by the
+workerd differential harness: `bodyUsed` reports a disturbed or consumed
+body, `clone()` reports workerd's message, a body stream that yields a
+non-byte chunk fails its consumers with a `TypeError`, a pull source runs
+on workerd's schedule, and `tee()` cancels its source with workerd's reason.
+A failed release attestation can now be re-run on the same tag. No
+configuration, data, or bucket-format changes.
 
 - **`request.bodyUsed` / `response.bodyUsed` observe the body stream**
   (#115). The flag was plain state that only the runtime's own consumers set,
@@ -56,9 +58,8 @@ and a published `<version>` or Release is still never replaced. The publish
 shell moved to `scripts/publish-release.sh`, with a stubbed-registry test for
 the retry decisions.
 
-A pull source now runs on Workerd's schedule and a `tee()` cancels its
-source with Workerd's reason. No configuration, data, or bucket-format
-changes.
+A pull source runs on workerd's schedule, and a `tee()` cancels its source
+with workerd's reason:
 
 - **A pull source runs Workerd's pull schedule** (#113). After the first
   `read()` dequeued a buffered chunk, Cello had already called `pull()` a
