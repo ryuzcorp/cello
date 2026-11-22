@@ -18,6 +18,33 @@ backstop, so the process is strict on purpose.
 - Direct pushes, force-pushes, and deletions on protected branches are
   blocked by ruleset.
 
+## When a publish run fails
+
+`publish.yml` publishes the immutable `<version>` image first, then attests the
+image and the release files, and only then moves `beta`/`latest` and creates the
+GitHub Release (`scripts/publish-release.sh stitch`, the two attestation steps,
+`promote`). The `<version>` image is pullable from the moment `stitch` succeeds,
+but no channel tag moves and no Release appears until both attestations pass, so
+a failure in `stitch` or an attestation costs nothing user-visible and the same
+tag is retried:
+
+```sh
+gh run rerun <run-id> --failed
+```
+
+The retry re-stitches from the per-arch digests the first attempt uploaded and
+accepts the already-published `<version>` only when it is exactly that index;
+anything else is refused. Both attestations run again, so a digest can end up
+with more than one provenance bundle — each verifies on its own. A failure
+inside `promote` leaves the channel tags that already moved (each already the
+attested index) and no Release; the retry re-runs those carbon copies and
+finishes. Channel tags only move forward, so a retry of an older version
+releases that version without rolling `beta`/`latest` back over a newer one.
+Use "Re-run failed jobs" (`--failed`), not a full re-run: `push` still refuses
+an already-published `<version>`. A published `<version>` and a published
+Release are never replaced, so once the Release exists the only recovery is a
+new tag — which is why v0.2.6 was cut for v0.2.5 rather than re-running it.
+
 ## Required checks
 
 A PR merges only when its required checks are green — currently the
