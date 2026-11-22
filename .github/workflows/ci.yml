@@ -124,6 +124,29 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Test
         run: cargo test --profile ci --locked
+      # Differential conformance against workerd, Cloudflare's open-source
+      # runtime: every corpus Worker runs on both and the transcripts must
+      # match. A step here, not a job of its own, because this is where the
+      # `cello` binary is already built; a separate job would rebuild it from
+      # a cold cache for a check that takes seconds. amd64 only.
+      - if: matrix.suffix == 'amd64'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+      - name: Install workerd
+        if: matrix.suffix == 'amd64'
+        working-directory: scripts/workerd-diff
+        # No install scripts: the lockfile's @cloudflare/workerd-linux-64
+        # carries the binary, so install.js never runs its unchecked fallback
+        # download.
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Differential conformance (workerd)
+        if: matrix.suffix == 'amd64'
+        run: node scripts/workerd-diff/runner.mjs
+        env:
+          CELLO_BIN: target/ci/cello
+          # The native binary, not the npm shim: --control-fd has to reach it.
+          WORKERD_BIN: scripts/workerd-diff/node_modules/@cloudflare/workerd-linux-64/bin/workerd
 
   # What a PR touches: Docker inputs (image build) and anything beyond the
   # docs site (clippy and the suite). A docs-only PR skips the Rust jobs.

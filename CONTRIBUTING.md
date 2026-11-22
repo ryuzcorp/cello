@@ -71,6 +71,38 @@ checks.
   - A new stream scenario belongs there when it needs minutes of clock,
     a deterministic interleaving, or a fail-before against a timing bug.
 
+## Differential conformance against workerd
+
+`scripts/workerd-diff/` runs each corpus Worker on
+[workerd](https://github.com/cloudflare/workerd), Cloudflare's open-source
+runtime, and on the locally built `cello` binary, then diffs a normalized
+transcript (status, stable headers, body bytes). Fixtures put anything
+order- or timing-sensitive into the body they return: no case depends on
+wall time.
+
+```sh
+npm --prefix scripts/workerd-diff ci --ignore-scripts
+cargo build --profile ci --bin cello
+CELLO_BIN=target/ci/cello node scripts/workerd-diff/runner.mjs [case ...]
+```
+
+`--ignore-scripts` matters: the `workerd` package's postinstall downloads a
+binary of its own choosing, while the lockfile's
+`@cloudflare/workerd-<platform>` package already carries the pinned one. The
+runner uses that native binary and refuses to start when it is not the version
+`package.json` pins.
+
+The gate only lists cases that agree: a divergence is filed as a
+`workerd diff:` issue with both transcripts and its case removed from
+`cases.mjs` until it passes, so there are no skip lists or expected-diff
+allowlists. `workerd` is pinned exactly; bump it in its own PR and expect new
+differences. CI runs the suite on amd64 inside the required `test` check.
+
+The cases boot `cello dev`, the development node, so a bug that only appears
+behind the production serve path is out of scope here; the release image is
+driven by `scripts/release-smoke.sh` instead (long-lived SSE, WebSocket
+messages, tee and backpressure at production shapes).
+
 ## What to change where
 
 - Rust, Docker, CI, tools, examples: this repo, same PR as its tests.
