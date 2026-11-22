@@ -41,7 +41,20 @@ of a `RangeError`. No configuration, data, or bucket-format changes.
   their UTF-8 bytes, which is also what workerd does.
 - **`Request.prototype.bytes()` and `Response.prototype.bytes()` exist**
   (#117). Fetch's byte accessor was missing; it returns the undecoded body as
-  a fresh `Uint8Array` and marks the body used, like the other consumers.
+  fresh `Uint8Array` and marks the body used, like the other consumers.
+
+A failed `publish` run is retryable on the same tag, so a release no longer
+costs a version when an attestation flakes. The pipeline now publishes the
+immutable `<version>` image first, attests the image and the release files, and
+only then moves `beta`/`latest` and creates the GitHub Release, so a failure
+before the attestations leaves the channel tags and the Release untouched (the
+`<version>` image is pullable as soon as it is published). `gh run rerun <run-id>
+--failed` accepts an already-published `<version>` only when it is exactly the
+index the run stitches from its own per-arch digests; a different image is
+refused, a channel tag that already holds a newer version is never rolled back,
+and a published `<version>` or Release is still never replaced. The publish
+shell moved to `scripts/publish-release.sh`, with a stubbed-registry test for
+the retry decisions.
 
 ## v0.2.6
 

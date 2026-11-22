@@ -62,6 +62,12 @@ jobs:
         run: cargo clippy --profile ci --all-targets --locked -- -D warnings
       - name: rustfmt
         run: cargo fmt --check
+      # The release scripts carry their own tests: `publish-release.sh` decides
+      # whether a retried publish may re-use an already-published `<version>`,
+      # which only a stubbed registry can exercise. It needs no toolchain, so
+      # it runs here rather than in a job of its own.
+      - name: Release script tests
+        run: scripts/tests/publish-release.test.sh
 
   test:
     name: Test (${{ matrix.suffix }})

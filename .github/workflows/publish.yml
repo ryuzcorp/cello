@@ -17,16 +17,42 @@
 #              only (no arch tags, so no namespace collision), record
 #              its digest, and package the matching release tarball by
 #              copying the binary and license files out of that digest
-#   `publish`  stitch the multi-arch tags from this run's validated arch
-#              digests (`<version>` and `beta` always; `<major>.<minor>`
-#              and `latest` for non-prereleases only), create the GitHub
-#              Release with the tarballs and SHA256SUMS, attest SLSA
-#              provenance for the index digest and the files (each arch
-#              build also records provenance and an SBOM), and print the
-#              index digest and the attestation verify commands to the
-#              step summary
+#   `publish`  in this order, so that a failure before the release can be
+#              retried on the same tag instead of costing a version:
+#                1. stitch the immutable `<version>` index from this run's
+#                   validated arch digests and push it
+#                2. attest SLSA provenance for the index digest, then for
+#                   the release tarballs and SHA256SUMS (each arch build
+#                   also records provenance and an SBOM)
+#                3. move the channel tags -- `beta` always, `<major>.<minor>`
+#                   and `latest` for non-prereleases only -- as carbon
+#                   copies of the attested index
+#                4. create the GitHub Release with the tarballs and
+#                   SHA256SUMS
+#              and print the index digest and the attestation verify
+#              commands to the step summary
 #
-# A published `<version>` is never overwritten: cut a new tag.
+# `<version>` itself is published by step 1 and can be pulled before the
+# Release exists; what waits for both attestations is everything a consumer
+# follows: no channel tag moves and no Release is created before step 3, and
+# the Release comes last. A failure before step 3 therefore leaves the channel
+# tags and the Release untouched, so the run is retried with "Re-run failed
+# jobs" (not "Re-run all jobs": `push` still refuses an already-published
+# `<version>`, and it does not re-run when only `publish` failed). A failure
+# inside step 3 can leave the channel tags that already moved -- each of them
+# already the attested index -- and no Release; the retry re-runs the same
+# carbon copies and finishes. Channel tags only ever move forward, so a retry
+# of an older version leaves a channel that already holds a newer version
+# alone.
+#
+# The retry runs `scripts/publish-release.sh stitch` again against the
+# artifacts the first attempt uploaded, which accepts the existing `<version>`
+# only when it is exactly the index this run stitches from its own arch
+# digests; anything else is refused.
+#
+# A published `<version>` is never overwritten and a published Release is
+# never replaced: once the release exists, a run refuses and the only
+# recovery is a new tag.
 name: publish
 
 on:
@@ -51,8 +77,6 @@ jobs:
       actions: read
     outputs:
       version: ${{ steps.parse.outputs.version }}
-      prerelease: ${{ steps.parse.outputs.prerelease }}
-      minor-tag: ${{ steps.parse.outputs.minor-tag }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -71,8 +95,6 @@ jobs:
           semver='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(\-((0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?'
           if [[ ${GITHUB_REF_NAME} =~ ^v${semver}$ ]]; then
             version="${GITHUB_REF_NAME#v}"
-            major="${BASH_REMATCH[1]}"
-            minor="${BASH_REMATCH[2]}"
           else
             echo "refusing tag $GITHUB_REF_NAME: want v<semver>" >&2
             exit 1
@@ -126,11 +148,7 @@ jobs:
           if [[ $version == *-* ]]; then
             prerelease="true"
           fi
-          {
-            echo "version=$version"
-            echo "prerelease=$prerelease"
-            echo "minor-tag=$major.$minor"
-          } >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag $GITHUB_REF_NAME is $sha on origin/main (prerelease: $prerelease)"
 
   push:
@@ -256,6 +274,11 @@ jobs:
       id-token: write
       attestations: write
     steps:
+      # The publish steps run `scripts/publish-release.sh` from the tagged
+      # tree, so a retry of this job runs the same logic the first attempt did.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - name: Log in to GHCR
         env:
           GHCR_TOKEN: ${{ github.token }}
@@ -267,98 +290,16 @@ jobs:
           pattern: release-*
           merge-multiple: true
           path: dist
-      - name: Publish
+      # Publishes the immutable `<version>` index and nothing else: no channel
+      # tag moves and no release is created until both attestations below
+      # succeed. A retry accepts an existing `<version>` only when it is
+      # exactly the index this run stitches from its own arch digests.
+      - name: Stitch the version index
         id: publish
         env:
-          VERSION: ${{ needs.verify.outputs.version }}
-          PRERELEASE: ${{ needs.verify.outputs.prerelease }}
-          MINOR_TAG: ${{ needs.verify.outputs.minor-tag }}
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          image="ghcr.io/ryuzcorp/cello"
-          # One SHA256SUMS for the release, verified before upload.
-          cat dist/SHA256SUMS-* > dist/SHA256SUMS
-          rm dist/SHA256SUMS-amd64 dist/SHA256SUMS-arm64
-          (cd dist && sha256sum -c SHA256SUMS)
-          # Refuse before tagging anything: a published <version> is never
-          # overwritten, and neither is its GitHub Release.
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            echo "refusing: release $GITHUB_REF_NAME already exists; cut a new tag" >&2
-            exit 1
-          fi
-          # Stitch the index from this run's arch digests (validated below),
-          # never from the arch tags, so nothing pushed under those tags
-          # later can slip into the release.
-          amd_digest=$(cat dist/arch-digest-amd64.txt)
-          arm_digest=$(cat dist/arch-digest-arm64.txt)
-          for digest in "$amd_digest" "$arm_digest"; do
-            hex="${digest#sha256:}"
-            case "$digest" in sha256:*) ;; *) echo "refusing: bad arch digest: $digest" >&2; exit 1 ;; esac
-            [ "${#hex}" -eq 64 ] || { echo "refusing: bad arch digest: $digest" >&2; exit 1; }
-            case "$hex" in *[!0-9a-f]*) echo "refusing: bad arch digest: $digest" >&2; exit 1 ;; esac
-          done
-          # <version> and beta always; <major>.<minor> and latest for
-          # non-prereleases only. latest moves only on stable releases,
-          # beta on every release including prereleases.
-          tags=("$VERSION" "beta")
-          if [ "$PRERELEASE" != "true" ]; then
-            tags+=("$MINOR_TAG" "latest")
-          fi
-          for tag in "${tags[@]}"; do
-            docker buildx imagetools create --tag "$image:$tag" \
-              "$image@$amd_digest" "$image@$arm_digest"
-          done
-          digest=$(docker buildx imagetools inspect "$image:$VERSION" \
-            --format '{{json .Manifest.Digest}}' | tr -d '"')
-          # The digest feeds attestations and release notes: enforce its shape.
-          hex="${digest#sha256:}"
-          case "$digest" in sha256:*) ;; *) echo "refusing: bad digest: $digest" >&2; exit 1 ;; esac
-          [ "${#hex}" -eq 64 ] || { echo "refusing: bad digest: $digest" >&2; exit 1; }
-          case "$hex" in *[!0-9a-f]*) echo "refusing: bad digest: $digest" >&2; exit 1 ;; esac
-          echo "digest=$digest" >> "$GITHUB_OUTPUT"
-          # The GitHub Release for this tag: prereleases are marked
-          # prerelease (existence was already refused above, before tagging).
-          args=()
-          if [ "$PRERELEASE" = "true" ]; then
-            args+=(--prerelease)
-          fi
-          {
-            echo "## Cello $VERSION"
-            echo
-            echo "Image: \`$image:$VERSION\` (\`$digest\`)"
-            echo "Full changelog: https://cello.ryuz.eu/changelog"
-            echo
-            echo "Install on Linux (amd64/arm64):"
-            echo '```sh'
-            echo "curl -fsSL https://cello.ryuz.eu/install.sh | sh"
-            echo '```'
-            echo
-            echo "Verify provenance (needs gh):"
-            echo '```sh'
-            echo "gh attestation verify oci://$image@$digest --repo ryuzcorp/cello"
-            echo "gh attestation verify cello-$VERSION-linux-amd64.tar.gz --repo ryuzcorp/cello"
-            echo '```'
-          } > notes.md
-          gh release create "$GITHUB_REF_NAME" --title "Cello $VERSION" \
-            --notes-file notes.md "${args[@]}" \
-            dist/cello-*.tar.gz dist/SHA256SUMS
-          {
-            echo "## cello $VERSION"
-            echo "index digest: \`$digest\`"
-            for tag in "${tags[@]}"; do
-              echo "published \`$image:$tag\`"
-            done
-            echo "Verify the SLSA provenance attestation:"
-            echo '```'
-            echo "gh attestation verify oci://$image@$digest --repo ryuzcorp/cello"
-            echo '```'
-            echo "Verify a release tarball attestation:"
-            echo '```'
-            echo "gh attestation verify dist/cello-$VERSION-linux-amd64.tar.gz --repo ryuzcorp/cello"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+        run: scripts/publish-release.sh stitch
       - name: Attest image provenance
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
@@ -369,3 +310,12 @@ jobs:
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: dist/cello-*.tar.gz, dist/SHA256SUMS
+      # Only now, with both attestations in place, do the channel tags move and
+      # the GitHub Release appear, so a failure above leaves nothing a user can
+      # pull on the new version.
+      - name: Promote and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          INDEX_DIGEST: ${{ steps.publish.outputs.digest }}
+        run: scripts/publish-release.sh promote

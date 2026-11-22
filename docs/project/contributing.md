@@ -7,6 +7,16 @@ Cello is agent-run: every change lands through a pull request into `main` (rebas
 
 The full process, including what goes where and the license notices, lives in [`CONTRIBUTING.md`](https://github.com/ryuzcorp/cello/blob/main/CONTRIBUTING.md) at the repo root. This page adds only the local test how-to.
 
+## Retry a failed release run
+
+`publish.yml` publishes the immutable `<version>` image, attests the image and the release files, and only then moves the `beta`/`latest` channel tags and creates the GitHub Release. The `<version>` image is pullable once it is published, but no channel tag moves and no Release appears until both attestations pass, so a failure before them costs nothing user-visible and the same tag is retried:
+
+```sh
+gh run rerun <run-id> --failed
+```
+
+The retry accepts the already-published `<version>` only when it is exactly the image index stitched from the per-arch digests the first attempt uploaded; a different index is refused, and a published `<version>` or Release is never replaced — for those, cut a new tag. A failure while promoting leaves the channel tags that already moved and no Release; the retry finishes them, and a channel tag that already holds a newer version is never rolled back. Use "Re-run failed jobs", not a full re-run: the per-arch build refuses an already-published `<version>`.
+
 ## Run the test suite locally
 
 Run the suite the way CI runs it:
