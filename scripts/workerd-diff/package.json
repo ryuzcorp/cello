@@ -1,0 +1,15 @@
+{
+  "name": "cello-workerd-diff",
+  "private": true,
+  "description": "Differential conformance harness: the same fixture Worker runs on workerd and on cello, and the observable transcripts are diffed.",
+  "type": "module",
+  "scripts": {
+    "diff": "node runner.mjs"
+  },
+  "dependencies": {
+    "workerd": "1.20261121.1"
+  },
+  "engines": {
+    "node": ">=22.19"
+  }
+}
