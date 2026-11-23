@@ -69,6 +69,9 @@ function make(format, decompress, name, missing) {
   // pending read() rejects with the cancel reason instead
   // of resolving {done: true}.
   ts.readable._cancelRejectsReads = true;
+  // ... and a failed push or flush closes the writable side
+  // instead of erroring it (#223).
+  ts.writable._closesOnError = true;
   // Last, so nothing after it can throw and strand the native stream.
   // Throws a RangeError when the isolate holds too many.
   id = __zlib_stream_new(format, decompress);

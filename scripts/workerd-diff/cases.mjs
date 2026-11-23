@@ -13,6 +13,8 @@ export const cases = [
   { name: "writable-close-states", fixture: "streams", path: "/writable-close-states" },
   { name: "writable-abort-states", fixture: "streams", path: "/writable-abort-states" },
   { name: "writable-write-states", fixture: "streams", path: "/writable-write-states" },
+  { name: "writer-released", fixture: "streams", path: "/writer-released" },
+  { name: "decompression-close-after-error", fixture: "streams", path: "/decompression-close-after-error" },
   { name: "transform-error", fixture: "streams", path: "/transform-error" },
   { name: "transform-close-after-cancel", fixture: "streams", path: "/transform-close-after-cancel" },
   { name: "gzip-large", fixture: "streams", path: "/gzip-large" },

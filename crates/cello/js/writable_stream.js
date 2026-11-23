@@ -193,12 +193,21 @@ class WritableStreamDefaultWriter {
   releaseLock() {
     if (this.#released) return;
     const s = this.#stream;
-    // Spec section 4.6.9: releasing rejects the writer's ready
-    // and (still-pending) closed promises with a fresh
-    // TypeError, even while an abort is in flight.
+    // Spec section 4.6.9: releasing rejects the writer's ready and
+    // (still-pending) closed promises with a fresh TypeError, even while
+    // an abort is in flight. For ready that means a *new* rejected promise
+    // even when the old one had settled, so a read after the release sees
+    // the released error; a handler attached before the release keeps the
+    // old settlement -- still resolved, or still the stream's error, as
+    // workerd measured (#193). closed keeps its own settlement once it has
+    // one (`_rejectClosed` only acts while it is pending).
     const err = new TypeError(
       "This WritableStream writer has been released.");
-    this._rejectReady(err);
+    if (this.#readyReject) this.#readyReject(err);
+    this.#readyPromise = Promise.reject(err);
+    this.#readyPromise.catch(() => {});
+    this.#readyResolve = null;
+    this.#readyReject = null;
     this._rejectClosed(err);
     // Workerd also rejects queued (not in-flight) writes
     // with the same error; the chunks are dropped.
@@ -211,6 +220,12 @@ class WritableStreamDefaultWriter {
   }
 
   get desiredSize() {
+    // Workerd throws for a released writer in every stream state (#193),
+    // instead of reporting the stream's size; `null` for an errored or
+    // closed stream would otherwise leak through.
+    if (this.#released)
+      throw new TypeError(
+        "This WritableStream writer has been released.");
     const s = this.#stream;
     if (s._state === 'errored' ||
         s._state === 'erroring') return null;
@@ -239,6 +254,10 @@ class WritableStream {
   _backpressure = false;
   _hwm = 1;
   _started = false;
+  // Workerd's compression streams are internal streams: a failed push or
+  // flush closes the writable side instead of erroring it (#223).
+  // compression_streams.js opts in on the stream it builds.
+  _closesOnError = false;
 
   constructor(underlyingSink, queuingStrategy) {
     // Per spec: extract strategy fields first. Size is
@@ -522,7 +541,8 @@ class WritableStream {
         this._queueSize -= entry.size;
         if (this._queueSize < 0) this._queueSize = 0;
         entry.reject(e);
-        this._dealWithRejection(e);
+        if (this._closesOnError) this._closeAfterError(e);
+        else this._dealWithRejection(e);
       },
     );
   }
@@ -569,7 +589,38 @@ class WritableStream {
       this._pendingAbort = null;
       abortReq.reject(e);
     }
-    this._dealWithRejection(e);
+    if (this._closesOnError) this._closeAfterError(e);
+    else this._dealWithRejection(e);
+  }
+
+  // A failing write or flush on an internal stream (workerd's compression
+  // streams) settles the writable side as *closed*, not errored (#223):
+  // later write()/close() calls report "This WritableStream has been
+  // closed.", desiredSize is 0 and abort() resolves, while writer.closed
+  // rejects with the failure and writer.ready resolves. Queued writes and
+  // a queued close reject with the closed-stream TypeError, as workerd
+  // does, instead of the stored error.
+  _closeAfterError(e) {
+    // An abort already moved the stream to 'erroring': that path owns the
+    // settle (and rejects the abort with the stored error).
+    if (this._state !== 'writable') {
+      this._dealWithRejection(e);
+      return;
+    }
+    this._state = 'closed';
+    const closedError = new TypeError(
+      "This WritableStream has been closed.");
+    for (const entry of this._queue) entry.reject(closedError);
+    this._queue = [];
+    this._queueSize = 0;
+    if (this._closeRequest) {
+      this._closeRequest.reject(closedError);
+      this._closeRequest = null;
+    }
+    if (this._writer) {
+      this._writer._resolveReady();
+      this._writer._rejectClosed(e);
+    }
   }
 
   getWriter() {

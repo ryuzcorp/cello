@@ -361,6 +361,145 @@ const routes = {
     return report(out);
   },
 
+  async "/writer-released"() {
+    // Issue #193: a released writer's surface. workerd throws the released
+    // TypeError from desiredSize in every state (a cello writer used to keep
+    // reporting the stream's size, and null once the stream errored),
+    // rejects write/close/abort, and installs a fresh rejected ready: a read
+    // after the release is the released error, while a handler attached
+    // before it keeps the old settlement. closed keeps its settlement once
+    // it has one. `flip` is a bounded microtask drain, never wall time: it
+    // gets the write into the sink so ready is provably pending at release.
+    const flip = async () => {
+      for (let i = 0; i < 16; i++) await null;
+    };
+    const attempt = (fn) => {
+      try { return String(fn()); } catch (error) { return errorInfo(error); }
+    };
+    const out = {};
+
+    // Nothing pending: ready resolved at construction. `*Before` keeps a
+    // handler on the pre-release promise; the plain reads come after.
+    const idleStream = new WritableStream({}, { highWaterMark: 2 });
+    const idleWriter = idleStream.getWriter();
+    const idleReadyBefore = idleWriter.ready.then(() => "ok", errorInfo);
+    idleWriter.releaseLock();
+    const idleReady = idleWriter.ready.then(() => "ok", errorInfo);
+    const idleClosed = idleWriter.closed.then(() => "ok", errorInfo);
+    out.idle = {
+      desiredSize: attempt(() => idleWriter.desiredSize),
+      readyBefore: await idleReadyBefore,
+      ready: await idleReady,
+      closed: await idleClosed,
+      write: await idleWriter.write("x").then(() => "ok", errorInfo),
+      close: await idleWriter.close().then(() => "ok", errorInfo),
+      abort: await idleWriter.abort("why").then(() => "ok", errorInfo),
+      releaseAgain: attempt(() => idleWriter.releaseLock()),
+      unlocked: idleStream.locked,
+    };
+    out.idle.reuse = attempt(() => idleStream.getWriter().desiredSize);
+
+    // Ready still pending at release: backpressure holds the write.
+    let releaseWrite;
+    const busyStream = new WritableStream(
+      { write: () => new Promise((resolve) => (releaseWrite = resolve)) },
+      { highWaterMark: 0 });
+    const busyWriter = busyStream.getWriter();
+    const busyWrite = busyWriter.write("a").then(() => "ok", errorInfo);
+    await flip();
+    const busyReady = busyWriter.ready.then(() => "ok", errorInfo);
+    const busyClosed = busyWriter.closed.then(() => "ok", errorInfo);
+    busyWriter.releaseLock();
+    out.pending = {
+      desiredSize: attempt(() => busyWriter.desiredSize),
+      ready: await busyReady,
+      closed: await busyClosed,
+    };
+    releaseWrite();
+    out.pending.write = await busyWrite;
+    out.pending.unlocked = busyStream.locked;
+
+    // Released after the stream closed: both promises stay resolved.
+    const doneStream = new WritableStream({});
+    const doneWriter = doneStream.getWriter();
+    await doneWriter.close();
+    const doneReadyBefore = doneWriter.ready.then(() => "ok", errorInfo);
+    const doneClosedBefore = doneWriter.closed.then(() => "ok", errorInfo);
+    doneWriter.releaseLock();
+    const doneReady = doneWriter.ready.then(() => "ok", errorInfo);
+    const doneClosed = doneWriter.closed.then(() => "ok", errorInfo);
+    out.closedStream = {
+      desiredSize: attempt(() => doneWriter.desiredSize),
+      readyBefore: await doneReadyBefore,
+      closedBefore: await doneClosedBefore,
+      ready: await doneReady,
+      closed: await doneClosed,
+    };
+
+    // Released after the stream errored: ready and closed keep the error.
+    const badStream = new WritableStream({ write() { throw new TypeError("boom"); } });
+    const badWriter = badStream.getWriter();
+    await badWriter.write("a").then(() => "ok", errorInfo);
+    const badReadyBefore = badWriter.ready.then(() => "ok", errorInfo);
+    badWriter.releaseLock();
+    const badReady = badWriter.ready.then(() => "ok", errorInfo);
+    const badClosed = badWriter.closed.then(() => "ok", errorInfo);
+    out.erroredStream = {
+      desiredSize: attempt(() => badWriter.desiredSize),
+      readyBefore: await badReadyBefore,
+      ready: await badReady,
+      closed: await badClosed,
+    };
+
+    return report(out);
+  },
+
+  async "/decompression-close-after-error"() {
+    // Issue #223: workerd's compression streams are internal streams, so a
+    // failed push closes the writable side instead of erroring it: a later
+    // close()/write() reports the closed-stream TypeError, desiredSize is 0
+    // and abort() resolves, while writer.closed rejects with the failure and
+    // writer.ready resolves. A plain TransformStream rejects all three with
+    // the thrown error instead, so this is the compression stream alone.
+    const attempt = (fn) => {
+      try { return String(fn()); } catch (error) { return errorInfo(error); }
+    };
+    const out = {};
+
+    const stream = new DecompressionStream("gzip");
+    const writer = stream.writable.getWriter();
+    const ready = writer.ready.then(() => "ok", errorInfo);
+    const closed = writer.closed.then(() => "ok", errorInfo);
+    const read = new Response(stream.readable).arrayBuffer()
+      .then((buffer) => `ok ${buffer.byteLength}`, errorInfo);
+    out.write = await writer.write(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]))
+      .then(() => "ok", errorInfo);
+    out.readAfterWrite = await read;
+    out.close = await writer.close().then(() => "ok", errorInfo);
+    out.closeAgain = await writer.close().then(() => "ok", errorInfo);
+    out.writeAgain = await writer.write(new Uint8Array([1])).then(() => "ok", errorInfo);
+    out.desiredSize = attempt(() => writer.desiredSize);
+    out.ready = await ready;
+    out.closed = await closed;
+    out.abort = await writer.abort("stop").then(() => "ok", errorInfo);
+    out.locked = stream.writable.locked;
+
+    // CompressionStream shares the internal-stream writable: a clean close
+    // still resolves, and only the second close is the closed-stream error.
+    const compress = new CompressionStream("gzip");
+    const compressWriter = compress.writable.getWriter();
+    const compressed = new Response(compress.readable).arrayBuffer()
+      .then((buffer) => buffer.byteLength);
+    out.compress = {
+      write: await compressWriter.write(new Uint8Array([1, 2, 3])).then(() => "ok", errorInfo),
+      close: await compressWriter.close().then(() => "ok", errorInfo),
+      closeAgain: await compressWriter.close().then(() => "ok", errorInfo),
+      read: await compressed,
+    };
+
+    return report(out);
+  },
+
   async "/writable-backpressure"() {
     const order = [];
     let release;
