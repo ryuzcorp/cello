@@ -262,10 +262,8 @@ pub fn refuse_batch(
     )
 }
 
-/// [`refuse_batch`] with the free-release bounds given, for an operator that
-/// tuned them (`CELLO_QUEUE_REFUSAL_FREE_LIMIT`,
-/// `CELLO_QUEUE_REFUSAL_FREE_WINDOW_S`) and for tests.
-pub fn refuse_batch_with(
+/// [`refuse_batch`] with the free-release bounds given.
+fn refuse_batch_with(
     now: Ms,
     kind: RefusalKind,
     unfittable: bool,
