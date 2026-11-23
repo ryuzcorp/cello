@@ -413,7 +413,12 @@ TUNING:
   CELLO_SQL_STATEMENT_MS          Per-statement SQL time bound (unset means
                                   unbounded; timed-out statements fail and
                                   roll back)
-  CELLO_FETCH_TIMEOUT_S           Outbound fetch timeout
+  CELLO_FETCH_TIMEOUT_S           Outbound fetch budget: connect, a streamed
+                                  request body and the response head (default:
+                                  120; at most 86400). A response body is not
+                                  on a total deadline
+  CELLO_HTTP_STREAM_IDLE_S        Seconds without bytes that ends a stream
+                                  body (default: 60; at most 86400)
   CELLO_HANDLER_BUDGET_S          JavaScript handler budget
   CELLO_BACKGROUND_BUDGET_S       Post-response background budget (default: 30)
   CELLO_TOKIO_THREADS             Tokio runtime worker threads

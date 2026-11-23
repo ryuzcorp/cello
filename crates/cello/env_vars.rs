@@ -282,9 +282,7 @@ pub fn validate() -> anyhow::Result<()> {
         "CELLO_ACTIVATIONS",
         "CELLO_C_TRIM_MB",
         "CELLO_DEPLOY_POLL_S",
-        "CELLO_FETCH_TIMEOUT_S",
         "CELLO_HANDLER_BUDGET_S",
-        "CELLO_HTTP_STREAM_IDLE_S",
         "CELLO_IDLE_EVICT_S",
         "CELLO_LOG_PIPELINE",
         "CELLO_LTX_COMPACTIONS",
@@ -309,6 +307,13 @@ pub fn validate() -> anyhow::Result<()> {
         "CELLO_WAKER_TICK_MS",
     ] {
         positive::<u64>(name)?;
+    }
+
+    // The two stream timeouts share the day ceiling: past it a "bound" no
+    // longer bounds anything, so a value that large is a misconfiguration,
+    // never an intentional disable (the switch for that is not setting it).
+    for name in ["CELLO_FETCH_TIMEOUT_S", "CELLO_HTTP_STREAM_IDLE_S"] {
+        bounded_timeout_seconds(name)?;
     }
 
     for name in [
@@ -446,6 +451,31 @@ pub fn value(name: &str) -> anyhow::Result<Option<String>> {
         Err(std::env::VarError::NotPresent) => Ok(None),
         Err(error) => Err(anyhow!("read {name}: {error}")),
     }
+}
+
+/// The largest accepted value for a seconds-based timeout
+/// (`CELLO_FETCH_TIMEOUT_S`, `CELLO_HTTP_STREAM_IDLE_S`). A bound past a day
+/// has stopped bounding anything: it would effectively disable the protection
+/// the knob exists for, so it is refused at startup instead of silently
+/// honoured.
+pub const MAX_TIMEOUT_SECONDS: u64 = 86_400;
+
+/// Parse an optional seconds-based timeout: unset/blank means "the consumer's
+/// default", anything else must be positive and at most
+/// [`MAX_TIMEOUT_SECONDS`].
+pub fn parse_bounded_timeout(name: &str, value: Option<String>) -> anyhow::Result<Option<u64>> {
+    let Some(seconds) = parse_positive::<u64>(name, value)? else {
+        return Ok(None);
+    };
+    if seconds > MAX_TIMEOUT_SECONDS {
+        bail!("{name} must be at most {MAX_TIMEOUT_SECONDS} seconds, not {seconds}");
+    }
+    Ok(Some(seconds))
+}
+
+/// [`parse_bounded_timeout`] over the process environment.
+pub fn bounded_timeout_seconds(name: &str) -> anyhow::Result<Option<u64>> {
+    parse_bounded_timeout(name, value(name)?)
 }
 
 pub fn flag(name: &str, default: bool) -> anyhow::Result<bool> {
@@ -622,5 +652,42 @@ mod renamed_prefix_tests {
     fn clean_environment_still_validates() {
         refuse_renamed(vars(&[("CELLO_OPERATOR_TOKEN", "token"), ("PATH", "/bin")]).into_iter())
             .expect("an env without CELLD_* validates");
+    }
+}
+
+#[cfg(test)]
+mod timeout_ceiling_tests {
+    use super::*;
+
+    /// Both stream timeouts accept up to a day and refuse anything past it:
+    /// a larger value would silently disable the bound the knob exists for.
+    /// Pure over injected values, so it never touches the process env.
+    #[test]
+    fn seconds_bounds_accept_a_day_and_refuse_more() {
+        for name in ["CELLO_FETCH_TIMEOUT_S", "CELLO_HTTP_STREAM_IDLE_S"] {
+            assert_eq!(parse_bounded_timeout(name, None).unwrap(), None);
+            assert_eq!(
+                parse_bounded_timeout(name, Some("1".into())).unwrap(),
+                Some(1)
+            );
+            assert_eq!(
+                parse_bounded_timeout(name, Some(MAX_TIMEOUT_SECONDS.to_string())).unwrap(),
+                Some(MAX_TIMEOUT_SECONDS)
+            );
+            for bad in ["0", "86401", "100000000", "soon"] {
+                let error = parse_bounded_timeout(name, Some(bad.into()))
+                    .expect_err("out-of-range values must refuse startup");
+                let message = format!("{error:#}");
+                assert!(
+                    message.contains(name),
+                    "{bad}: refuses naming {name}: {message}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_ceiling_is_exactly_one_day() {
+        assert_eq!(MAX_TIMEOUT_SECONDS, 86_400);
     }
 }

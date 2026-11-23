@@ -11268,7 +11268,10 @@ fn op_fetch(
         // HTTP stream service already ends a body that makes no progress for
         // `CELLO_HTTP_STREAM_IDLE_S`.
         let fetch_timeout = crate::env_vars::positive_or("CELLO_FETCH_TIMEOUT_S", 120)
-            .expect("validated CELLO_FETCH_TIMEOUT_S");
+            .expect("validated CELLO_FETCH_TIMEOUT_S")
+            // `validate` refuses anything past the day ceiling; the clamp keeps
+            // a caller that skipped it from storing a bound that never fires.
+            .min(crate::env_vars::MAX_TIMEOUT_SECONDS);
         let mut rb = client.request(m, &url);
         // reqwest omits Content-Length for an empty Vec, which collapses the
         // wire representation of `Some([])` into the representation of

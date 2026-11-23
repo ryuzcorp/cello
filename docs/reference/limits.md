@@ -61,11 +61,14 @@ services, APIs, and Wrangler configuration.
   produces nothing, or the client stops reading.
 - A Worker `fetch()` is bounded the same way, and not by a total deadline:
   `CELLO_FETCH_TIMEOUT_S` bounds the connect, a streamed request body, and
-  the wait for the response head. The response body then streams for as long
-  as the upstream keeps sending — an SSE feed or a proxied download is never
-  truncated because it outlived that budget — and a body the Worker stops
-  reading follows the idle rule above (every received chunk refreshes it, so
-  a silent or black-holed upstream still ends).
+  the wait for the response head (both knobs accept 1–86400 seconds). The
+  response body then streams for as long as the upstream keeps sending — an
+  SSE feed or a proxied download is never truncated because it outlived that
+  budget. A body the Worker reads is ended when no bytes arrive for
+  `CELLO_HTTP_STREAM_IDLE_S` (every received chunk starts a fresh window), so
+  a silent or black-holed upstream still ends. That idle timer runs only while
+  the host is polling the body: a passthrough fetch body that the client stops
+  reading is bounded by the response-body rule above, not by this one.
 - A streamed body keeps its event, isolate, and cell resident until it ends,
   so a retiring generation waits for open streams before it frees its heaps.
 - A `TransformStream` applies backpressure: while nobody reads the readable
