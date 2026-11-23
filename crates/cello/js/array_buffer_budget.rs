@@ -227,6 +227,10 @@ impl BackingStoreBudget {
 pub(super) struct HostStoreRefusal {
     /// The ceiling the bytes would have crossed, for the guest-facing message.
     pub(super) cap: usize,
+    /// The bytes the caller asked for. Past the whole cap no collection can
+    /// make room, so the caller can tell a squeeze from a batch that can
+    /// never fit and stop asking.
+    pub(super) requested: usize,
 }
 
 impl std::fmt::Display for HostStoreRefusal {
@@ -402,7 +406,10 @@ pub(super) fn host_store(
     let len = bytes.len();
     let retained = bytes.capacity();
     if !budget.reserve_latching(retained) {
-        return Err(HostStoreRefusal { cap: budget.cap() });
+        return Err(HostStoreRefusal {
+            cap: budget.cap(),
+            requested: len,
+        });
     }
     let pointer = bytes.as_mut_ptr();
     let charge = Box::new(HostCharge {

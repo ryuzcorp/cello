@@ -5946,27 +5946,39 @@ fn queue_batch_value<'s>(
     Ok(value.into())
 }
 
-/// Whether a Queue dispatch failed because the target isolate had no room for
-/// the batch, rather than because anything in the consumer ran and failed.
+/// Why a Queue dispatch never reached the consumer's handler.
 ///
-/// Two errors qualify and neither ran consumer code: the isolate's
-/// backing-store budget refused one of the batch's message bodies (the
-/// per-isolate `ArrayBuffer` cap, `CELLO_V8_EXTERNAL_LIMIT_MB`), or the node
-/// had no stateless slot to admit the event into. Both leave the message
-/// entirely undelivered, so the broker releases the lease without spending an
-/// attempt.
+/// Both kinds leave the message entirely undelivered: no line of the consumer
+/// ran, so a delivery attempt is not the consumer's to spend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueueRefusal {
+    /// The consumer isolate's backing-store budget refused the batch. With
+    /// `unfittable` the bodies cannot fit an *empty* isolate either, so no
+    /// amount of waiting makes the batch deliverable.
+    Budget { unfittable: bool },
+    /// The node had no stateless slot to admit the event into, or was
+    /// shedding, so no isolate was even chosen.
+    Pressure,
+}
+
+/// Classify a Queue dispatch error, or `None` when the consumer ran and failed
+/// (or the failure was something else entirely).
 ///
 /// A handler that throws, a `message.retry()`, `batch.retryAll()` and a lease
-/// that expires unsettled all reach the broker as settlements or expiries,
-/// never as this error, so they keep spending attempts.
-pub fn is_queue_capacity_refusal(error: &anyhow::Error) -> bool {
-    error
-        .downcast_ref::<array_buffer_budget::HostStoreRefusal>()
-        .is_some()
-        || matches!(
-            error.downcast_ref::<crate::engine_api::AdmitError>(),
-            Some(crate::engine_api::AdmitError::Refused(_))
-        )
+/// that expires unsettled reach the broker as settlements or expiries, never
+/// as this error, so they keep spending attempts.
+pub fn queue_refusal(error: &anyhow::Error) -> Option<QueueRefusal> {
+    if let Some(refusal) = error.downcast_ref::<array_buffer_budget::HostStoreRefusal>() {
+        // Past the whole cap no collection can make room: the batch can never
+        // be materialized, so waiting for it is pointless.
+        return Some(QueueRefusal::Budget {
+            unfittable: refusal.requested > refusal.cap,
+        });
+    }
+    match error.downcast_ref::<crate::engine_api::AdmitError>() {
+        Some(crate::engine_api::AdmitError::Refused(_)) => Some(QueueRefusal::Pressure),
+        _ => None,
+    }
 }
 
 /// Start a queue consumer's first turn. The batch body bytes move directly
@@ -5976,6 +5988,27 @@ fn begin_queue(
     batch: QueueBatch,
     reply: tokio::sync::oneshot::Sender<Result<QueueDispatchResult>>,
 ) -> Begun {
+    // A batch whose bodies cannot fit the whole budget can never be
+    // materialized, however long it waits, so refuse it here instead of
+    // charging the isolate message by message. The error is the same
+    // `HostStoreRefusal` a mid-batch refusal returns, with `requested` past
+    // `cap`, which is what makes the host charge the attempt rather than
+    // release the lease.
+    if let Some(budget) = backing_store_budget(tc) {
+        let bytes = batch
+            .messages
+            .iter()
+            .map(|message| message.body.len())
+            .sum();
+        if bytes > budget.cap() {
+            let _ = reply.send(Err(array_buffer_budget::HostStoreRefusal {
+                cap: budget.cap(),
+                requested: bytes,
+            }
+            .into()));
+            return Begun::Nothing;
+        }
+    }
     let runtime_state = actor_runtime_state(tc);
     let context =
         IoContext::tracked_with_options(runtime_state.resource_limits, false, &runtime_state);

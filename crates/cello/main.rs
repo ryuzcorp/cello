@@ -2829,15 +2829,18 @@ async fn dispatch_queue_batch(app: AppHandle, call: QueueDispatchReq) {
     };
     let result = match result {
         Ok(result) => result,
-        Err(error) if cello::js::is_queue_capacity_refusal(&error) => {
-            let released = release_refused_batch(app, &scope, &queue, &lease_id, &leases).await;
+        Err(error) if cello::js::queue_refusal(&error).is_some() => {
+            let refusal = cello::js::queue_refusal(&error).expect("checked above");
+            let action =
+                release_refused_batch(app, &scope, &queue, &lease_id, &leases, refusal).await;
             tracing::warn!(
                 %scope,
                 %queue,
                 %script,
                 %error,
-                released,
-                "Queue batch refused for want of isolate capacity; its lease was released without spending a delivery attempt"
+                ?refusal,
+                ?action,
+                "Queue batch refused for want of capacity; see the action for whether the lease was released or the attempt charged"
             );
             return;
         }
@@ -2911,12 +2914,12 @@ async fn dispatch_queue_batch(app: AppHandle, call: QueueDispatchReq) {
     }
 }
 
-/// Hand a refused batch's lease back to the queue cell without spending a
-/// delivery attempt.
+/// Report a refused batch to the queue cell, which decides whether the lease
+/// is released without spending an attempt or the attempt is charged.
 ///
 /// The request carries the settlement's own fence — the lease id plus every
-/// member's identity, sequence and generation — so a release that lost a race
-/// with a newer lease clears nothing. A failed release is logged and the lease
+/// member's identity, sequence and generation — so a report that lost a race
+/// with a newer lease clears nothing. A failed report is logged and the lease
 /// is left to expire, which costs the attempt this path exists to save; the
 /// message itself is never dropped.
 async fn release_refused_batch(
@@ -2925,8 +2928,18 @@ async fn release_refused_batch(
     queue: &str,
     lease_id: &str,
     leases: &[cello::host_channels::QueueLeaseRef],
-) -> bool {
-    let body = serde_json::json!({ "leaseId": lease_id, "leases": leases });
+    refusal: cello::js::QueueRefusal,
+) -> Option<String> {
+    let (kind, unfittable) = match refusal {
+        cello::js::QueueRefusal::Budget { unfittable } => ("budget", unfittable),
+        cello::js::QueueRefusal::Pressure => ("pressure", false),
+    };
+    let body = serde_json::json!({
+        "leaseId": lease_id,
+        "leases": leases,
+        "kind": kind,
+        "unfittable": unfittable,
+    });
     let body = cello::js::RequestBody::Bytes(body.to_string().into_bytes().into());
     let (reply, receive) = oneshot::channel();
     dispatch_do_call(
@@ -2950,35 +2963,38 @@ async fn release_refused_batch(
     )
     .await;
     match receive.await {
+        Ok(Ok(response)) if (200..300).contains(&response.status) => Some(
+            serde_json::from_slice::<serde_json::Value>(&response.body)
+                .ok()
+                .and_then(|body| body.get("action")?.as_str().map(str::to_string))
+                .unwrap_or_else(|| "released".to_string()),
+        ),
         Ok(Ok(response)) => {
-            let released = (200..300).contains(&response.status);
-            if !released {
-                tracing::warn!(
-                    %scope,
-                    %queue,
-                    status = response.status,
-                    "Queue refusal release was refused; its lease will expire"
-                );
-            }
-            released
+            tracing::warn!(
+                %scope,
+                %queue,
+                status = response.status,
+                "Queue refusal report was refused; its lease will expire"
+            );
+            None
         }
         Ok(Err(error)) => {
             tracing::warn!(
                 %scope,
                 %queue,
                 %error,
-                "Queue refusal release routing failed; its lease will expire"
+                "Queue refusal report routing failed; its lease will expire"
             );
-            false
+            None
         }
         Err(error) => {
             tracing::warn!(
                 %scope,
                 %queue,
                 %error,
-                "Queue refusal release dispatcher dropped; its lease will expire"
+                "Queue refusal report dispatcher dropped; its lease will expire"
             );
-            false
+            None
         }
     }
 }
