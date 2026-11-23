@@ -123,6 +123,12 @@ export class Thrower {
     if (kind === "/num") throw 42;
     if (kind === "/null") throw null;
     if (kind === "/empty") throw new TypeError("");
+    if (kind === "/replaced-dom") {
+      // A Worker that replaces the global class owns the instance it throws;
+      // workerd treats it as a plain Error, never a DOMException.
+      globalThis.DOMException = class DOMException extends Error {};
+      throw new globalThis.DOMException("replaced!");
+    }
     throw new Error("handler exploded");
   }
 }
@@ -203,6 +209,14 @@ export default {
           () => stub.fetch(`https://do.test${kind}`), shape);
       }
       return Response.json(out);
+    }
+    if (route === "/throw-replaced") {
+      // Must run after every other route: replacing the global persists in
+      // the isolate. A Worker that replaces the class owns the instance it
+      // throws; workerd hands its caller a plain Error, never a DOMException.
+      const stub = env.THROWER.getByName("thrower-replaced");
+      return Response.json(await attempt(
+        () => stub.fetch("https://do.test/replaced-dom"), shape));
     }
     if (route === "/rpc-throw") {
       const stub = env.RPC.getByName("rpc");

@@ -2267,15 +2267,16 @@ fn handler_rejection(
         Some(value.to_rust_string_lossy(tc))
     }
     let r = p.result(tc);
-    let is_dom = r
-        .to_object(tc)
-        .and_then(|object| {
-            let global = tc.get_current_context().global(tc);
-            let key = v8::String::new(tc, "DOMException")?;
-            let ctor: v8::Local<v8::Object> = global.get(tc, key.into())?.try_into().ok()?;
-            object.instance_of(tc, ctor)
-        })
-        .unwrap_or(false);
+    // The harness class, not the live global: a Worker that replaces
+    // `globalThis.DOMException` must not change what class its caller sees.
+    // Workerd treats such an instance as a plain `Error`.
+    let is_dom = internal_value(tc, "__primDOMException")
+        .and_then(|ctor| ctor.to_object(tc))
+        .is_some_and(|ctor| {
+            r.to_object(tc)
+                .and_then(|object| object.instance_of(tc, ctor))
+                .unwrap_or(false)
+        });
     if is_dom || r.is_native_error() {
         let default_name = if is_dom { "DOMException" } else { "Error" };
         let (name, message) = match r.to_object(tc) {

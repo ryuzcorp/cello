@@ -653,6 +653,55 @@ fn durable_object_and_websocket_match_workerd() {
         "shape-probe",
     );
 
+    // #151: a Worker that replaces `globalThis.DOMException` and throws an
+    // instance of its own class does not make it a DOMException. Workerd
+    // classifies against its own class, so the caller sees a plain Error with
+    // the name, message and `remote` marker intact. This runs last because
+    // the replacement stays in the isolate.
+    let replaced = answer!("/throw-replaced");
+    expect(
+        &mut failures,
+        "replaced.ctor",
+        text(&replaced, &["ctor"]),
+        "Error",
+    );
+    expect(
+        &mut failures,
+        "replaced.name",
+        text(&replaced, &["name"]),
+        "Error",
+    );
+    expect(
+        &mut failures,
+        "replaced.message",
+        text(&replaced, &["message"]),
+        "replaced!",
+    );
+    expect(
+        &mut failures,
+        "replaced.isDom",
+        text(&replaced, &["isDom"]),
+        "false",
+    );
+    expect(
+        &mut failures,
+        "replaced.isError",
+        text(&replaced, &["isError"]),
+        "true",
+    );
+    expect(
+        &mut failures,
+        "replaced.remote",
+        text(&replaced, &["remote"]),
+        "true",
+    );
+    expect(
+        &mut failures,
+        "replaced.stack",
+        text(&replaced, &["stack"]),
+        "Error: replaced!",
+    );
+
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
