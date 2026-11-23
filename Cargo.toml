@@ -50,6 +50,7 @@ aes = "0.8"
 aes-gcm = "0.10"
 cbc = { version = "0.1", features = ["alloc"] }
 ctr = "0.9"
+ghash = "0.5"
 anyhow = "1"
 async-trait = "0.1"
 axum = { version = "0.7", features = ["multipart"] }

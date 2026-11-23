@@ -115,4 +115,12 @@ export const cases = [
   { name: "cache-put-consumes", fixture: "cache", path: "/put-consumes" },
   { name: "cache-match-twice", fixture: "cache", path: "/match-twice" },
   { name: "cache-status-text", fixture: "cache", path: "/status-text" },
+  // Web Crypto: key-usage enforcement (#197), argument validation (#198),
+  // AES-GCM IV and tag ranges (#199), and the values the sweep measured as
+  // already agreeing, so they cannot regress.
+  { name: "crypto-usages", fixture: "crypto", path: "/usages" },
+  { name: "crypto-operations", fixture: "crypto", path: "/ops" },
+  { name: "crypto-validation", fixture: "crypto", path: "/validation" },
+  { name: "crypto-aes-gcm", fixture: "crypto", path: "/gcm" },
+  { name: "crypto-values", fixture: "crypto", path: "/values" },
 ];

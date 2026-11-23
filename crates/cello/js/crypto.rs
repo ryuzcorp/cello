@@ -2018,13 +2018,20 @@ pub(super) fn op_webcrypto_hmac_verify(
     rv.set(v8::Boolean::new(scope, valid).into());
 }
 
-/// AES-GCM for the Web Crypto ops. The key, IV, and tag sizes are instantiated
-/// explicitly because the crate fixes all three in the type.
+/// AES-GCM for the Web Crypto ops.
 ///
-/// Web Crypto permits any IV length; 96 bits is the recommendation, not the
-/// rule, so 128-bit IVs are accepted too. For anything but 96 bits the crate
-/// derives J0 by GHASHing the IV, per NIST SP 800-38D. An empty IV is
-/// rejected in the JS layer, by name, before reaching here.
+/// Web Crypto permits any non-empty IV length; 96 bits is the recommendation,
+/// not the rule. The `aes-gcm` crate fixes the nonce and tag sizes in the type,
+/// so it can only be instantiated for 12- and 16-byte IVs with 12..=16-byte
+/// tags. Workerd accepts every length (the sweep measured 1 through 65536-byte
+/// IVs and 4- and 8-byte tags), so the mode is implemented here over the same
+/// `aes` and `ghash` crates the AEAD uses, following NIST SP 800-38D section
+/// 7.2 for J0 and the counter. A 96-bit IV is J0 verbatim with the counter
+/// 1; every other length is `GHASH(IV || 0^s || [len(IV)]64)`.
+///
+/// An empty IV and an unsupported tag length are rejected in the JS layer, by
+/// name, before reaching here; the guards below keep the op safe to call
+/// directly.
 fn webcrypto_aes_gcm(
     key: &[u8],
     iv: &[u8],
@@ -2033,51 +2040,133 @@ fn webcrypto_aes_gcm(
     tag_size: usize,
     encrypting: bool,
 ) -> Option<Vec<u8>> {
-    use aes_gcm::aead::consts::{U12, U13, U14, U15, U16};
-    use aes_gcm::aead::{Aead, KeyInit, Payload};
-    macro_rules! run {
-        ($aes:ty, $nonce_size:ty, $tag_size:ty) => {{
-            type Gcm = aes_gcm::AesGcm<$aes, $nonce_size, $tag_size>;
-            let cipher = <Gcm as KeyInit>::new_from_slice(key).ok()?;
-            let nonce = aes_gcm::Nonce::<$nonce_size>::from_slice(iv);
-            let payload = Payload {
-                msg: data,
-                aad: additional_data,
-            };
-            if encrypting {
-                cipher.encrypt(nonce, payload)
-            } else {
-                cipher.decrypt(nonce, payload)
-            }
-            .ok()?
-        }};
+    match key.len() {
+        16 => webcrypto_aes_gcm_with::<aes::Aes128>(
+            key,
+            iv,
+            additional_data,
+            data,
+            tag_size,
+            encrypting,
+        ),
+        32 => webcrypto_aes_gcm_with::<aes::Aes256>(
+            key,
+            iv,
+            additional_data,
+            data,
+            tag_size,
+            encrypting,
+        ),
+        _ => None,
     }
-    macro_rules! by_tag {
-        ($aes:ty, $nonce_size:ty) => {
-            match tag_size {
-                12 => run!($aes, $nonce_size, U12),
-                13 => run!($aes, $nonce_size, U13),
-                14 => run!($aes, $nonce_size, U14),
-                15 => run!($aes, $nonce_size, U15),
-                16 => run!($aes, $nonce_size, U16),
-                _ => return None,
-            }
-        };
+}
+
+/// One key size of [`webcrypto_aes_gcm`]: the block cipher is the only part
+/// the AES key length changes.
+fn webcrypto_aes_gcm_with<C>(
+    key: &[u8],
+    iv: &[u8],
+    additional_data: &[u8],
+    data: &[u8],
+    tag_size: usize,
+    encrypting: bool,
+) -> Option<Vec<u8>>
+where
+    C: aes::cipher::BlockCipher
+        + aes::cipher::BlockEncrypt
+        + aes::cipher::KeyInit
+        + aes::cipher::BlockSizeUser<BlockSize = aes::cipher::generic_array::typenum::U16>,
+{
+    use aes::cipher::KeyInit;
+    use ghash::universal_hash::UniversalHash;
+
+    if iv.is_empty() || !matches!(tag_size, 4 | 8 | 12 | 13 | 14 | 15 | 16) {
+        return None;
     }
-    macro_rules! by_iv {
-        ($aes:ty) => {
-            match iv.len() {
-                12 => by_tag!($aes, U12),
-                16 => by_tag!($aes, U16),
-                _ => return None,
-            }
-        };
+    let cipher = <C as KeyInit>::new_from_slice(key).ok()?;
+
+    // H = E_K(0^128) keys GHASH; J0 is the initial counter block.
+    let mut h = ghash::Block::default();
+    cipher.encrypt_block(&mut h);
+    let ghash = ghash::GHash::new(&h);
+    let j0 = if iv.len() == 12 {
+        let mut block = ghash::Block::default();
+        block[..12].copy_from_slice(iv);
+        block[15] = 1;
+        block
+    } else {
+        let mut hash = ghash.clone();
+        hash.update_padded(iv);
+        let mut length = ghash::Block::default();
+        length[8..].copy_from_slice(&((iv.len() as u64) * 8).to_be_bytes());
+        hash.update(&[length]);
+        hash.finalize()
+    };
+
+    // The tag mask is the keystream block at J0 itself.
+    let mut mask = j0;
+    cipher.encrypt_block(&mut mask);
+
+    let tag_for = |body: &[u8]| -> ghash::Tag {
+        let mut hash = ghash.clone();
+        hash.update_padded(additional_data);
+        hash.update_padded(body);
+        let mut lengths = ghash::Block::default();
+        lengths[..8].copy_from_slice(&((additional_data.len() as u64) * 8).to_be_bytes());
+        lengths[8..].copy_from_slice(&((body.len() as u64) * 8).to_be_bytes());
+        hash.update(&[lengths]);
+        let mut tag = hash.finalize();
+        for (byte, mask) in tag.iter_mut().zip(mask.iter()) {
+            *byte ^= *mask;
+        }
+        tag
+    };
+
+    if encrypting {
+        let mut out = data.to_vec();
+        ctr32_apply(&cipher, &j0, &mut out)?;
+        let tag = tag_for(&out);
+        out.extend_from_slice(&tag[..tag_size]);
+        Some(out)
+    } else {
+        let split = data.len().checked_sub(tag_size)?;
+        let (body, provided) = data.split_at(split);
+        let expected = tag_for(body);
+        // The tag comparison is constant time: no early exit on a mismatch.
+        let mut difference = 0u8;
+        for (left, right) in expected[..tag_size].iter().zip(provided) {
+            difference |= left ^ right;
+        }
+        if difference != 0 {
+            return None;
+        }
+        let mut out = body.to_vec();
+        ctr32_apply(&cipher, &j0, &mut out)?;
+        Some(out)
     }
-    Some(match key.len() {
-        16 => by_iv!(aes::Aes128),
-        32 => by_iv!(aes::Aes256),
-        _ => return None,
-    })
+}
+
+/// XORs `buffer` with the GCM counter-mode keystream, which starts one block
+/// past J0. The counter is the low 32 bits, big-endian; a wrap is refused
+/// rather than silently reusing a keystream (SP 800-38D caps a message far
+/// below that anyway).
+fn ctr32_apply<C>(cipher: &C, j0: &ghash::Block, buffer: &mut [u8]) -> Option<()>
+where
+    C: aes::cipher::BlockEncrypt
+        + aes::cipher::BlockSizeUser<BlockSize = aes::cipher::generic_array::typenum::U16>,
+{
+    let mut counter = *j0;
+    let mut block = ghash::Block::default();
+    for chunk in buffer.chunks_mut(16) {
+        let low = u32::from_be_bytes([counter[12], counter[13], counter[14], counter[15]]);
+        counter[12..].copy_from_slice(&low.checked_add(1)?.to_be_bytes());
+        block.copy_from_slice(&counter);
+        cipher.encrypt_block(&mut block);
+        for (byte, mask) in chunk.iter_mut().zip(block.iter()) {
+            *byte ^= *mask;
+        }
+    }
+    Some(())
 }
 
 /// The AES modes the ops accept. The set is closed here, so a mode name is
@@ -2351,4 +2440,74 @@ pub(super) fn op_webcrypto_aes_decrypt(
     rv: v8::ReturnValue<v8::Value>,
 ) {
     op_webcrypto_aes(scope, args, rv, false);
+}
+
+#[cfg(test)]
+mod aes_gcm_tests {
+    use super::*;
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// Workerd 1.20261121.1 (BoringSSL) ground truth for a 16-byte key of
+    /// ones, additional data `aad`, plaintext `payload`, across the IV and tag
+    /// lengths the crate's fixed-type API could not express. The sweep measured
+    /// 4-, 1-, 3-, 12-, 33- and 24-byte IVs.
+    #[test]
+    fn nonstandard_iv_and_tag_lengths_match_workerd() {
+        let key = [1u8; 16];
+        let aad = b"aad";
+        let plaintext = b"payload";
+        let cases: [(&[u8], usize, &str); 6] = [
+            (
+                &[1, 2, 3, 4],
+                16,
+                "3880f3824d8d193356080e79449511685fe5d7dd3cf293",
+            ),
+            (&[9], 4, "8b3b2c56b27569d70c09e4"),
+            (&[1, 2, 3], 8, "5c022e80f7b7d045ba6252917b0604"),
+            (&[7; 12], 12, "3f8771ddf09b6f721a7f957cfc3f5183a8b2a0"),
+            (&[5; 24], 13, "cb3c612acb0e7aecdcc39fe3a6e02911566917b0"),
+            (
+                &[3; 33],
+                16,
+                "5a3a8db2261328fba19a583932c707c161f646233b7411",
+            ),
+        ];
+        for (iv, tag_size, expected) in cases {
+            let sealed =
+                webcrypto_aes_gcm(&key, iv, aad, plaintext, tag_size, true).expect("encrypt");
+            assert_eq!(hex(&sealed), expected, "iv {} tag {tag_size}", iv.len());
+            let opened =
+                webcrypto_aes_gcm(&key, iv, aad, &sealed, tag_size, false).expect("decrypt");
+            assert_eq!(opened, plaintext);
+            let mut corrupt = sealed.clone();
+            corrupt[0] ^= 1;
+            assert!(
+                webcrypto_aes_gcm(&key, iv, aad, &corrupt, tag_size, false).is_none(),
+                "a flipped ciphertext bit passed authentication"
+            );
+        }
+    }
+
+    /// NIST SP 800-38D test case 1: the all-zero key and 96-bit IV with empty
+    /// input and 128-bit tag. This is the path the previous implementation
+    /// already used, kept as the regression anchor for the port.
+    #[test]
+    fn nist_empty_vector() {
+        let sealed = webcrypto_aes_gcm(&[0; 16], &[0; 12], b"", b"", 16, true).expect("encrypt");
+        assert_eq!(hex(&sealed), "58e2fccefa7e3061367f1d57a4e7455a");
+    }
+
+    /// Shapes the JS layer refuses never reach the op, and the op refuses them
+    /// too: an empty IV, a key of the wrong size, an out-of-range tag, and a
+    /// ciphertext shorter than its own tag.
+    #[test]
+    fn invalid_inputs_are_refused() {
+        assert!(webcrypto_aes_gcm(&[0; 16], b"", b"", b"x", 16, true).is_none());
+        assert!(webcrypto_aes_gcm(&[0; 15], b"iv", b"", b"x", 16, true).is_none());
+        assert!(webcrypto_aes_gcm(&[0; 16], b"iv", b"", b"x", 5, true).is_none());
+        assert!(webcrypto_aes_gcm(&[0; 16], b"iv", b"", b"x", 16, false).is_none());
+    }
 }

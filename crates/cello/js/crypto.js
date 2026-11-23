@@ -117,6 +117,176 @@
     ).toUpperCase();
   }
 
+  // The caller's spelling of the algorithm, for the message Web Crypto raises
+  // when it does not match the key. Web IDL keeps the string the caller wrote;
+  // only the comparison is case-insensitive.
+  function _requestedAlgorithmName(algorithm) {
+    if (typeof algorithm === "string") return algorithm;
+    const name = algorithm?.name;
+    return name === undefined ? undefined : String(name);
+  }
+
+  // Web IDL argument errors, in workerd's exact text: a Worker that catches a
+  // `TypeError` and matches the message keeps working. The type names are the
+  // IDL ones (`CryptoKey`, `BufferSource`, `Array`), not the JS constructors.
+  function _argumentTypeError(method, index, type) {
+    return new TypeError(
+      `Failed to execute '${method}' on 'SubtleCrypto': parameter ${index} ` +
+        `is not of type '${type}'.`,
+    );
+  }
+
+  function _requireAlgorithm(algorithm, interfaceName) {
+    if (algorithm === undefined || algorithm === null) {
+      throw new TypeError(
+        `Cannot initialize ${interfaceName} with required members from an ` +
+          "undefined or null value.",
+      );
+    }
+  }
+
+  function _requireCryptoKey(method, index, key) {
+    if (!(key instanceof CryptoKey)) {
+      throw _argumentTypeError(method, index, "CryptoKey");
+    }
+    return key;
+  }
+
+  function _requireBufferSource(method, index, data) {
+    if (!(data instanceof ArrayBuffer) && !ArrayBuffer.isView(data)) {
+      throw _argumentTypeError(method, index, "BufferSource");
+    }
+    return data;
+  }
+
+  function _requireUsages(method, index, usages) {
+    if (!Array.isArray(usages)) {
+      throw _argumentTypeError(method, index, "Array");
+    }
+    // Web IDL converts each entry to a KeyUsage string, and the key stores its
+    // usages as a set: a duplicate is kept once, in first-seen order.
+    return [...new Set(usages.map((usage) => String(usage)))];
+  }
+
+  // The usages Web Crypto lets each algorithm's key carry, split by the key's
+  // type. A public key has no operation of its own for ECDH/X25519, so its
+  // list is empty and only the private half derives. Measured against workerd
+  // 1.20261121.1: importKey, generateKey and deriveKey reject anything else
+  // with a SyntaxError.
+  const _KEY_USAGES = {
+    "HMAC": { secret: ["sign", "verify"] },
+    "AES-GCM": { secret: ["encrypt", "decrypt", "wrapKey", "unwrapKey"] },
+    "AES-CBC": { secret: ["encrypt", "decrypt", "wrapKey", "unwrapKey"] },
+    "AES-CTR": { secret: ["encrypt", "decrypt", "wrapKey", "unwrapKey"] },
+    "AES-KW": { secret: ["wrapKey", "unwrapKey"] },
+    "HKDF": { secret: ["deriveKey", "deriveBits"] },
+    "PBKDF2": { secret: ["deriveKey", "deriveBits"] },
+    "RSASSA-PKCS1-V1_5": { public: ["verify"], private: ["sign"] },
+    "RSA-PSS": { public: ["verify"], private: ["sign"] },
+    "RSA-OAEP": { public: ["encrypt", "wrapKey"], private: ["decrypt", "unwrapKey"] },
+    "ECDSA": { public: ["verify"], private: ["sign"] },
+    "ECDH": { public: [], private: ["deriveKey", "deriveBits"] },
+    "ED25519": { public: ["verify"], private: ["sign"] },
+    "NODE-ED25519": { public: ["verify"], private: ["sign"] },
+    "X25519": { public: [], private: ["deriveKey", "deriveBits"] },
+  };
+
+  // The name a key reports and the error messages use: `RSASSA-PKCS1-v1_5`,
+  // not the uppercased lookup spelling.
+  function _reportedAlgorithmName(name) {
+    return _ASYM_NAMES[name] ?? name;
+  }
+
+  // Validates a key's requested usages for `type`, returning the deduplicated
+  // list. `verb` is "import" or "generate"; workerd phrases both.
+  function _checkedUsages(name, type, usages, verb, allowEmpty = false) {
+    const reported = _reportedAlgorithmName(name);
+    const allowed = (_KEY_USAGES[name] ?? {})[type] ?? [];
+    for (const usage of usages) {
+      if (!allowed.includes(usage)) {
+        const subject = verb === "generate"
+          ? reported
+          : `${type} ${reported}`;
+        throw new DOMException(
+          `Attempt to ${verb} ${subject} key with invalid usage "${usage}".`,
+          "SyntaxError",
+        );
+      }
+    }
+    // The stored list follows the algorithm's own usage order, not the
+    // caller's: workerd reports `["encrypt", "decrypt", "wrapKey",
+    // "unwrapKey"]` for any input ordering of those four.
+    const kept = allowed.filter((usage) => usages.includes(usage));
+    // A secret or private key with no usage could never be used, so Web Crypto
+    // refuses to mint one; a public key may legitimately carry none.
+    if (!allowEmpty && type !== "public" && kept.length === 0) {
+      throw new DOMException(
+        "Secret/private CryptoKeys must have at least one usage.",
+        "SyntaxError",
+      );
+    }
+    return kept;
+  }
+
+  // generateKey's asymmetric form: every usage must belong to one of the two
+  // halves, and the private half must keep at least one (workerd's own error,
+  // not the generic empty-usages one).
+  function _generateAsymmetricUsages(name, usages) {
+    const reported = _reportedAlgorithmName(name);
+    const table = _KEY_USAGES[name] ?? {};
+    const publicAllowed = table.public ?? [];
+    const privateAllowed = table.private ?? [];
+    for (const usage of usages) {
+      if (!publicAllowed.includes(usage) && !privateAllowed.includes(usage)) {
+        throw new DOMException(
+          `Attempt to generate ${reported} key with invalid usage "${usage}".`,
+          "SyntaxError",
+        );
+      }
+    }
+    if (!usages.some((usage) => privateAllowed.includes(usage))) {
+      throw new DOMException(
+        "Attempt to generate asymmetric keys with no valid private key usages.",
+        "SyntaxError",
+      );
+    }
+    return {
+      publicUsages: publicAllowed.filter((usage) => usages.includes(usage)),
+      privateUsages: privateAllowed.filter((usage) => usages.includes(usage)),
+    };
+  }
+
+  // The two checks every keyed operation makes, in workerd's order: the
+  // requested algorithm must name the key's own, then the key must list the
+  // operation's usage. A key used beyond its declared usages is the security
+  // bug this guards (issue #197).
+  function _checkKeyUsage(key, requestedName, usage) {
+    const keyName = String(key.algorithm?.name ?? "");
+    if (
+      String(requestedName ?? "").toUpperCase() !== keyName.toUpperCase()
+    ) {
+      throw new DOMException(
+        `Requested algorithm "${requestedName}" does not match this ` +
+          `CryptoKey's algorithm "${keyName}".`,
+        "InvalidAccessError",
+      );
+    }
+    if (!Array.from(key.usages).includes(usage)) {
+      throw new DOMException(
+        `Requested key usage "${usage}" does not match any usage listed in ` +
+          "this CryptoKey.",
+        "InvalidAccessError",
+      );
+    }
+  }
+
+  function _notExtractable(key) {
+    return new DOMException(
+      `Attempt to export non-extractable ${String(key.algorithm?.name)} key.`,
+      "InvalidAccessError",
+    );
+  }
+
   function _hashName(hash) {
     return _algorithmName(
       typeof hash === "string" ? hash : hash?.name || "SHA-256",
@@ -207,7 +377,10 @@
   // The AES modes the host ops accept. `encrypt` and `decrypt` both test
   // against this one set, so neither can grow a mode the other refuses.
   const _AES_MODES = new Set(["AES-GCM", "AES-CBC", "AES-CTR"]);
-  const _AES_GCM_TAG_LENGTHS = new Set([96, 104, 112, 120, 128]);
+  // SP 800-38D and the Web Crypto specification name these seven tag
+  // lengths; workerd accepts exactly them (measured), including 32 and 64
+  // bit, which the previous list and the AEAD type omitted.
+  const _AES_GCM_TAG_LENGTHS = new Set([32, 64, 96, 104, 112, 120, 128]);
   const _RSA_OAEP_HASHES = new Set([
     "SHA-1", "SHA-256", "SHA-384", "SHA-512",
   ]);
@@ -224,21 +397,66 @@
   // AES-GCM reports a failure by returning nothing, and this turns that into
   // the `OperationError` the Web Crypto specification names. The block modes
   // throw from the host with the cause, so they never reach that branch.
+  // Web IDL converts the algorithm dictionary before any other parameter, so
+  // a missing or mistyped member is reported before the key is touched. The
+  // texts are workerd's.
+  function _aesValidate(name, algorithm, encrypting) {
+    const field = name === "AES-CTR" ? "counter" : "iv";
+    if (
+      algorithm === null || algorithm === undefined ||
+      algorithm[field] === undefined
+    ) {
+      throw new TypeError(
+        field === "iv"
+          ? 'Missing field "iv" in "algorithm".'
+          : 'Missing "counter" member in "algorithm".',
+      );
+    }
+    const interfaceName = encrypting ? "EncryptAlgorithm" : "DecryptAlgorithm";
+    const checkType = (member) => {
+      const value = algorithm[member];
+      if (
+        value !== undefined && !(value instanceof ArrayBuffer) &&
+        !ArrayBuffer.isView(value)
+      ) {
+        throw new TypeError(
+          `Incorrect type for the '${member}' field on '${interfaceName}': ` +
+            "the provided value is not of type 'BufferSource'.",
+        );
+      }
+    };
+    checkType(field);
+    if (name === "AES-GCM") checkType("additionalData");
+  }
+
   function _aes(name, algorithm, key, data, encrypting) {
-    if (name === "AES-GCM" && _toBuf(algorithm.iv).byteLength === 0) {
+    const ivBytes = _toBuf(name === "AES-CTR" ? algorithm.counter : algorithm.iv);
+    if (name === "AES-GCM" && ivBytes.byteLength === 0) {
       throw new DOMException("AES-GCM IV must not be empty.", "OperationError");
+    }
+    if (name === "AES-CBC" && ivBytes.byteLength !== 16) {
+      throw _operationError(
+        `AES-CBC IV must be 16 bytes long (provided ` +
+          `${ivBytes.byteLength} bytes).`,
+      );
+    }
+    if (name === "AES-CTR" && ivBytes.byteLength !== 16) {
+      throw _operationError(
+        "Counter must have length of 16 bytes " +
+          `(provided ${ivBytes.byteLength}).`,
+      );
     }
     const tagLength = name === "AES-GCM"
       ? Number(algorithm.tagLength ?? 128)
       : 128;
     if (name === "AES-GCM" && !_AES_GCM_TAG_LENGTHS.has(tagLength)) {
-      throw _operationError("unsupported AES-GCM tagLength: " + tagLength);
+      throw _operationError("Invalid AES-GCM tag length " + tagLength + ".");
     }
     const run = encrypting ? _aesEncrypt : _aesDecrypt;
     const out = run(
       name,
       key.__celloMaterial.bytes,
-      _toBuf(name === "AES-CTR" ? algorithm.counter : algorithm.iv),
+      ivBytes,
       _toBuf(data),
       name === "AES-GCM"
         ? _toBuf(algorithm.additionalData ?? new Uint8Array())
@@ -257,25 +475,63 @@
     get [Symbol.toStringTag]() { return "SubtleCrypto"; }
 
     async digest(algorithm, data) {
+      // Web IDL's union conversion: an absent argument is not a
+      // `string or HashAlgorithm`, while an explicit null cannot initialize
+      // the dictionary, and workerd names the two cases differently.
+      if (algorithm === undefined) {
+        throw new TypeError(
+          "Failed to execute 'digest' on 'SubtleCrypto': parameter 1 is not " +
+            "of type 'string or HashAlgorithm'.",
+        );
+      }
+      if (algorithm === null) {
+        throw new TypeError(
+          "Cannot initialize HashAlgorithm with required members from an " +
+            "undefined or null value.",
+        );
+      }
       const name = _algorithmName(algorithm);
       if (!_DIGEST_ALGS.has(name)) {
-        throw _notSupported("unsupported digest algorithm: " + name);
+        throw _notSupported(
+          "Unrecognized or unimplemented digest algorithm requested.");
       }
-      const out = _digest(name, _toBuf(data));
+      const out = _digest(name, _toBuf(_requireBufferSource("digest", 2, data)));
       return out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength);
     }
 
     async importKey(format, keyData, algorithm, extractable, usages) {
+      _requireAlgorithm(algorithm, "ImportKeyAlgorithm");
       const name = _algorithmName(algorithm);
+      const requested = _requireUsages("importKey", 5, usages);
+      if (!["raw", "spki", "pkcs8", "jwk"].includes(String(format))) {
+        throw _notSupported(`Unrecognized key import format "${format}".`);
+      }
+      // Every import answer goes through this: the usages are validated
+      // against the algorithm and the key's type right where the key is
+      // built, so no branch can return a key with a usage it cannot honour.
+      const make = (type, algorithmDict, extractableValue, material) =>
+        _makeKey(
+          type, algorithmDict, extractableValue,
+          _checkedUsages(name, type, requested, "import"), material,
+        );
       if (format === "raw" && (name === "HKDF" || name === "PBKDF2")) {
-        // The spec makes KDF secrets non-extractable, so the password
-        // material cannot come back out through exportKey.
+        // An unusable usage is reported before the extractability rule; a
+        // valid one then hits it, because the spec makes KDF secrets
+        // non-extractable so the password material cannot come back out.
+        const keyUsages = _checkedUsages(
+          name, "secret", requested, "import", true);
         if (extractable) {
           throw new DOMException(
-            name + " keys must not be extractable", "SyntaxError");
+            name + " key cannot be extractable.", "SyntaxError");
+        }
+        if (keyUsages.length === 0) {
+          throw new DOMException(
+            "Secret/private CryptoKeys must have at least one usage.",
+            "SyntaxError",
+          );
         }
         return _makeKey(
-          "secret", { name }, false, usages,
+          "secret", { name }, false, keyUsages,
           { bytes: _toBuf(keyData).slice() },
         );
       }
@@ -284,8 +540,8 @@
         const normalized = name === "HMAC"
           ? { name, hash: { name: _hashName(algorithm?.hash) }, length: raw.byteLength * 8 }
           : { name, length: raw.byteLength * 8 };
-        return _makeKey(
-          "secret", normalized, extractable, usages, { bytes: raw },
+        return make(
+          "secret", normalized, extractable, { bytes: raw },
         );
       }
       // A symmetric key's JWK is `{"kty":"oct","k":...}`. `k` carries the
@@ -340,8 +596,8 @@
         const normalized = name === "HMAC"
           ? { name, hash: { name: _hashName(algorithm?.hash) }, length: raw.byteLength * 8 }
           : { name, length: raw.byteLength * 8 };
-        return _makeKey(
-          "secret", normalized, extractable, usages, { bytes: raw },
+        return make(
+          "secret", normalized, extractable, { bytes: raw },
         );
       }
       // An EC public key's `raw` form is its SEC1 point, uncompressed or
@@ -361,11 +617,10 @@
           visibility: "public",
           passphrase: null,
         });
-        return _makeKey(
+        return make(
           "public",
           _keyAlgorithm(name, algorithm, imported.keyType, imported.details),
           extractable,
-          usages,
           {
             bytes: Uint8Array.from(imported.der),
             keyType: imported.keyType,
@@ -385,11 +640,10 @@
           visibility: "public",
           passphrase: null,
         });
-        return _makeKey(
+        return make(
           "public",
           _keyAlgorithm(name, algorithm, imported.keyType, imported.details),
           extractable,
-          usages,
           {
             bytes: Uint8Array.from(imported.der),
             keyType: imported.keyType,
@@ -429,11 +683,10 @@
           visibility,
           passphrase: null,
         });
-        return _makeKey(
+        return make(
           visibility,
           _keyAlgorithm(name, algorithm, imported.keyType, imported.details),
           extractable,
-          usages,
           {
             bytes: Uint8Array.from(imported.der),
             keyType: imported.keyType,
@@ -445,6 +698,7 @@
     }
 
     async exportKey(format, key) {
+      _requireCryptoKey("exportKey", 2, key);
       // The `raw` form of a Secure Curves public key is its 32-byte point,
       // and of an EC public key its uncompressed SEC1 point. The branch
       // below answers every `raw` request from the stored bytes, which for
@@ -456,7 +710,7 @@
             key.__celloMaterial?.keyType === "x25519" ||
             key.__celloMaterial?.keyType === "ec")) {
         if (!key.extractable) {
-          throw new DOMException("key is not extractable", "InvalidAccessError");
+          throw _notExtractable(key);
         }
         return Uint8Array.from(_extra("asym-key-raw-public", {
           der: Array.from(key.__celloMaterial.bytes),
@@ -464,7 +718,7 @@
       }
       if (format === "raw" && key?.__celloMaterial?.bytes) {
         if (!key.extractable) {
-          throw new DOMException("key is not extractable", "InvalidAccessError");
+          throw _notExtractable(key);
         }
         const raw = key.__celloMaterial.bytes;
         return raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength);
@@ -476,7 +730,7 @@
           key?.__celloMaterial?.bytes !== undefined &&
           key?.__celloMaterial?.keyType === undefined) {
         if (!key.extractable) {
-          throw new DOMException("key is not extractable", "InvalidAccessError");
+          throw _notExtractable(key);
         }
         const bytes = key.__celloMaterial.bytes;
         const name = key.algorithm?.name;
@@ -494,7 +748,7 @@
       }
       if (format === "jwk" && key?.__celloMaterial?.jwk) {
         if (!key.extractable) {
-          throw new DOMException("key is not extractable", "InvalidAccessError");
+          throw _notExtractable(key);
         }
         return structuredClone(key.__celloMaterial.jwk);
       }
@@ -503,7 +757,7 @@
       const material = key?.__celloMaterial;
       if (material?.keyType !== undefined) {
         if (!key.extractable) {
-          throw new DOMException("key is not extractable", "InvalidAccessError");
+          throw _notExtractable(key);
         }
         const visibility = key.type;
         if (format === "jwk") {
@@ -518,6 +772,7 @@
           return der.buffer.slice(der.byteOffset, der.byteOffset + der.byteLength);
         }
       }
+      if (!key.extractable) throw _notExtractable(key);
       throw _notSupported("unsupported key export");
     }
 
@@ -528,7 +783,7 @@
       const left = _toBuf(a), right = _toBuf(b);
       if (left.byteLength !== right.byteLength) {
         throw new TypeError(
-          "Input buffers must have the same byte length");
+          "Input buffers must have the same byte length.");
       }
       return $$timingSafeEqual(left, right);
     }
@@ -539,12 +794,25 @@
     // HKDF and PBKDF2 have no natural output size, so for them a missing
     // or unaligned length is the OperationError the spec names.
     async deriveBits(algorithm, baseKey, length) {
+      _requireAlgorithm(algorithm, "DeriveKeyAlgorithm");
+      const requested = _requestedAlgorithmName(algorithm);
+      _requireCryptoKey("deriveBits", 2, baseKey);
+      _checkKeyUsage(baseKey, requested, "deriveBits");
+      return this._deriveBits(algorithm, baseKey, length);
+    }
+
+    // The derivation itself, shared by `deriveBits` and `deriveKey` so the
+    // latter checks only its own `deriveKey` usage and does not re-require
+    // `deriveBits` on the same base key (workerd does not either).
+    async _deriveBits(algorithm, baseKey, length) {
       const name = _algorithmName(algorithm);
       if (name === "HKDF" || name === "PBKDF2") {
         const bits = Number(length);
         if (!Number.isInteger(bits) || bits <= 0 || bits % 8 !== 0) {
           throw _operationError(
-            name + " length must be a positive multiple of 8 bits");
+            `${name} requires a derived key length that is a multiple of ` +
+              `eight (requested ${length}).`,
+          );
         }
         const hash = _hashName(algorithm?.hash);
         if (!_DIGEST_ALGS.has(hash)) {
@@ -564,7 +832,9 @@
           const iterations = Number(algorithm?.iterations);
           if (!Number.isInteger(iterations) || iterations <= 0) {
             throw _operationError(
-              "PBKDF2 iterations must be a positive integer");
+              "PBKDF2 requires a positive iteration count " +
+                `(requested ${algorithm?.iterations}).`,
+            );
           }
           out = $$pbkdf2(hash, ikm, salt, iterations, bits / 8);
         }
@@ -595,6 +865,10 @@
     }
 
     async deriveKey(algorithm, baseKey, derived, extractable, usages) {
+      _requireAlgorithm(algorithm, "DeriveKeyAlgorithm");
+      const requested = _requestedAlgorithmName(algorithm);
+      _requireCryptoKey("deriveKey", 2, baseKey);
+      _checkKeyUsage(baseKey, requested, "deriveKey");
       const name = _algorithmName(derived);
       // An HMAC key with no stated length defaults to its hash's block
       // size, which is what the spec's getKeyLength returns.
@@ -606,14 +880,17 @@
             ? ({ "SHA-384": 1024, "SHA-512": 1024 }[
               _hashName(derived?.hash)] ?? 512)
             : null);
-      const bits = await this.deriveBits(algorithm, baseKey, length);
+      const bits = await this._deriveBits(algorithm, baseKey, length);
       return this.importKey(
         "raw", bits, derived, extractable, usages);
     }
 
     async generateKey(algorithm, extractable, usages) {
+      _requireAlgorithm(algorithm, "GenerateKeyAlgorithm");
       const name = _algorithmName(algorithm);
+      const requested = _requireUsages("generateKey", 3, usages);
       if (_SECRET_KEY_ALGS.has(name)) {
+        const keyUsages = _checkedUsages(name, "secret", requested, "generate");
         let byteLength;
         if (name === "HMAC") {
           const defaults = {
@@ -633,7 +910,7 @@
             "secret",
             { name, hash: { name: hash }, length: raw.byteLength * 8 },
             extractable,
-            usages,
+            keyUsages,
             { bytes: raw },
           );
         }
@@ -652,7 +929,7 @@
           "secret",
           { name, length: raw.byteLength * 8 },
           extractable,
-          usages,
+          keyUsages,
           { bytes: raw },
         );
       }
@@ -671,6 +948,8 @@
       };
       const kind = ASYM_GENERATE[name];
       if (kind !== undefined) {
+        const { publicUsages, privateUsages } =
+          _generateAsymmetricUsages(name, requested);
         const options = { type: kind };
         if (kind === "rsa") {
           // Only 3 and 65537 are legal exponents, and cello generates with
@@ -717,27 +996,32 @@
         // hash is what sign() then hashes with, so a caller that mutates
         // `publicKey.algorithm.hash.name` on a shared object would change
         // what the private key signs.
-        const half = (der, type, allowed) =>
+        const half = (der, type, assigned) =>
           _makeKey(type,
             _keyAlgorithm(name, algorithm, pair.keyType, pair.details),
             type === "public" ? true : extractable,
-            (usages || []).filter((usage) => allowed.includes(usage)), {
+            assigned, {
               bytes: Uint8Array.from(der),
               keyType: pair.keyType,
               details: pair.details,
             });
         return {
-          publicKey: half(pair.publicDer, "public", ["verify", "encrypt"]),
-          privateKey: half(pair.privateDer, "private",
-            ["sign", "decrypt", "deriveKey", "deriveBits"]),
+          publicKey: half(pair.publicDer, "public", publicUsages),
+          privateKey: half(pair.privateDer, "private", privateUsages),
         };
       }
-      throw _notSupported("unsupported key algorithm: " + name);
+      throw _notSupported(
+        `Unrecognized key generation algorithm ` +
+          `"${_requestedAlgorithmName(algorithm)}" requested.`);
     }
 
     async sign(algorithm, key, data) {
-      const name = _algorithmName(algorithm || key?.algorithm);
-      const bytes = _toBuf(data);
+      _requireAlgorithm(algorithm, "SignAlgorithm");
+      const requested = _requestedAlgorithmName(algorithm);
+      _requireCryptoKey("sign", 2, key);
+      const bytes = _toBuf(_requireBufferSource("sign", 3, data));
+      const name = _algorithmName(algorithm);
+      _checkKeyUsage(key, requested, "sign");
       if (name === "HMAC") {
         const hash = _hashName(key?.algorithm?.hash);
         const sig = _hmacSign(hash, key.__celloMaterial.bytes, bytes);
@@ -773,13 +1057,19 @@
     }
 
     async verify(algorithm, key, signature, data) {
-      const name = _algorithmName(algorithm || key?.algorithm);
+      _requireAlgorithm(algorithm, "VerifyAlgorithm");
+      const requested = _requestedAlgorithmName(algorithm);
+      _requireCryptoKey("verify", 2, key);
+      const signatureBytes = _toBuf(_requireBufferSource("verify", 3, signature));
+      const dataBytes = _toBuf(_requireBufferSource("verify", 4, data));
+      const name = _algorithmName(algorithm);
+      _checkKeyUsage(key, requested, "verify");
       if (name === "HMAC") {
         return _hmacVerify(
           _hashName(key?.algorithm?.hash),
           key.__celloMaterial.bytes,
-          _toBuf(signature),
-          _toBuf(data),
+          signatureBytes,
+          dataBytes,
         );
       }
       // Ed25519 signs through `ed25519-sign` above, so a key pair that can
@@ -810,8 +1100,8 @@
       }
       return _extra(operation, {
         key: Array.from(material),
-        data: Array.from(_toBuf(data)),
-        signature: Array.from(_toBuf(signature)),
+        data: Array.from(dataBytes),
+        signature: Array.from(signatureBytes),
         // ECDSA carries its hash on the call, RSASSA on the key.
         hash: _hashName(
           name === "ECDSA" ? algorithm?.hash : key?.algorithm?.hash,
@@ -820,9 +1110,23 @@
     }
 
     async encrypt(algorithm, key, data) {
+      _requireAlgorithm(algorithm, "EncryptAlgorithm");
+      _requireCryptoKey("encrypt", 2, key);
+      const bytes = _toBuf(_requireBufferSource("encrypt", 3, data));
+      const requested = _requestedAlgorithmName(algorithm);
+      const name = _algorithmName(algorithm);
+      _checkKeyUsage(key, requested, "encrypt");
+      if (_AES_MODES.has(name)) _aesValidate(name, algorithm, true);
+      return this._encrypt(algorithm, key, bytes);
+    }
+
+    // The encrypted primitive, shared by `encrypt` and `wrapKey`: wrapping
+    // checks the `wrapKey` usage, so it cannot re-enter the public method and
+    // be refused for lacking `encrypt` on the same key.
+    async _encrypt(algorithm, key, bytes) {
       const name = _algorithmName(algorithm);
       if (_AES_MODES.has(name)) {
-        return _aes(name, algorithm, key, data, true);
+        return _aes(name, algorithm, key, bytes, true);
       }
       if (name === "RSA-OAEP") {
         const hash = _hashName(key?.algorithm?.hash);
@@ -831,7 +1135,7 @@
         }
         const result = _extra("rsa-oaep-encrypt", {
           key: Array.from(key?.__celloMaterial?.bytes || []),
-          data: Array.from(_toBuf(data)),
+          data: Array.from(bytes),
           hash,
           label: _rsaOaepLabel(algorithm),
         });
@@ -849,45 +1153,59 @@
     // `OperationError` the spec names - a short KEK or corrupt input - not
     // the host's own error shape.
     async wrapKey(format, key, wrappingKey, wrapAlgorithm) {
+      _requireAlgorithm(wrapAlgorithm, "EncryptAlgorithm");
+      _requireCryptoKey("wrapKey", 2, key);
+      _requireCryptoKey("wrapKey", 3, wrappingKey);
+      const requested = _requestedAlgorithmName(wrapAlgorithm);
+      const name = _algorithmName(wrapAlgorithm);
+      _checkKeyUsage(wrappingKey, requested, "wrapKey");
+      if (_AES_MODES.has(name)) _aesValidate(name, wrapAlgorithm, true);
       const exported = await this.exportKey(format, key);
-      const raw = format === "jwk"
-        ? new TextEncoder().encode(JSON.stringify(exported))
-        : exported;
-      if (_algorithmName(wrapAlgorithm) === "AES-KW") {
-        if (wrappingKey?.type !== "secret" ||
-            wrappingKey?.algorithm?.name !== "AES-KW") {
+      const raw = _toBuf(
+        format === "jwk"
+          ? new TextEncoder().encode(JSON.stringify(exported))
+          : exported,
+      );
+      if (name === "AES-KW") {
+        if (wrappingKey.type !== "secret") {
           throw new DOMException(
-            "AES-KW wrapping key must be an AES-KW key", "InvalidAccessError");
+            "AES-KW wrapping key must be a secret key", "InvalidAccessError");
         }
         try {
           const out = _extra("aes-kw-wrap", {
             key: Array.from(wrappingKey.__celloMaterial.bytes),
-            data: Array.from(_toBuf(raw)),
+            data: Array.from(raw),
           });
           return Uint8Array.from(out.bytes).buffer;
         } catch {
           throw _operationError("AES-KW wrapKey failed");
         }
       }
-      return this.encrypt(wrapAlgorithm, wrappingKey, raw);
+      return this._encrypt(wrapAlgorithm, wrappingKey, raw);
     }
 
     async unwrapKey(
       format, wrapped, unwrappingKey, unwrapAlgorithm,
       algorithm, extractable, usages,
     ) {
-      if (_algorithmName(unwrapAlgorithm) === "AES-KW") {
-        if (unwrappingKey?.type !== "secret" ||
-            unwrappingKey?.algorithm?.name !== "AES-KW") {
+      _requireAlgorithm(unwrapAlgorithm, "DecryptAlgorithm");
+      const wrappedBytes = _toBuf(_requireBufferSource("unwrapKey", 2, wrapped));
+      _requireCryptoKey("unwrapKey", 3, unwrappingKey);
+      const requested = _requestedAlgorithmName(unwrapAlgorithm);
+      const name = _algorithmName(unwrapAlgorithm);
+      _checkKeyUsage(unwrappingKey, requested, "unwrapKey");
+      if (_AES_MODES.has(name)) _aesValidate(name, unwrapAlgorithm, false);
+      if (name === "AES-KW") {
+        if (unwrappingKey.type !== "secret") {
           throw new DOMException(
-            "AES-KW unwrapping key must be an AES-KW key",
+            "AES-KW unwrapping key must be a secret key",
             "InvalidAccessError");
         }
         let raw;
         try {
           const out = _extra("aes-kw-unwrap", {
             key: Array.from(unwrappingKey.__celloMaterial.bytes),
-            data: Array.from(_toBuf(wrapped)),
+            data: Array.from(wrappedBytes),
           });
           raw = Uint8Array.from(out.bytes);
         } catch {
@@ -898,7 +1216,7 @@
           : raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength);
         return this.importKey(format, keyData, algorithm, extractable, usages);
       }
-      const raw = await this.decrypt(unwrapAlgorithm, unwrappingKey, wrapped);
+      const raw = await this._decrypt(unwrapAlgorithm, unwrappingKey, wrappedBytes);
       const keyData = format === "jwk"
         ? JSON.parse(new TextDecoder().decode(raw))
         : raw;
@@ -906,9 +1224,20 @@
     }
 
     async decrypt(algorithm, key, data) {
+      _requireAlgorithm(algorithm, "DecryptAlgorithm");
+      _requireCryptoKey("decrypt", 2, key);
+      const bytes = _toBuf(_requireBufferSource("decrypt", 3, data));
+      const requested = _requestedAlgorithmName(algorithm);
+      const name = _algorithmName(algorithm);
+      _checkKeyUsage(key, requested, "decrypt");
+      if (_AES_MODES.has(name)) _aesValidate(name, algorithm, false);
+      return this._decrypt(algorithm, key, bytes);
+    }
+
+    async _decrypt(algorithm, key, bytes) {
       const name = _algorithmName(algorithm);
       if (_AES_MODES.has(name)) {
-        return _aes(name, algorithm, key, data, false);
+        return _aes(name, algorithm, key, bytes, false);
       }
       if (name === "RSA-OAEP") {
         const hash = _hashName(key?.algorithm?.hash);
@@ -917,7 +1246,7 @@
         }
         const result = _extra("rsa-oaep-decrypt", {
           key: Array.from(key?.__celloMaterial?.bytes || []),
-          data: Array.from(_toBuf(data)),
+          data: Array.from(bytes),
           hash,
           label: _rsaOaepLabel(algorithm),
         });
@@ -932,6 +1261,12 @@
     getRandomValues(array) {
       // Web IDL brand check, observable via node:crypto's webcrypto alias.
       if (this !== crypto) throw new TypeError("Illegal invocation");
+      if (!(array instanceof ArrayBuffer) && !ArrayBuffer.isView(array)) {
+        throw new TypeError(
+          "Failed to execute 'getRandomValues' on 'Crypto': parameter 1 is " +
+            "not of type 'ArrayBufferView'.",
+        );
+      }
       if (
         !(array instanceof Int8Array) &&
         !(array instanceof Uint8Array) &&
@@ -944,13 +1279,15 @@
         !(array instanceof BigUint64Array)
       ) {
         throw new DOMException(
-          "Argument is not an integer-typed array",
+          "ArrayBufferView argument to getRandomValues() must be an " +
+            "integer-typed view.",
           "TypeMismatchError",
         );
       }
       if (array.byteLength > 65536) {
         throw new DOMException(
-          "getRandomValues byteLength must be at most 65536",
+          "getRandomValues() only accepts buffers of size <= 64K but " +
+            `provided ${array.byteLength} bytes.`,
           "QuotaExceededError",
         );
       }
