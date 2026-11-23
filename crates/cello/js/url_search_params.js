@@ -92,12 +92,20 @@ const _parseString = (s) => {
 
 class URLSearchParams {
   #params = [];
-  _url = null; // live-bound URL, if any
-
+  #url = null; // live-bound URL, if any
   static {
     // Genuine-instance brand for the clone registry.
     __cello.__isUrlSearchParamsInstance = (value) => {
       try { return #params in value; } catch { return false; }
+    };
+    // The paired URL binds itself and re-encodes after a mutation; both
+    // stay module-private so the prototype names no host helper (#206).
+    __cello.$$urlSearchParamsInit = (params, search) =>
+      params.#initFromSearch(search);
+    // The URL binds its lazily built params object to itself here, because
+    // only this class may touch the private slot.
+    __cello.$$bindUrlSearchParams = (params, url) => {
+      params.#url = url;
     };
   }
 
@@ -147,10 +155,10 @@ class URLSearchParams {
   }
 
   #sync() {
-    if (this._url) this._url._updateSearch(this);
+    if (this.#url) __cello.$$urlUpdateSearch(this.#url, this);
   }
 
-  _initFromSearch(search) {
+  #initFromSearch(search) {
     const s = search.startsWith('?')
       ? search.slice(1) : search;
     this.#params = _parseString(s);
@@ -257,8 +265,5 @@ class URLSearchParams {
 }
 
 globalThis.URLSearchParams = URLSearchParams;
-Object.defineProperty(URLSearchParams.prototype,
-  Symbol.toStringTag, {
-    value: 'URLSearchParams', configurable: true,
-  });
+__cello.$$webidl(URLSearchParams, 'URLSearchParams');
 } // end block scope

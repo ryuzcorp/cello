@@ -4,6 +4,14 @@
 // sequence, `body` an array of chunks sent as a chunked upload.
 
 export const cases = [
+  { name: "shape-fetch", fixture: "shape", path: "/fetch" },
+  { name: "shape-binary", fixture: "shape", path: "/binary" },
+  { name: "shape-streams", fixture: "shape", path: "/streams" },
+  { name: "shape-events", fixture: "shape", path: "/events" },
+  { name: "shape-crypto", fixture: "shape", path: "/crypto" },
+  { name: "shape-details", fixture: "shape", path: "/details" },
+  { name: "shape-bindings", fixture: "shape", path: "/bindings" },
+  { name: "shape-websocket", fixture: "shape", path: "/websocket" },
   { name: "readable-basics", fixture: "streams", path: "/readable-basics" },
   { name: "readable-pull-order", fixture: "streams", path: "/readable-pull-order" },
   { name: "readable-byob", fixture: "streams", path: "/readable-byob" },

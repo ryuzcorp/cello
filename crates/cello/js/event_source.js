@@ -102,7 +102,7 @@
       if (this._sourceState === 2) return;
       this._sourceState = reconnecting ? 0 : 2;
       const event = new ErrorEvent("error", { message, error });
-      event._trust();
+      __cello.$$trustEvent(event);
       this.dispatchEvent(event);
     }
 
@@ -110,7 +110,7 @@
       if (this._sourceState === 2) return;
       this._sourceState = 1; // OPEN
       const event = new Event("open");
-      event._trust();
+      __cello.$$trustEvent(event);
       this.dispatchEvent(event);
     }
 
@@ -127,7 +127,7 @@
         origin,
         lastEventId: this._lastId,
       });
-      event._trust();
+      __cello.$$trustEvent(event);
       this.dispatchEvent(event);
     }
 

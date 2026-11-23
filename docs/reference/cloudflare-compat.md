@@ -181,6 +181,48 @@ use. An unsupported feature that stays silent is a defect.
 - A remote Durable Object call waits for a rejected owner generation to
   change for at most `CELLO_OPERATION_DEADLINE_MS`.
 
+### Reflected object shape
+
+Workerd keeps the state of its Web API objects out of the JavaScript object,
+and Cello matches that reflection. A `Request`, `Response`, `Headers`,
+`FormData`, `AbortSignal`, `Blob`/`File`, `URL`/`URLSearchParams`, a stream,
+an event object, `DOMException`, `MessagePort`/`MessageChannel`, `WebSocket`,
+`CryptoKey`, a KV/R2/D1 binding or a `Cache` has no own property of its own:
+`Object.keys()` is empty, spread and `JSON.stringify()` see `{}` (a
+`DOMException` serializes as `code`/`name`/`message`/`stack`, as workerd's
+does), and `Object.getOwnPropertyNames()` lists no host field or host helper.
+Every WebIDL attribute is an enumerable accessor on the prototype -- workerd's
+reflection, not a data property per instance -- so assigning to a read-only
+attribute no longer changes what the object reports or does. Each interface
+carries its `Symbol.toStringTag`, so
+`Object.prototype.toString.call(response)` is `"[object Response]"` and
+`[object DOMException]` for an error. `Request` and `Response` share workerd's
+`Body` prototype level (a global `Body`), and `D1Database` inherits workerd's
+`WrappedBinding` level, which is the tag a D1 database reports.
+
+Known reflection-only differences:
+
+- An interface's `prototype` property is non-writable: V8 refuses to redefine
+  a class's, so where workerd's interface objects have a writable `prototype`
+  Cello's do not.
+- Method `length` values and accessor function names follow V8's class
+  syntax. The differential gate pins structure, enumerability and
+  accessor-versus-data, not those incidental values.
+- `D1DatabaseSession` is not pinned against workerd: workerd's own session
+  reflects internal `WrappedBinding` members (`_queryOrThrow`, `_send`,
+  `_updateBookmark`, ...). Cello exposes `prepare`, `batch` and
+  `getBookmark`.
+- `D1PreparedStatement` carries workerd's own `statement` and `params` data
+  members. They are copies for reflection; the statement's behaviour reads
+  internal slots.
+- `Cache.add()`, `Cache.addAll()`, `Cache.matchAll()`, `Cache.keys()`,
+  `CacheStorage.delete()`, `CacheStorage.match()`, `CacheStorage.has()` and
+  `CacheStorage.keys()` exist with workerd's shapes and throw workerd's own
+  synchronous "the method is not implemented" error: the pinned build does the
+  same, and the per-node store exposes no operation that enumerates entries.
+- `URL.createObjectURL()` and `URL.revokeObjectURL()` exist and throw
+  workerd's own "is not implemented" error, as workerd's pinned build does.
+
 ### [Bindings](https://developers.cloudflare.com/workers/runtime-apis/bindings/)
 
 Only the binding types in the [services table](#services) are available.

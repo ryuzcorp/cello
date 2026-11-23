@@ -31,7 +31,7 @@
 
   // The verbatim header list, one pair per append: casing and multiplicity
   // survive the round trip, and `set-cookie` values stay apart.
-  const headerPairs = (headers) => headers.__celloHeaderList;
+  const headerPairs = (headers) => __cello.$$headerList(headers);
 
   // Largest single entry, body plus headers plus key: the budget the host
   // enforces in worker_cache.rs (`MAX_ENTRY_BYTES`). The drain below stops
@@ -66,8 +66,8 @@
   const encoder = new TextEncoder();
   // Captured at install time: the harness declares these in its own script
   // scope, so they reach this script only through `__cello`.
-  const bodyChunk = __cello.__bodyChunk;
-  const markBodyUsed = __cello.__markBodyUsed;
+  const bodyChunk = __cello.$$bodyChunk;
+  const markBodyUsed = __cello.$$markBodyUsed;
   const chunkBytes = (value) =>
     typeof value === "string"
       ? encoder.encode(value)
@@ -84,7 +84,8 @@
   const drainCapped = async (response) => {
     // Already-buffered bodies never touch the stream: the bytes exist, so
     // arrayBuffer() can neither hang nor grow the heap.
-    if (response._bodyBytes !== null || response.body === null) {
+    const state = __cello.$$responseState(response);
+    if (state.bytes !== null || response.body === null) {
       const buffered = new Uint8Array(await response.arrayBuffer());
       return buffered.byteLength > MAX_ENTRY_BYTES ? null : buffered;
     }
@@ -121,15 +122,17 @@
     // Memoize, as __drainBody does: the put consumed the body, so a later
     // read is refused as used, but the bytes stay behind the stream for the
     // host paths that read them.
-    response._bodyBytes = body;
-    response._body = undefined;
+    state.bytes = body;
     return body;
   };
 
   class Cache {
+    // The namespace is a private slot: `Object.keys(caches.default)` used to
+    // report it, and workerd's Cache has no own property (#206).
+    #namespace;
     constructor(token = undefined, namespace = "default") {
       if (token !== kCreate) throw new TypeError("Illegal constructor");
-      this._namespace = namespace;
+      this.#namespace = namespace;
     }
 
     get [Symbol.toStringTag]() { return "Cache"; }
@@ -168,7 +171,7 @@
       // staleness, or size can refuse it -- but put() resolves undefined
       // either way, as Cloudflare's does.
       __cache_put(
-        this._namespace,
+        this.#namespace,
         key.url,
         key.method,
         response.status,
@@ -185,7 +188,7 @@
       const key = asKey(request);
       const ignoreMethod = args[1]?.ignoreMethod === true;
       const found = __cache_match(
-        this._namespace,
+        this.#namespace,
         key.url,
         key.method,
         ignoreMethod,
@@ -213,7 +216,7 @@
       const key = asKey(request);
       const ignoreMethod = args[1]?.ignoreMethod === true;
       return __cache_delete(
-        this._namespace,
+        this.#namespace,
         key.url,
         key.method,
         ignoreMethod,

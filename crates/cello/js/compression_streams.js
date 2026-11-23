@@ -8,6 +8,10 @@
 // both sides keep alive, is collected. The isolate's table also goes
 // when the isolate does, and caps how many streams can be live at once.
 //
+// Workerd's CompressionStream is a TransformStream subclass (readable and
+// writable are inherited accessors), so the pair lives in the
+// TransformStream private state, never as own fields (#170, #206).
+//
 // Compiled on first access (see LAZY_GLOBALS); a bundle that never names
 // either global never pays for this file.
 return (() => {
@@ -68,10 +72,10 @@ function make(format, decompress, name, missing) {
   // Workerd's compression streams are internal streams: a
   // pending read() rejects with the cancel reason instead
   // of resolving {done: true}.
-  ts.readable._cancelRejectsReads = true;
+  __cello.$$readableState(ts.readable).cancelRejectsReads = true;
   // ... and a failed push or flush closes the writable side
   // instead of erroring it (#223).
-  ts.writable._closesOnError = true;
+  __cello.$$writableStreamState(ts.writable).closesOnError = true;
   // Last, so nothing after it can throw and strand the native stream.
   // Throws a RangeError when the isolate holds too many.
   id = __zlib_stream_new(format, decompress);
@@ -87,26 +91,32 @@ function make(format, decompress, name, missing) {
 
 class CompressionStream {
   constructor(format) {
-    const ts = make(format, false, 'CompressionStream', arguments.length === 0);
-    this.readable = ts.readable;
-    this.writable = ts.writable;
+    const ts = make(format, false, 'CompressionStream',
+                    arguments.length === 0);
+    __cello.$$setTransformPair(this, ts.readable, ts.writable);
   }
 }
 
 class DecompressionStream {
   constructor(format) {
-    const ts = make(format, true, 'DecompressionStream', arguments.length === 0);
-    this.readable = ts.readable;
-    this.writable = ts.writable;
+    const ts = make(format, true, 'DecompressionStream',
+                    arguments.length === 0);
+    __cello.$$setTransformPair(this, ts.readable, ts.writable);
   }
 }
 
-for (const [cls, name] of [
-  [CompressionStream, 'CompressionStream'],
-  [DecompressionStream, 'DecompressionStream'],
-])
-  Object.defineProperty(cls.prototype, Symbol.toStringTag,
-                        { value: name, configurable: true });
+// Workerd wires both as TransformStream subclasses; the base constructor
+// must never run, so the chains are set directly.
+Object.setPrototypeOf(CompressionStream.prototype,
+                      TransformStream.prototype);
+Object.setPrototypeOf(CompressionStream, TransformStream);
+Object.setPrototypeOf(DecompressionStream.prototype,
+                      TransformStream.prototype);
+Object.setPrototypeOf(DecompressionStream, TransformStream);
+
+// WebIDL reflection (#171, #206).
+__cello.$$webidl(CompressionStream, 'CompressionStream');
+__cello.$$webidl(DecompressionStream, 'DecompressionStream');
 
 return { CompressionStream, DecompressionStream };
 })()

@@ -1,0 +1,9 @@
+{
+  "name": "shape",
+  "main": "index.js",
+  "compatibility_date": "2026-11-01",
+  "no_bundle": true,
+  "kv_namespaces": [{ "binding": "KV", "id": "shape-kv" }],
+  "r2_buckets": [{ "binding": "R2", "bucket_name": "shape-r2" }],
+  "d1_databases": [{ "binding": "DB", "database_name": "shape-d1" }]
+}

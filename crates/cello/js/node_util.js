@@ -4459,7 +4459,7 @@ stamp(globalThis.Headers, {
   name: "Headers",
   entries: true,
   props: [],
-  hidden: [["immutable", (v) => !!v._immutable]],
+  hidden: [["immutable", (v) => !!__cello.$$headersSealed(v)]],
 });
 stamp(globalThis.FormData, {
   name: "FormData",
@@ -4526,14 +4526,23 @@ stamp(globalThis.ReadableStream, {
   name: "ReadableStream",
   props: [["locked", (v) => v.locked]],
   hidden: [
-    ["state", (v) =>
-      v._errored ? "errored" : v._closed ? "closed" : "readable"],
-    ["supportsBYOB", (v) =>
-      v.__celloBodyBytes !== undefined || v.__celloStreamId !== undefined],
-    ["length", (v) =>
-      v._expectedLength === undefined
+    // The stream's state is private (#170); node:util asks the runtime
+    // through the same friend accessor the rest of the prelude uses.
+    ["state", (v) => {
+      const s = __cello.$$readableState(v);
+      return s.errored ? "errored" : s.closed ? "closed" : "readable";
+    }],
+    ["supportsBYOB", (v) => {
+      const s = __cello.$$readableState(v);
+      return s.byteCtl !== undefined || s.ictl !== undefined ||
+        s.buffered !== undefined;
+    }],
+    ["length", (v) => {
+      const s = __cello.$$readableState(v);
+      return s.expectedLength === undefined
         ? undefined
-        : BigInt(v._expectedLength)],
+        : BigInt(s.expectedLength);
+    }],
   ],
 });
 stamp(globalThis.WebSocket, {

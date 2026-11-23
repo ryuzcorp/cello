@@ -58,12 +58,13 @@ function _checkValue(value) {
   return value;
 }
 
-// Enumerable function-valued brand, shared by
-// every instance: V8's structured clone throws
-// on functions, so a Headers can never silently
-// flatten into a plain object -- RPC
-// serialization lifts it natively instead.
-const _noClone = () => {};
+// A constructed Headers is the only thing the clone and RPC codecs may treat
+// as one: a guest can reach `Headers.prototype` but not this set, so a forged
+// prototype flattens to plain data (#221). Workerd keeps no brand on the
+// instance, so the set stays module-private (#170).
+const _headersInstances = new WeakSet();
+__cello.$$isHeadersInstance = (value) =>
+  WeakSet.prototype.has.call(_headersInstances, value);
 
 // The spec's header list, plus the sorted pair list derived from it.
 //
@@ -125,9 +126,25 @@ function _pairs(state) {
 
 class Headers {
   #list = _newList();
+  #immutable = false;
+  // The runtime's own modules read the wire list and seal a redirect's header
+  // list through these accessors; neither is a guest-visible member (#206).
+  static #expose = (() => {
+    __cello.$$headerList = (headers) => {
+      const list = headers.#list.list;
+      const out = new Array(list.length);
+      for (let i = 0; i < list.length; i++)
+        out[i] = [list[i][0], list[i][1]];
+      return out;
+    };
+    __cello.$$sealHeaders = (headers) => {
+      headers.#immutable = true;
+    };
+    __cello.$$headersSealed = (headers) => headers.#immutable;
+  })();
 
   #checkMutable() {
-    if (this._immutable)
+    if (this.#immutable)
       throw new TypeError("Can't modify immutable headers.");
   }
 
@@ -150,7 +167,7 @@ class Headers {
   }
 
   constructor(init) {
-    this.__celloHost = _noClone;
+    _headersInstances.add(this);
     if (init === undefined) return;
     // WebIDL's "Headers or Sequence or object": a primitive is none of them,
     // so it is refused before any iteration. A function is an object (a
@@ -211,6 +228,16 @@ class Headers {
     }
     return value;
   }
+  // Workerd's nonstandard Fetch extension: every value for a name, one entry
+  // per append, where `get` joins them into one comma-separated value.
+  getAll(name) {
+    const lower = _lower(_checkName(name));
+    const state = this.#list;
+    const out = [];
+    for (let i = 0; i < state.lower.length; i++)
+      if (state.lower[i] === lower) out.push(state.list[i][1]);
+    return out;
+  }
   set(name, value) {
     this.#checkMutable();
     name = _checkName(name);
@@ -270,22 +297,6 @@ class Headers {
     for (let i = 0; i < state.lower.length; i++)
       if (state.lower[i] === "set-cookie")
         out.push(state.list[i][1]);
-    return out;
-  }
-  // The verbatim header list every outbound path serializes: insertion
-  // order, original casing, one entry per append. The iteration view above
-  // is lossy for a wire request -- it lower-cases, sorts, and combines -- so
-  // this is a second, deliberately different view, not a convenience.
-  //
-  // A class accessor, so it is non-enumerable and a record walk over a
-  // `Headers` never picks it up. Fresh pairs, so a caller that writes into
-  // what it received cannot rewrite the header list or desynchronize it
-  // from the parallel lower-cased names.
-  get __celloHeaderList() {
-    const list = this.#list.list;
-    const out = new Array(list.length);
-    for (let i = 0; i < list.length; i++)
-      out[i] = [list[i][0], list[i][1]];
     return out;
   }
   // Iteration: per WHATWG the header list stays live,
@@ -350,5 +361,22 @@ function _makeHeadersIter(list, kind) {
 // the BodyInit dictionary member's USVString branch
 // accepts any non-BodyInit value via ToString. Match
 // that here so primitives go through cleanly.
+
+// Workerd's Headers prototype: members enumerable per WebIDL, a
+// non-enumerable interface tag, and a constructor that takes no required
+// argument (#171, #206).
+for (const key of Object.getOwnPropertyNames(Headers.prototype)) {
+  if (key === "constructor") continue;
+  const descriptor = Object.getOwnPropertyDescriptor(Headers.prototype, key);
+  if (descriptor === undefined || descriptor.enumerable) continue;
+  descriptor.enumerable = true;
+  Object.defineProperty(Headers.prototype, key, descriptor);
+}
+Object.defineProperty(Headers.prototype, Symbol.toStringTag, {
+  value: "Headers", configurable: true, writable: true, enumerable: false,
+});
+Object.defineProperty(Headers, "length", {
+  value: 0, configurable: true, writable: false,
+});
 
 globalThis.Headers = Headers;

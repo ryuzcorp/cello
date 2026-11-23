@@ -22,7 +22,7 @@
 
 mod common;
 
-use common::{announced, cello_command, forward_announce, NO_EXTRA_ENV};
+use common::{announced, cello_command, forward_announce};
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -54,7 +54,9 @@ struct TestNode {
 
 impl TestNode {
     fn boot(app_project: &Path) -> Self {
-        let mut child = cello_command(app_project, NO_EXTRA_ENV)
+        // The fixture reaches the binding's cell stub through the test-only
+        // seam; a shipping node does not expose it.
+        let mut child = cello_command(app_project, [("CELLO_TEST_WAIT", "1")])
             .arg("dev")
             .arg(app_project)
             .arg("--port")

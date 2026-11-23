@@ -4,7 +4,7 @@
 // 'errored' | 'closed'. An abort or controller error while a sink
 // write/close is in flight (or before start settles) parks the stream in
 // 'erroring'; the in-flight operation completes normally, then
-// _finishErroring rejects the queued writes in order, runs the sink
+// finishErroring rejects the queued writes in order, runs the sink
 // abort, and rejects close/closed. One deliberate Workerd deviation from
 // the current spec text: close() on an errored stream rejects with the
 // stored error (spec rejects with a fresh TypeError). Everything else
@@ -14,18 +14,14 @@
 // follow the request's single abort (spec returns the same promise
 // again), and the close()/write() rejections name each state the way
 // workerd's messages do.
+//
+// Every field lives in a private state object (this module's WeakMap), so
+// a WritableStream, writer, controller or TransformStream exposes no own
+// properties and no internal prototype methods; other preludes read the
+// same state through `__cello.$$...` (#170, #206).
 
 // Brand-check sentinel for internal construction.
 const _wsc_brand = Symbol("WritableStreamController");
-
-// Per-stream hook a TransformStream installs on its writable side: its sink
-// write parks on the readable's backpressure promise, so entering 'erroring'
-// has to release it (the write then rejects with the stored error) or an
-// abort, a readable cancel, or a controller error could never settle. Kept
-// in a module-private WeakMap rather than an own field: a tenant that
-// shadows a public property must not be able to make abort()/cancel throw
-// before the sink's abort algorithm runs.
-const _unblockWriteHooks = new WeakMap();
 
 // A fresh promise following `p`'s outcome. Workerd hands every abort() call
 // its own promise instead of returning the request's promise again, while
@@ -36,6 +32,133 @@ function _followAbort(p) {
   const follower = p.then((value) => value);
   follower.catch(() => {});
   return follower;
+}
+
+const __rsState = (stream) => __cello.$$readableState(stream);
+
+// ---- writable stream state -------------------------------------------------
+class WritableStreamState {
+  constructor() {
+    this.sink = null;
+    this.locked = false;
+    this.state = 'writable'; // writable|erroring|errored|closed
+    this.storedError = undefined;
+    this.controller = null;
+    this.writer = null;
+    this.queue = []; // of {chunk, size, resolve, reject}
+    this.queueSize = 0;
+    this.inFlightWrite = null;
+    this.inFlightClose = null;
+    this.closeRequest = null;
+    this.pendingAbort = null;
+    this.abortPromise = null;
+    this.backpressure = false;
+    this.hwm = 1;
+    this.started = false;
+    this.sizeFn = undefined;
+    this.startFn = undefined;
+    this.writeFn = undefined;
+    this.closeFn = undefined;
+    this.abortFn = undefined;
+    // Spec: [[signal]] is an AbortSignal that fires when the stream is
+    // aborted. Installed by the controller's constructor.
+    this.signalAbort = undefined;
+    // Per-stream hook a TransformStream installs on its writable side: its
+    // sink write parks on the readable's backpressure promise, so entering
+    // 'erroring' has to release it (the write then rejects with the stored
+    // error) or an abort, a readable cancel, or a controller error could
+    // never settle. Kept in the private state rather than an own field: a
+    // tenant that shadows a public property must not be able to make
+    // abort()/cancel throw before the sink's abort algorithm runs.
+    this.unblockWrite = undefined;
+    // Runs after every abort() request has been recorded (IdentityTransform
+    // Stream unparks a write that is waiting on a read the abort cancels).
+    this.abortHook = undefined;
+    // Workerd's compression streams are internal streams: a failed push or
+    // flush closes the writable side instead of erroring it (#223).
+    // compression_streams.js opts in through `__cello.$$closesOnError`.
+    this.closesOnError = false;
+  }
+}
+
+const _writableStates = new WeakMap();
+const __wsState = (stream) => {
+  const state = _writableStates.get(stream);
+  if (state === undefined)
+    throw new TypeError("Illegal invocation");
+  return state;
+};
+
+// ---- writer state ----------------------------------------------------------
+class WriterState {
+  constructor(stream) {
+    this.stream = stream;
+    this.released = false;
+    this.closedPromise = null;
+    this.closedResolve = null;
+    this.closedReject = null;
+    this.readyPromise = null;
+    this.readyResolve = null;
+    this.readyReject = null;
+  }
+}
+
+const _writerStates = new WeakMap();
+const __wtrState = (writer) => {
+  const state = _writerStates.get(writer);
+  if (state === undefined)
+    throw new TypeError("Illegal invocation");
+  return state;
+};
+
+function __resetReady(state) {
+  state.readyPromise = new Promise((res, rej) => {
+    state.readyResolve = res;
+    state.readyReject = rej;
+  });
+  // Same pattern the constructor uses for the
+  // closed promise: attach a no-op rejection sink
+  // so V8 doesn't report an unhandled rejection
+  // when ready is rejected by the erroring path and
+  // the user never touched `writer.ready`. The
+  // user awaiting writer.ready still sees the
+  // rejection -- the promise is shared. Without
+  // this, a writable whose sink throws on the
+  // first write produced both the user-visible
+  // `await writer.write(...)` rejection AND a
+  // ghost "Uncaught (in promise)" reported on
+  // the freshly-reset ready promise (the
+  // queueSize-just-hit-hwm case).
+  state.readyPromise.catch(() => {});
+}
+
+function __resolveReady(state) {
+  if (state.readyResolve) state.readyResolve();
+}
+
+function __rejectReady(state, e) {
+  if (state.readyReject) {
+    state.readyReject(e);
+    // Replace with a rejected promise so subsequent
+    // reads of writer.ready get the error.
+    state.readyPromise = Promise.reject(e);
+    // Prevent unhandled rejection.
+    state.readyPromise.catch(() => {});
+    state.readyResolve = null;
+    state.readyReject = null;
+  }
+}
+
+function __resolveClosed(state) {
+  if (state.closedResolve) state.closedResolve();
+}
+
+function __rejectClosedWriter(state, e) {
+  if (state.closedReject) {
+    state.closedReject(e);
+    state.closedResolve = null;
+    state.closedReject = null;
+  }
 }
 
 class WritableStreamDefaultController {
@@ -54,7 +177,7 @@ class WritableStreamDefaultController {
     // AbortController so the signal survives the full
     // lifetime of the controller.
     this.#abortController = new AbortController();
-    stream._signalAbort = (reason) => {
+    __wsState(stream).signalAbort = (reason) => {
       if (!this.#abortController.signal.aborted) {
         this.#abortController.abort(reason);
       }
@@ -62,7 +185,7 @@ class WritableStreamDefaultController {
   }
 
   error(e) {
-    this.#stream._errorStream(e);
+    __errorStream(__wsState(this.#stream), e);
   }
 
   get signal() {
@@ -71,25 +194,20 @@ class WritableStreamDefaultController {
 }
 
 class WritableStreamDefaultWriter {
-  #stream;
-  #released = false;
-  #closedPromise;
-  #closedResolve;
-  #closedReject;
-  #readyPromise;
-  #readyResolve;
-  #readyReject;
+  #s;
 
   constructor(stream) {
     if (!(stream instanceof WritableStream))
       throw new TypeError(
         "WritableStreamDefaultWriter requires a " +
         "WritableStream argument");
-    if (stream._locked)
+    const st = __wsState(stream);
+    if (st.locked)
       throw new TypeError("WritableStream is locked");
-    this.#stream = stream;
-    stream._locked = true;
-    stream._writer = this;
+    const state = this.#s = new WriterState(stream);
+    _writerStates.set(this, state);
+    st.locked = true;
+    st.writer = this;
 
     // Closed promise. Same pattern as ReadableStream
     // (#105): attach a no-op sink so V8 doesn't fire
@@ -97,102 +215,55 @@ class WritableStreamDefaultWriter {
     // and the user never touched writer.closed. User
     // `await writer.closed` still sees the rejection
     // because the promise is shared.
-    this.#closedPromise = new Promise((res, rej) => {
-      this.#closedResolve = res;
-      this.#closedReject = rej;
+    state.closedPromise = new Promise((res, rej) => {
+      state.closedResolve = res;
+      state.closedReject = rej;
     });
-    this.#closedPromise.catch(() => {});
+    state.closedPromise.catch(() => {});
 
-    this._resetReady();
-    const state = stream._state;
-    if (state === 'writable') {
-      if (stream._closing() || !stream._backpressure)
-        this.#readyResolve();
-    } else if (state === 'closed') {
-      this.#readyResolve();
-      this._resolveClosed();
-    } else if (state === 'erroring') {
-      this._rejectReady(stream._storedError);
+    __resetReady(state);
+    if (st.state === 'writable') {
+      if (__closing(st) || !st.backpressure)
+        __resolveReady(state);
+    } else if (st.state === 'closed') {
+      __resolveReady(state);
+      __resolveClosed(state);
+    } else if (st.state === 'erroring') {
+      __rejectReady(state, st.storedError);
     } else { // errored
-      this._rejectReady(stream._storedError);
-      this._rejectClosed(stream._storedError);
-    }
-  }
-
-  _resetReady() {
-    this.#readyPromise = new Promise((res, rej) => {
-      this.#readyResolve = res;
-      this.#readyReject = rej;
-    });
-    // Same pattern the constructor uses for the
-    // closed promise: attach a no-op rejection sink
-    // so V8 doesn't report an unhandled rejection
-    // when ready is rejected by the erroring path and
-    // the user never touched `writer.ready`. The
-    // user awaiting writer.ready still sees the
-    // rejection -- the promise is shared. Without
-    // this, a writable whose sink throws on the
-    // first write produced both the user-visible
-    // `await writer.write(...)` rejection AND a
-    // ghost "Uncaught (in promise)" reported on
-    // the freshly-reset ready promise (the
-    // queueSize-just-hit-hwm case).
-    this.#readyPromise.catch(() => {});
-  }
-
-  _resolveReady() {
-    if (this.#readyResolve) this.#readyResolve();
-  }
-
-  _rejectReady(e) {
-    if (this.#readyReject) {
-      this.#readyReject(e);
-      // Replace with a rejected promise so subsequent
-      // reads of writer.ready get the error.
-      this.#readyPromise = Promise.reject(e);
-      // Prevent unhandled rejection.
-      this.#readyPromise.catch(() => {});
-      this.#readyResolve = null;
-      this.#readyReject = null;
-    }
-  }
-
-  _resolveClosed() {
-    if (this.#closedResolve) this.#closedResolve();
-  }
-
-  _rejectClosed(e) {
-    if (this.#closedReject) {
-      this.#closedReject(e);
-      this.#closedResolve = null;
-      this.#closedReject = null;
+      __rejectReady(state, st.storedError);
+      __rejectClosedWriter(state, st.storedError);
     }
   }
 
   write(chunk) {
-    if (this.#released)
+    const state = this.#s;
+    if (state.released)
       return Promise.reject(
         new TypeError("This WritableStream writer has been released."));
-    return this.#stream._write(chunk);
+    return __write(__wsState(state.stream), chunk);
   }
 
   close() {
-    if (this.#released)
+    const state = this.#s;
+    if (state.released)
       return Promise.reject(
         new TypeError("This WritableStream writer has been released."));
-    return this.#stream._close();
+    return __close(__wsState(state.stream));
   }
 
   abort(reason) {
-    if (this.#released)
+    const state = this.#s;
+    if (state.released)
       return Promise.reject(
         new TypeError("This WritableStream writer has been released."));
-    return this.#stream._abort(reason);
+    return __abort(__wsState(state.stream), reason);
   }
 
   releaseLock() {
-    if (this.#released) return;
-    const s = this.#stream;
+    const state = this.#s;
+    if (state.released) return;
+    const s = __wsState(state.stream);
     // Spec section 4.6.9: releasing rejects the writer's ready and
     // (still-pending) closed promises with a fresh TypeError, even while
     // an abort is in flight. For ready that means a *new* rejected promise
@@ -200,66 +271,369 @@ class WritableStreamDefaultWriter {
     // the released error; a handler attached before the release keeps the
     // old settlement -- still resolved, or still the stream's error, as
     // workerd measured (#193). closed keeps its own settlement once it has
-    // one (`_rejectClosed` only acts while it is pending).
+    // one (__rejectClosedWriter only acts while it is pending).
     const err = new TypeError(
       "This WritableStream writer has been released.");
-    if (this.#readyReject) this.#readyReject(err);
-    this.#readyPromise = Promise.reject(err);
-    this.#readyPromise.catch(() => {});
-    this.#readyResolve = null;
-    this.#readyReject = null;
-    this._rejectClosed(err);
+    if (state.readyReject) state.readyReject(err);
+    state.readyPromise = Promise.reject(err);
+    state.readyPromise.catch(() => {});
+    state.readyResolve = null;
+    state.readyReject = null;
+    __rejectClosedWriter(state, err);
     // Workerd also rejects queued (not in-flight) writes
     // with the same error; the chunks are dropped.
-    for (const entry of s._queue) entry.reject(err);
-    s._queue = [];
-    s._queueSize = 0;
-    s._locked = false;
-    s._writer = null;
-    this.#released = true;
+    for (const entry of s.queue) entry.reject(err);
+    s.queue = [];
+    s.queueSize = 0;
+    s.locked = false;
+    s.writer = null;
+    state.released = true;
   }
 
   get desiredSize() {
+    const state = this.#s;
     // Workerd throws for a released writer in every stream state (#193),
     // instead of reporting the stream's size; `null` for an errored or
     // closed stream would otherwise leak through.
-    if (this.#released)
+    if (state.released)
       throw new TypeError(
         "This WritableStream writer has been released.");
-    const s = this.#stream;
-    if (s._state === 'errored' ||
-        s._state === 'erroring') return null;
-    if (s._state === 'closed') return 0;
-    return s._hwm - s._queueSize;
+    const s = __wsState(state.stream);
+    if (s.state === 'errored' ||
+        s.state === 'erroring') return null;
+    if (s.state === 'closed') return 0;
+    return s.hwm - s.queueSize;
   }
 
-  get ready() { return this.#readyPromise; }
-  get closed() { return this.#closedPromise; }
+  get ready() { return this.#s.readyPromise; }
+  get closed() { return this.#s.closedPromise; }
+}
+
+function __closing(st) {
+  return st.closeRequest !== null ||
+         st.inFlightClose !== null;
+}
+
+// Backpressure flips only on a threshold crossing, so
+// ready is reset (or resolved) once per transition
+// rather than on every write.
+function __updateBackpressure(st) {
+  const bp = st.queueSize >= st.hwm;
+  if (bp === st.backpressure) return;
+  st.backpressure = bp;
+  const w = st.writer;
+  if (!w) return;
+  if (bp) __resetReady(__wtrState(w));
+  else __resolveReady(__wtrState(w));
+}
+
+function __write(st, chunk) {
+  // Spec: the size algorithm runs before the state
+  // checks; a throw or invalid size errors the stream
+  // and the checks below then reject with it.
+  let size = 1;
+  if (st.sizeFn) {
+    try {
+      size = st.sizeFn(chunk);
+      if (!Number.isFinite(size) || size < 0)
+        throw new RangeError(
+          "invalid strategy size: " + size);
+    } catch (e) {
+      __errorStream(st, e);
+    }
+  }
+  if (st.state === 'errored')
+    return Promise.reject(st.storedError);
+  // Workerd names each state separately here (#132), and its message
+  // for a closing stream says "ReadableStream": measured on
+  // 1.20261121.1, not a typo of ours.
+  if (st.state === 'closed')
+    return Promise.reject(new TypeError(
+      "This WritableStream has been closed."));
+  if (__closing(st))
+    return Promise.reject(new TypeError(
+      "This ReadableStream is closed."));
+  if (st.state === 'erroring')
+    return Promise.reject(st.storedError);
+  return new Promise((resolve, reject) => {
+    st.queue.push({ chunk, size, resolve, reject });
+    st.queueSize += size;
+    __updateBackpressure(st);
+    __advanceQueue(st);
+  });
+}
+
+function __close(st) {
+  // Workerd rejects close() on an errored stream with its stored error
+  // (the spec text rejects with a fresh TypeError), the reason
+  // writer.closed already reports. A producer whose consumer cancelled
+  // the readable therefore observes the cancel reason instead of a
+  // generic message (#129). The other two states have their own
+  // workerd messages (#132), measured on 1.20261121.1.
+  if (st.state === 'errored')
+    return Promise.reject(st.storedError);
+  if (st.state === 'closed')
+    return Promise.reject(new TypeError(
+      "This WritableStream has been closed."));
+  if (__closing(st))
+    return Promise.reject(new TypeError(
+      "Cannot close a writer that is already being closed"));
+  return new Promise((resolve, reject) => {
+    st.closeRequest = { resolve, reject };
+    if (st.backpressure &&
+        st.state === 'writable' && st.writer)
+      __resolveReady(__wtrState(st.writer));
+    __advanceQueue(st);
+  });
+}
+
+function __abort(st, reason) {
+  const p = __abortRequest(st, reason);
+  // IdentityTransformStream observes every abort request to unpark a write
+  // that is waiting on a read this abort cancels.
+  if (st.abortHook) st.abortHook(reason);
+  return p;
+}
+
+function __abortRequest(st, reason) {
+  // Workerd: every abort() call gets its own promise, and all of them
+  // follow the request's single abort, settled or not (#133).
+  if (st.abortPromise) return _followAbort(st.abortPromise);
+  if (st.state === 'closed')
+    return Promise.resolve();
+  // Workerd resolves abort() on a stream that already errored: the
+  // error reached every consumer already, so aborting changes nothing
+  // (the spec text resolves too; this path used to reject with the
+  // stored error, which the old header misrecorded as workerd's).
+  // Aborting while the stream is still *erroring* rejects with the
+  // stored error from finishErroring: the request is recorded before
+  // the state settles.
+  if (st.state === 'errored')
+    return Promise.resolve();
+  // Fire the controller's AbortSignal so sinks watching
+  // controller.signal can cancel in-flight work.
+  if (st.signalAbort) st.signalAbort(reason);
+  const wasErroring = st.state === 'erroring';
+  if (wasErroring) reason = undefined;
+  const p = new Promise((resolve, reject) => {
+    st.pendingAbort =
+      { resolve, reject, reason, wasErroring };
+  });
+  st.abortPromise = p;
+  // No-op sink: a dropped abort() that ends up rejecting
+  // must not fire the unhandled-rejection hook.
+  p.catch(() => {});
+  if (!wasErroring) __startErroring(st, reason);
+  return p;
+}
+
+// WritableStreamDefaultControllerErrorIfNeeded.
+function __errorStream(st, e) {
+  if (st.state === 'writable') __startErroring(st, e);
+}
+
+function __startErroring(st, reason) {
+  st.storedError = reason;
+  st.state = 'erroring';
+  const unblockWrite = st.unblockWrite;
+  if (unblockWrite) unblockWrite();
+  if (st.writer) __rejectReady(__wtrState(st.writer), reason);
+  if (st.started && !st.inFlightWrite &&
+      !st.inFlightClose)
+    __finishErroring(st);
+}
+
+function __finishErroring(st) {
+  st.state = 'errored';
+  const err = st.storedError;
+  // Reject queued writes in order, then settle abort,
+  // then reject close/closed -- the spec's promise
+  // resolution order.
+  for (const entry of st.queue) entry.reject(err);
+  st.queue = [];
+  st.queueSize = 0;
+  const abortReq = st.pendingAbort;
+  st.pendingAbort = null;
+  if (!abortReq) {
+    __rejectCloseAndClosed(st);
+    return;
+  }
+  if (abortReq.wasErroring) {
+    // The stream was already erroring when abort() was
+    // called: the sink abort is not run.
+    abortReq.reject(err);
+    __rejectCloseAndClosed(st);
+    return;
+  }
+  let result;
+  try {
+    result = st.abortFn
+      ? st.abortFn.call(st.sink, abortReq.reason)
+      : undefined;
+  } catch (e) { result = Promise.reject(e); }
+  Promise.resolve(result).then(
+    () => {
+      abortReq.resolve();
+      __rejectCloseAndClosed(st);
+    },
+    (e) => {
+      abortReq.reject(e);
+      __rejectCloseAndClosed(st);
+    },
+  );
+}
+
+function __rejectCloseAndClosed(st) {
+  if (st.closeRequest) {
+    st.closeRequest.reject(st.storedError);
+    st.closeRequest = null;
+  }
+  if (st.writer)
+    __rejectClosedWriter(__wtrState(st.writer), st.storedError);
+}
+
+function __dealWithRejection(st, e) {
+  if (st.state === 'writable') {
+    __startErroring(st, e);
+    return;
+  }
+  if (st.state === 'erroring') __finishErroring(st);
+}
+
+function __advanceQueue(st) {
+  if (!st.started) return;
+  if (st.inFlightWrite || st.inFlightClose) return;
+  const state = st.state;
+  if (state === 'errored' || state === 'closed') return;
+  if (state === 'erroring') {
+    __finishErroring(st);
+    return;
+  }
+  if (st.queue.length > 0)
+    __startWrite(st, st.queue.shift());
+  else if (st.closeRequest)
+    __startClose(st);
+}
+
+function __startWrite(st, entry) {
+  st.inFlightWrite = entry;
+  // A sync throw is deferred into a rejection so an
+  // abort() issued between write() and the microtask
+  // still sees the write as in flight (Workerd runs the
+  // sink abort in that case; a sync error path would
+  // reach the errored state first and skip it).
+  let result;
+  try {
+    result = st.writeFn
+      ? st.writeFn.call(
+          st.sink, entry.chunk, st.controller)
+      : undefined;
+  } catch (e) { result = Promise.reject(e); }
+  Promise.resolve(result).then(
+    () => {
+      st.inFlightWrite = null;
+      entry.resolve(undefined);
+      st.queueSize -= entry.size;
+      if (st.queueSize < 0) st.queueSize = 0;
+      if (st.state === 'writable' && !__closing(st))
+        __updateBackpressure(st);
+      __advanceQueue(st);
+    },
+    (e) => {
+      st.inFlightWrite = null;
+      st.queueSize -= entry.size;
+      if (st.queueSize < 0) st.queueSize = 0;
+      entry.reject(e);
+      if (st.closesOnError) __closeAfterError(st, e);
+      else __dealWithRejection(st, e);
+    },
+  );
+}
+
+function __startClose(st) {
+  st.inFlightClose = st.closeRequest;
+  st.closeRequest = null;
+  let result;
+  try {
+    result = st.closeFn
+      ? st.closeFn.call(st.sink)
+      : undefined;
+  } catch (e) { result = Promise.reject(e); }
+  Promise.resolve(result).then(
+    () => __finishClose(st),
+    (e) => __finishCloseWithError(st, e),
+  );
+}
+
+function __finishClose(st) {
+  st.inFlightClose.resolve();
+  st.inFlightClose = null;
+  if (st.state === 'erroring') {
+    // An abort raced the close and lost: the close wins,
+    // the abort fulfills, the stream closes cleanly.
+    st.storedError = undefined;
+    const abortReq = st.pendingAbort;
+    if (abortReq) {
+      st.pendingAbort = null;
+      abortReq.resolve();
+    }
+  }
+  st.state = 'closed';
+  if (st.writer) __resolveClosed(__wtrState(st.writer));
+}
+
+function __finishCloseWithError(st, e) {
+  st.inFlightClose.reject(e);
+  st.inFlightClose = null;
+  // A pending abort is rejected with the close error;
+  // the sink abort is not run.
+  const abortReq = st.pendingAbort;
+  if (abortReq) {
+    st.pendingAbort = null;
+    abortReq.reject(e);
+  }
+  if (st.closesOnError) __closeAfterError(st, e);
+  else __dealWithRejection(st, e);
+}
+
+// A failing write or flush on an internal stream (workerd's compression
+// streams) settles the writable side as *closed*, not errored (#223): later
+// write()/close() calls report "This WritableStream has been closed.",
+// desiredSize is 0 and abort() resolves, while writer.closed rejects with the
+// failure and writer.ready resolves. Queued writes and a queued close reject
+// with the closed-stream TypeError, as workerd does, instead of the stored
+// error.
+function __closeAfterError(st, e) {
+  // An abort already moved the stream to 'erroring': that path owns the
+  // settle (and rejects the abort with the stored error).
+  if (st.state !== 'writable') {
+    __dealWithRejection(st, e);
+    return;
+  }
+  st.state = 'closed';
+  const closedError = new TypeError(
+    "This WritableStream has been closed.");
+  for (const entry of st.queue) entry.reject(closedError);
+  st.queue = [];
+  st.queueSize = 0;
+  if (st.closeRequest) {
+    st.closeRequest.reject(closedError);
+    st.closeRequest = null;
+  }
+  const writerState = st.writer === null ? undefined : __wtrState(st.writer);
+  if (writerState !== undefined) {
+    __resolveReady(writerState);
+    __rejectClosedWriter(writerState, e);
+  }
 }
 
 class WritableStream {
-  _sink = null;
-  _locked = false;
-  _state = 'writable'; // writable|erroring|errored|closed
-  _storedError = undefined;
-  _controller = null;
-  _writer = null;
-  _queue = []; // of {chunk, size, resolve, reject}
-  _queueSize = 0;
-  _inFlightWrite = null;
-  _inFlightClose = null;
-  _closeRequest = null;
-  _pendingAbort = null;
-  _abortPromise = null;
-  _backpressure = false;
-  _hwm = 1;
-  _started = false;
-  // Workerd's compression streams are internal streams: a failed push or
-  // flush closes the writable side instead of erroring it (#223).
-  // compression_streams.js opts in on the stream it builds.
-  _closesOnError = false;
+  #s;
+
 
   constructor(underlyingSink, queuingStrategy) {
+    const st = this.#s = new WritableStreamState();
+    _writableStates.set(this, st);
     // Per spec: extract strategy fields first. Size is
     // read and validated before highWaterMark; invalid
     // size must beat invalid highWaterMark.
@@ -269,7 +643,7 @@ class WritableStream {
           && typeof size !== 'function')
         throw new TypeError(
           'strategy.size must be a function');
-      this._sizeFn = size;
+      st.sizeFn = size;
       const hwm = queuingStrategy.highWaterMark;
       if (hwm !== undefined) {
         const n = Number(hwm);
@@ -278,348 +652,39 @@ class WritableStream {
         if (Number.isNaN(n) || n < 0)
           throw new TypeError(
             'highWaterMark must be non-negative');
-        this._hwm = n;
+        st.hwm = n;
       }
     }
     const sink = underlyingSink || {};
     if (sink.type !== undefined)
       throw new RangeError("Invalid type");
-    this._sink = sink;
+    st.sink = sink;
     // Cache sink algorithms once per spec + bind this.
-    this._startFn = sink.start;
-    this._writeFn = sink.write;
-    this._closeFn = sink.close;
-    this._abortFn = sink.abort;
-    this._controller = new WritableStreamDefaultController(
+    st.startFn = sink.start;
+    st.writeFn = sink.write;
+    st.closeFn = sink.close;
+    st.abortFn = sink.abort;
+    st.controller = new WritableStreamDefaultController(
       _wsc_brand, this);
-    this._backpressure = this._queueSize >= this._hwm;
-    if (this._startFn) {
+    st.backpressure = st.queueSize >= st.hwm;
+    if (st.startFn) {
       // A sync start throw becomes a rejection rather
       // than escaping the constructor; per spec it
       // errors the stream once started is recorded.
       let result;
       try {
-        result = this._startFn.call(sink, this._controller);
+        result = st.startFn.call(sink, st.controller);
       } catch (e) { result = Promise.reject(e); }
       Promise.resolve(result).then(
-        () => { this._started = true; this._advanceQueue(); },
-        (e) => { this._started = true; this._dealWithRejection(e); },
+        () => { st.started = true; __advanceQueue(st); },
+        (e) => { st.started = true; __dealWithRejection(st, e); },
       );
     } else {
       // Workerd starts a sink with no start() synchronously:
       // a write dispatched before the next microtask is
       // already in flight when an abort arrives, so it
       // completes instead of being rejected with the queue.
-      this._started = true;
-    }
-  }
-
-  _closing() {
-    return this._closeRequest !== null ||
-           this._inFlightClose !== null;
-  }
-
-  // Backpressure flips only on a threshold crossing, so
-  // ready is reset (or resolved) once per transition
-  // rather than on every write.
-  _updateBackpressure() {
-    const bp = this._queueSize >= this._hwm;
-    if (bp === this._backpressure) return;
-    this._backpressure = bp;
-    const w = this._writer;
-    if (!w) return;
-    if (bp) w._resetReady();
-    else w._resolveReady();
-  }
-
-  _write(chunk) {
-    // Spec: the size algorithm runs before the state
-    // checks; a throw or invalid size errors the stream
-    // and the checks below then reject with it.
-    let size = 1;
-    if (this._sizeFn) {
-      try {
-        size = this._sizeFn(chunk);
-        if (!Number.isFinite(size) || size < 0)
-          throw new RangeError(
-            "invalid strategy size: " + size);
-      } catch (e) {
-        this._errorStream(e);
-      }
-    }
-    if (this._state === 'errored')
-      return Promise.reject(this._storedError);
-    // Workerd names each state separately here (#132), and its message
-    // for a closing stream says "ReadableStream": measured on
-    // 1.20261121.1, not a typo of ours.
-    if (this._state === 'closed')
-      return Promise.reject(new TypeError(
-        "This WritableStream has been closed."));
-    if (this._closing())
-      return Promise.reject(new TypeError(
-        "This ReadableStream is closed."));
-    if (this._state === 'erroring')
-      return Promise.reject(this._storedError);
-    return new Promise((resolve, reject) => {
-      this._queue.push({ chunk, size, resolve, reject });
-      this._queueSize += size;
-      this._updateBackpressure();
-      this._advanceQueue();
-    });
-  }
-
-  _close() {
-    // Workerd rejects close() on an errored stream with its stored error
-    // (the spec text rejects with a fresh TypeError), the reason
-    // writer.closed already reports. A producer whose consumer cancelled
-    // the readable therefore observes the cancel reason instead of a
-    // generic message (#129). The other two states have their own
-    // workerd messages (#132), measured on 1.20261121.1.
-    if (this._state === 'errored')
-      return Promise.reject(this._storedError);
-    if (this._state === 'closed')
-      return Promise.reject(new TypeError(
-        "This WritableStream has been closed."));
-    if (this._closing())
-      return Promise.reject(new TypeError(
-        "Cannot close a writer that is already being closed"));
-    return new Promise((resolve, reject) => {
-      this._closeRequest = { resolve, reject };
-      if (this._backpressure &&
-          this._state === 'writable' && this._writer)
-        this._writer._resolveReady();
-      this._advanceQueue();
-    });
-  }
-
-  _abort(reason) {
-    // Workerd: every abort() call gets its own promise, and all of them
-    // follow the request's single abort, settled or not (#133).
-    if (this._abortPromise) return _followAbort(this._abortPromise);
-    if (this._state === 'closed')
-      return Promise.resolve();
-    // Workerd resolves abort() on a stream that already errored: the
-    // error reached every consumer already, so aborting changes nothing
-    // (the spec text resolves too; this path used to reject with the
-    // stored error, which the old header misrecorded as workerd's).
-    // Aborting while the stream is still *erroring* rejects with the
-    // stored error from _finishErroring: the request is recorded before
-    // the state settles.
-    if (this._state === 'errored')
-      return Promise.resolve();
-    // Fire the controller's AbortSignal so sinks watching
-    // controller.signal can cancel in-flight work.
-    if (this._signalAbort) this._signalAbort(reason);
-    const wasErroring = this._state === 'erroring';
-    if (wasErroring) reason = undefined;
-    const p = new Promise((resolve, reject) => {
-      this._pendingAbort =
-        { resolve, reject, reason, wasErroring };
-    });
-    this._abortPromise = p;
-    // No-op sink: a dropped abort() that ends up rejecting
-    // must not fire the unhandled-rejection hook.
-    p.catch(() => {});
-    if (!wasErroring) this._startErroring(reason);
-    return p;
-  }
-
-  // WritableStreamDefaultControllerErrorIfNeeded.
-  _errorStream(e) {
-    if (this._state === 'writable') this._startErroring(e);
-  }
-
-  _startErroring(reason) {
-    this._storedError = reason;
-    this._state = 'erroring';
-    const unblockWrite = _unblockWriteHooks.get(this);
-    if (unblockWrite) unblockWrite();
-    if (this._writer) this._writer._rejectReady(reason);
-    if (this._started && !this._inFlightWrite &&
-        !this._inFlightClose)
-      this._finishErroring();
-  }
-
-  _finishErroring() {
-    this._state = 'errored';
-    const err = this._storedError;
-    // Reject queued writes in order, then settle abort,
-    // then reject close/closed -- the spec's promise
-    // resolution order.
-    for (const entry of this._queue) entry.reject(err);
-    this._queue = [];
-    this._queueSize = 0;
-    const abortReq = this._pendingAbort;
-    this._pendingAbort = null;
-    if (!abortReq) {
-      this._rejectCloseAndClosed();
-      return;
-    }
-    if (abortReq.wasErroring) {
-      // The stream was already erroring when abort() was
-      // called: the sink abort is not run.
-      abortReq.reject(err);
-      this._rejectCloseAndClosed();
-      return;
-    }
-    let result;
-    try {
-      result = this._abortFn
-        ? this._abortFn.call(this._sink, abortReq.reason)
-        : undefined;
-    } catch (e) { result = Promise.reject(e); }
-    Promise.resolve(result).then(
-      () => {
-        abortReq.resolve();
-        this._rejectCloseAndClosed();
-      },
-      (e) => {
-        abortReq.reject(e);
-        this._rejectCloseAndClosed();
-      },
-    );
-  }
-
-  _rejectCloseAndClosed() {
-    if (this._closeRequest) {
-      this._closeRequest.reject(this._storedError);
-      this._closeRequest = null;
-    }
-    if (this._writer)
-      this._writer._rejectClosed(this._storedError);
-  }
-
-  _dealWithRejection(e) {
-    if (this._state === 'writable') {
-      this._startErroring(e);
-      return;
-    }
-    if (this._state === 'erroring') this._finishErroring();
-  }
-
-  _advanceQueue() {
-    if (!this._started) return;
-    if (this._inFlightWrite || this._inFlightClose) return;
-    const state = this._state;
-    if (state === 'errored' || state === 'closed') return;
-    if (state === 'erroring') {
-      this._finishErroring();
-      return;
-    }
-    if (this._queue.length > 0)
-      this._startWrite(this._queue.shift());
-    else if (this._closeRequest)
-      this._startClose();
-  }
-
-  _startWrite(entry) {
-    this._inFlightWrite = entry;
-    // A sync throw is deferred into a rejection so an
-    // abort() issued between write() and the microtask
-    // still sees the write as in flight (Workerd runs the
-    // sink abort in that case; a sync error path would
-    // reach the errored state first and skip it).
-    let result;
-    try {
-      result = this._writeFn
-        ? this._writeFn.call(
-            this._sink, entry.chunk, this._controller)
-        : undefined;
-    } catch (e) { result = Promise.reject(e); }
-    Promise.resolve(result).then(
-      () => {
-        this._inFlightWrite = null;
-        entry.resolve(undefined);
-        this._queueSize -= entry.size;
-        if (this._queueSize < 0) this._queueSize = 0;
-        if (this._state === 'writable' && !this._closing())
-          this._updateBackpressure();
-        this._advanceQueue();
-      },
-      (e) => {
-        this._inFlightWrite = null;
-        this._queueSize -= entry.size;
-        if (this._queueSize < 0) this._queueSize = 0;
-        entry.reject(e);
-        if (this._closesOnError) this._closeAfterError(e);
-        else this._dealWithRejection(e);
-      },
-    );
-  }
-
-  _startClose() {
-    this._inFlightClose = this._closeRequest;
-    this._closeRequest = null;
-    let result;
-    try {
-      result = this._closeFn
-        ? this._closeFn.call(this._sink)
-        : undefined;
-    } catch (e) { result = Promise.reject(e); }
-    Promise.resolve(result).then(
-      () => this._finishClose(),
-      (e) => this._finishCloseWithError(e),
-    );
-  }
-
-  _finishClose() {
-    this._inFlightClose.resolve();
-    this._inFlightClose = null;
-    if (this._state === 'erroring') {
-      // An abort raced the close and lost: the close wins,
-      // the abort fulfills, the stream closes cleanly.
-      this._storedError = undefined;
-      const abortReq = this._pendingAbort;
-      if (abortReq) {
-        this._pendingAbort = null;
-        abortReq.resolve();
-      }
-    }
-    this._state = 'closed';
-    if (this._writer) this._writer._resolveClosed();
-  }
-
-  _finishCloseWithError(e) {
-    this._inFlightClose.reject(e);
-    this._inFlightClose = null;
-    // A pending abort is rejected with the close error;
-    // the sink abort is not run.
-    const abortReq = this._pendingAbort;
-    if (abortReq) {
-      this._pendingAbort = null;
-      abortReq.reject(e);
-    }
-    if (this._closesOnError) this._closeAfterError(e);
-    else this._dealWithRejection(e);
-  }
-
-  // A failing write or flush on an internal stream (workerd's compression
-  // streams) settles the writable side as *closed*, not errored (#223):
-  // later write()/close() calls report "This WritableStream has been
-  // closed.", desiredSize is 0 and abort() resolves, while writer.closed
-  // rejects with the failure and writer.ready resolves. Queued writes and
-  // a queued close reject with the closed-stream TypeError, as workerd
-  // does, instead of the stored error.
-  _closeAfterError(e) {
-    // An abort already moved the stream to 'erroring': that path owns the
-    // settle (and rejects the abort with the stored error).
-    if (this._state !== 'writable') {
-      this._dealWithRejection(e);
-      return;
-    }
-    this._state = 'closed';
-    const closedError = new TypeError(
-      "This WritableStream has been closed.");
-    for (const entry of this._queue) entry.reject(closedError);
-    this._queue = [];
-    this._queueSize = 0;
-    if (this._closeRequest) {
-      this._closeRequest.reject(closedError);
-      this._closeRequest = null;
-    }
-    if (this._writer) {
-      this._writer._resolveReady();
-      this._writer._rejectClosed(e);
+      st.started = true;
     }
   }
 
@@ -627,20 +692,20 @@ class WritableStream {
     return new WritableStreamDefaultWriter(this);
   }
 
-  get locked() { return this._locked; }
+  get locked() { return this.#s.locked; }
 
   close() {
-    if (this._locked)
+    if (this.#s.locked)
       return Promise.reject(new TypeError(
         "Cannot close a locked stream"));
-    return this._close();
+    return __close(this.#s);
   }
 
   abort(reason) {
-    if (this._locked)
+    if (this.#s.locked)
       return Promise.reject(new TypeError(
         "Cannot abort a locked stream"));
-    return this._abort(reason);
+    return __abort(this.#s, reason);
   }
 }
 
@@ -695,6 +760,16 @@ class TransformStreamDefaultController {
   get desiredSize() { return this.#rsc.desiredSize; }
 }
 
+// ---- transform pair state --------------------------------------------------
+const _transformStates = new WeakMap();
+
+function __pairOf(ts) {
+  const pair = _transformStates.get(ts);
+  if (pair === undefined)
+    throw new TypeError("Illegal invocation");
+  return pair;
+}
+
 // TransformStream -- pairs a readable + writable
 //
 // The pair runs the spec's backpressure handshake: the readable
@@ -706,11 +781,12 @@ class TransformStreamDefaultController {
 // streamed Response, whose HTTP client stopped reading, from
 // buffering the body in the isolate's heap.
 class TransformStream {
-  readable;
-  writable;
+  #s;
 
   constructor(transformer = {}, writableStrategy,
               readableStrategy) {
+    const pair = this.#s = { readable: null, writable: null };
+    _transformStates.set(this, pair);
     // Cache transformer methods once (may include proto
     // chain); call with .call(transformer, ...) so `this`
     // binds per spec.
@@ -751,7 +827,7 @@ class TransformStream {
       return Promise.resolve(
         cancelFn.call(transformer, reason));
     };
-    this.readable = new ReadableStream({
+    const readable = new ReadableStream({
       start(c) { rsc = c; },
       pull() {
         // The consumer wants data: release the parked write and hand
@@ -765,7 +841,7 @@ class TransformStream {
         // The readable is closed by now, so nothing will pull again:
         // error the writable before awaiting the transformer's cancel,
         // or a write parked on the handshake would wait on it forever.
-        writable?._errorStream(reason);
+        if (writable) __errorStream(__wsState(writable), reason);
         await runCancel(reason);
       },
     }, {
@@ -781,14 +857,14 @@ class TransformStream {
     // generic controller does not either), so observe the dequeue instead:
     // with highWaterMark > 0 a read can leave desiredSize positive without
     // any pull running, and the parked write must resume.
-    this.readable._onDequeue = () => {
+    __rsState(readable).onDequeue = () => {
       setBackpressure(!(rsc.desiredSize > 0));
     };
     // Workerd extension: expectedLength on the
     // transformer feeds Content-Length when the
     // readable becomes a fetch body.
     if (transformer.expectedLength !== undefined)
-      this.readable._expectedLength =
+      __rsState(readable).expectedLength =
         Number(transformer.expectedLength);
     // Track the first controller.error() so that
     // transformer.flush()'s side effect can be replayed
@@ -801,7 +877,7 @@ class TransformStream {
     // on a handshake nothing will ever release.
     let startWindowError = null;
     const errorWritable = (e) => {
-      if (writable) writable._errorStream(e);
+      if (writable) __errorStream(__wsState(writable), e);
       else if (startWindowError === null) startWindowError = e;
     };
     const ctrl = new TransformStreamDefaultController(rsc, (e) => {
@@ -852,8 +928,9 @@ class TransformStream {
           // errored the stream while this write was parked: fail it
           // with the stored error instead of transforming into a dead
           // readable.
-          if (writable._state === 'erroring')
-            throw writable._storedError;
+          const wst = __wsState(writable);
+          if (wst.state === 'erroring')
+            throw wst.storedError;
           return performTransform(chunk);
         });
       },
@@ -898,13 +975,17 @@ class TransformStream {
     // write parked on the handshake so it can reject with the stored
     // error instead of waiting for a pull that will never come. Module
     // private so tenant code cannot shadow it.
-    _unblockWriteHooks.set(writable, () => setBackpressure(false));
+    __wsState(writable).unblockWrite = () => setBackpressure(false);
     // A controller.error()/terminate() from start() ran before the
     // writable existed; apply it now, before any write can queue.
     if (startWindowError !== null)
-      writable._errorStream(startWindowError);
-    this.writable = writable;
+      __errorStream(__wsState(writable), startWindowError);
+    pair.readable = readable;
+    pair.writable = writable;
   }
+
+  get readable() { return __pairOf(this).readable; }
+  get writable() { return __pairOf(this).writable; }
 }
 
 globalThis.WritableStream = WritableStream;
@@ -915,7 +996,24 @@ globalThis.WritableStreamDefaultController =
 globalThis.TransformStream = TransformStream;
 globalThis.TransformStreamDefaultController =
   TransformStreamDefaultController;
-// Web IDL toStringTag.
+
+// The runtime's own modules drive writable state and adopt a
+// TransformStream's pair through these hooks; tenant code cannot reach
+// `__cello`.
+__cello.$$writableStreamState = __wsState;
+__cello.$$errorStream = (stream, e) =>
+  __errorStream(__wsState(stream), e);
+__cello.$$setTransformPair = (target, readable, writable) => {
+  let pair = _transformStates.get(target);
+  if (pair === undefined) {
+    pair = { readable: null, writable: null };
+    _transformStates.set(target, pair);
+  }
+  pair.readable = readable;
+  pair.writable = writable;
+};
+
+// WebIDL reflection (#171, #206).
 for (const [cls, name] of [
   [WritableStream, 'WritableStream'],
   [WritableStreamDefaultWriter,
@@ -926,7 +1024,5 @@ for (const [cls, name] of [
   [TransformStreamDefaultController,
     'TransformStreamDefaultController'],
 ]) {
-  Object.defineProperty(cls.prototype,
-    Symbol.toStringTag,
-    { value: name, configurable: true });
+  __cello.$$webidl(cls, name);
 }

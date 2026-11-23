@@ -1148,8 +1148,14 @@ export default {
           return { value: obj === null ? null : await obj.text() };
         }
         case 'r2-noforge': {
-          const proto = Object.getPrototypeOf(env.OWN_R2);
-          return { ctor: proto.constructor.name };
+          // The interface exists (workerd's R2Bucket), but only the host can
+          // mint one: a forged construction is refused and reads nothing.
+          const C = Object.getPrototypeOf(env.OWN_R2).constructor;
+          const out = await attempt(async () => {
+            const forged = new C('own', 'bf-victim-r2');
+            return { leaked: await forged.get('ownkey') };
+          });
+          return { ctor: C.name, ...out };
         }
         case 'svc-own': {
           const r = await (await env.SB.fetch('https://victim/ping')).json();
