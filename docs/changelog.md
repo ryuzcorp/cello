@@ -9,7 +9,8 @@ tee-skew conformance test no longer assumes which of a tee's copies the skew
 budget ends. A third change is breaking: a Worker can no longer generate code
 at run time (#194), described below. The differential gate gained six cases
 from those fixes and fourteen Request/body cases from the changes below,
-plus 25 binding cases (see below), 86 in total. No configuration or
+plus 25 binding cases, six Web Crypto cases and 23 Durable Object and
+WebSocket cases (see below), 116 in total. No configuration or
 bucket-format changes; the development store gains two nullable
 columns, which is backward compatible (see below). The `eval`,
 `Function` and wasm runtime-compilation changes are listed after the stream
@@ -287,7 +288,10 @@ Durable Object and WebSocket fixes:
   `stub.fetch()` and stub RPC reject with the handler's own value: an
   `Error` subclass keeps its class, a `DOMException` stays a `DOMException`,
   a thrown object stays an object, and a primitive becomes an `Error` with
-  its text. The error carries workerd's own `remote` marker, and its `stack`
+  its text. The class is decided against the runtime's own `DOMException`,
+  captured before tenant code runs, so a Worker that replaces
+  `globalThis.DOMException` and throws an instance gives its caller a plain
+  `Error`. The error carries workerd's own `remote` marker, and its `stack`
   is the first line (plus the caller's frames over RPC), so no
   `rejected: Error: …` text or Cello host frame reaches the guest.
 - **`put(key, undefined)` is refused and clone failures are

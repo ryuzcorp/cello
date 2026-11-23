@@ -12457,6 +12457,9 @@ if (!globalThis.DOMException) {
 // The realm's DOMException, captured before tenant code can replace the
 // global: error classification must not follow a Worker's own global.
 const __primDOMException = globalThis.DOMException;
+// The host classifies a rejected Durable Object handler by this constructor,
+// not by the global a Worker may have replaced.
+__cello.__primDOMException = __primDOMException;
 if (!globalThis.AbortSignal) {
   const __abortBrand = Symbol("abortSignal");
   globalThis.AbortSignal = class AbortSignal extends EventTarget {
