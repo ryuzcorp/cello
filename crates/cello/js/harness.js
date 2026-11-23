@@ -12905,7 +12905,9 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
     const text = binary ? null : String(data);
     if (this._loopback) {
       const peer = this._loopback;
-      const message = binary ? bytes.slice() : text;
+      // `_dispatchMessage` converts an ArrayBuffer per `binaryType`, so hand
+      // it the copy's buffer, as `data.slice(0)` did before #130.
+      const message = binary ? bytes.slice().buffer : text;
       queueMicrotask(() => peer._dispatchMessage(message));
       return;
     }
