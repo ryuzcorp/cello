@@ -348,7 +348,10 @@ The `tail` and `email` handlers are unavailable.
 ### [Web Crypto](https://developers.cloudflare.com/workers/runtime-apis/web-crypto/)
 
 - HMAC accepts MD5, SHA-1, SHA-224, SHA-256, SHA-384, and SHA-512.
-- ECDSA supports only the P-256 curve with SHA-256.
+- ECDSA supports only the P-256 curve with SHA-256, so a request that
+  names a different curve or hash for a P-256 key is refused with
+  `NotSupportedError`. Workerd accepts a mismatched curve/hash pair on the
+  request, so callers written against it may need the request corrected.
 - AES-GCM accepts any non-empty IV length and the authentication tag
   lengths 32, 64, 96, 104, 112, 120, and 128 bits.
 - RSA-OAEP accepts SHA-1, SHA-256, SHA-384, and SHA-512. A nonempty label
@@ -360,6 +363,10 @@ The `tail` and `email` handlers are unavailable.
   algorithm. A signature from one spelling verifies under the other.
 - X25519 derives bits and keys. A peer key of a low order gives a shared
   secret of all zero bytes, so `deriveBits()` rejects that key instead.
+- A `CryptoKey`'s `algorithm` and `usages` are fresh frozen copies on each
+  read, and the key's state is held outside the JavaScript object. Assigning
+  to the copy throws in strict mode, where workerd's socket copy accepts the
+  assignment and ignores it; the key's behaviour is the same either way.
 - An Ed25519 or X25519 public key uses its 32-byte point for the `raw`
   format, so `importKey()` and `exportKey()` both carry the point alone.
 - An EC public key imports and exports the uncompressed point as `raw`.

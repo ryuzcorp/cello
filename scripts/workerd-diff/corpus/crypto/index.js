@@ -283,6 +283,67 @@ export default {
       return Response.json(out);
     }
 
+    if (path === "/isolation") {
+      // Attack probes whose outcome agrees with workerd: the material is not
+      // reachable, the constructor refuses guests, a prototype-only forgery is
+      // not a CryptoKey, and a non-extractable key cannot be exported.
+      const key = await crypto.subtle.importKey("raw", utf8("s"), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+      out.materialType = typeof key.__celloMaterial;
+      out.ownNames = Object.getOwnPropertyNames(key).sort();
+      out.constructor = attemptSync(() => new CryptoKey("secret", { name: "HMAC" }, false, ["sign"], {}));
+      const forged = Object.create(CryptoKey.prototype);
+      Object.assign(forged, {
+        type: "secret", algorithm: key.algorithm, extractable: false,
+        usages: ["sign"], __celloMaterial: { bytes: utf8("s") },
+      });
+      out.forgedSign = await attempt(() => crypto.subtle.sign("HMAC", forged, utf8("m")));
+      out.forgedWrap = await attempt(() => crypto.subtle.wrapKey("raw", forged, key, { name: "AES-GCM", iv: new Uint8Array(12) }));
+      out.exportNonExtractable = await attempt(() => crypto.subtle.exportKey("raw", key));
+      const verifyOnly = await crypto.subtle.importKey("raw", utf8("s"), { name: "HMAC", hash: "SHA-256" }, false, ["verify"]);
+      out.verifyOnlySign = await attempt(() => crypto.subtle.sign("HMAC", verifyOnly, utf8("m")));
+      return Response.json(out);
+    }
+
+    if (path === "/isolation-strict") {
+      // The Cello-only side of the same contract (workerd's own properties are
+      // mutable and its sign reads internal slots; Cello serves frozen copies,
+      // so a mutation attempt throws). Driven by the Rust conformance test.
+      const key = await crypto.subtle.importKey("raw", utf8("s"), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+      const before = hex(await crypto.subtle.sign("HMAC", key, utf8("m")));
+      let mutate = "ok";
+      try {
+        key.algorithm.hash.name = "SHA-1";
+      } catch (error) {
+        mutate = `${error.name}: ${error.message}`;
+      }
+      const after = hex(await crypto.subtle.sign("HMAC", key, utf8("m")));
+      let push = "ok";
+      try {
+        key.usages.push("verify");
+      } catch (error) {
+        push = `${error.name}: ${error.message}`;
+      }
+      const clone = structuredClone(
+        await crypto.subtle.importKey("raw", utf8("s"), { name: "HMAC", hash: "SHA-256" }, false, ["verify"]));
+      out.mutation = {
+        before, after, same: before === after, reported: key.algorithm.hash.name,
+      };
+      out.mutateThrew = mutate !== "ok";
+      out.pushThrew = push !== "ok";
+      out.usernameAfterPush = key.usages;
+      out.cloneUsages = clone.usages;
+      out.cloneSign = await attempt(() => crypto.subtle.sign("HMAC", clone, utf8("m")));
+      out.algorithmFrozen = Object.isFrozen(key.algorithm) && Object.isFrozen(key.algorithm.hash);
+      out.usagesFrozen = Object.isFrozen(key.usages);
+      const descriptor = Object.getOwnPropertyDescriptor(key, "algorithm");
+      out.descriptor = {
+        accessor: descriptor.get !== undefined,
+        enumerable: descriptor.enumerable,
+        configurable: descriptor.configurable,
+      };
+      return Response.json(out);
+    }
+
     if (path === "/gcm") {
       const key = await crypto.subtle.importKey("raw", new Uint8Array(16).fill(1), "AES-GCM", true, ["encrypt", "decrypt"]);
       for (const length of [0, 1, 2, 3, 4, 8, 11, 12, 13, 15, 16, 17, 24, 32, 64, 128, 129]) {
@@ -304,6 +365,8 @@ export default {
       // Deterministic BoringSSL vectors across the lengths the old
       // fixed-type implementation could not take.
       const vectors = [
+        [new Uint8Array(12).fill(2), 32],
+        [new Uint8Array(12).fill(2), 64],
         [new Uint8Array([1, 2, 3, 4]), 128],
         [new Uint8Array([9]), 32],
         [new Uint8Array([1, 2, 3]), 64],

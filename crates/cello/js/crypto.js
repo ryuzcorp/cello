@@ -121,9 +121,11 @@
   // when it does not match the key. Web IDL keeps the string the caller wrote;
   // only the comparison is case-insensitive.
   function _requestedAlgorithmName(algorithm) {
-    if (typeof algorithm === "string") return algorithm;
-    const name = algorithm?.name;
-    return name === undefined ? undefined : String(name);
+    if (algorithm !== null && typeof algorithm === "object") {
+      const name = algorithm.name;
+      return name === undefined ? "" : String(name);
+    }
+    return String(algorithm);
   }
 
   // Web IDL argument errors, in workerd's exact text: a Worker that catches a
@@ -146,7 +148,9 @@
   }
 
   function _requireCryptoKey(method, index, key) {
-    if (!(key instanceof CryptoKey)) {
+    // Internal-slot membership, not `instanceof`: a forged object with
+    // `CryptoKey.prototype` in its chain has no slots and is refused.
+    if (!_KEY_SLOTS.has(key)) {
       throw _argumentTypeError(method, index, "CryptoKey");
     }
     return key;
@@ -260,10 +264,20 @@
   // requested algorithm must name the key's own, then the key must list the
   // operation's usage. A key used beyond its declared usages is the security
   // bug this guards (issue #197).
+  // `NODE-ED25519` is Cloudflare's pre-standard spelling of `Ed25519`; the
+  // two name one algorithm for the key-match check (the reported name keeps
+  // the caller's spelling).
+  function _canonicalAlgorithmName(name) {
+    const upper = String(name ?? "").toUpperCase();
+    return upper === "NODE-ED25519" ? "ED25519" : upper;
+  }
+
   function _checkKeyUsage(key, requestedName, usage) {
-    const keyName = String(key.algorithm?.name ?? "");
+    const slots = _keySlots(key);
+    const keyName = String(slots.algorithm?.name ?? "");
     if (
-      String(requestedName ?? "").toUpperCase() !== keyName.toUpperCase()
+      _canonicalAlgorithmName(requestedName) !==
+        _canonicalAlgorithmName(keyName)
     ) {
       throw new DOMException(
         `Requested algorithm "${requestedName}" does not match this ` +
@@ -271,7 +285,7 @@
         "InvalidAccessError",
       );
     }
-    if (!Array.from(key.usages).includes(usage)) {
+    if (!slots.usages.includes(usage)) {
       throw new DOMException(
         `Requested key usage "${usage}" does not match any usage listed in ` +
           "this CryptoKey.",
@@ -282,7 +296,8 @@
 
   function _notExtractable(key) {
     return new DOMException(
-      `Attempt to export non-extractable ${String(key.algorithm?.name)} key.`,
+      `Attempt to export non-extractable ` +
+        `${String(_keySlots(key).algorithm?.name)} key.`,
       "InvalidAccessError",
     );
   }
@@ -311,21 +326,71 @@
     return Array.from(label);
   }
 
+  // A key's state lives only in these internal slots. The JS properties are
+  // fresh copies built from the slots on every read, so guest code can
+  // neither see the material of a non-extractable key nor change what an
+  // operation uses by mutating a returned dictionary (issue #197's review).
+  const _KEY_SLOTS = new WeakMap();
+  const _KEY_CONSTRUCTION = Symbol("CryptoKey construction");
+
+  function _keySlots(key) {
+    const slots = _KEY_SLOTS.get(key);
+    if (slots === undefined) throw new TypeError("Illegal invocation");
+    return slots;
+  }
+
+  // A detached copy of a key algorithm dictionary: arrays and typed arrays
+  // are new, and the dictionaries are frozen so a mutation cannot reach the
+  // slots. `Object.freeze` throws on a typed array with elements, so views
+  // are copied but left extensible.
+  function _copyKeyAlgorithm(value) {
+    if (ArrayBuffer.isView(value)) return value.slice();
+    if (Array.isArray(value)) {
+      return Object.freeze(value.map(_copyKeyAlgorithm));
+    }
+    if (value !== null && typeof value === "object") {
+      const copy = {};
+      for (const [name, member] of Object.entries(value)) {
+        copy[name] = _copyKeyAlgorithm(member);
+      }
+      return Object.freeze(copy);
+    }
+    return value;
+  }
+
   class CryptoKey {
-    constructor(type, algorithm, extractable, usages, material) {
+    constructor(token, type, algorithm, extractable, usages, material) {
+      if (token !== _KEY_CONSTRUCTION) {
+        throw new TypeError("Illegal constructor");
+      }
+      _KEY_SLOTS.set(this, {
+        type,
+        algorithm,
+        extractable: Boolean(extractable),
+        usages: Object.freeze(Array.from(usages || [])),
+        material,
+      });
+      // Own enumerable accessors, so `Object.keys(key)` lists the four
+      // attributes as workerd's own properties do; each read answers from
+      // the slots, never from guest-writable state.
+      const getter = (read) => ({
+        get() { return read(_keySlots(this)); },
+        enumerable: true,
+        configurable: true,
+      });
       Object.defineProperties(this, {
-        type: { value: type, enumerable: true },
-        algorithm: { value: algorithm, enumerable: true },
-        extractable: { value: Boolean(extractable), enumerable: true },
-        usages: { value: Object.freeze(Array.from(usages || [])), enumerable: true },
-        __celloMaterial: { value: material },
+        type: getter((slots) => slots.type),
+        algorithm: getter((slots) => _copyKeyAlgorithm(slots.algorithm)),
+        extractable: getter((slots) => slots.extractable),
+        usages: getter((slots) => Object.freeze(Array.from(slots.usages))),
       });
     }
     get [Symbol.toStringTag]() { return "CryptoKey"; }
   }
 
   function _makeKey(type, algorithm, extractable, usages, material) {
-    return new CryptoKey(type, algorithm, extractable, usages, material);
+    return new CryptoKey(
+      _KEY_CONSTRUCTION, type, algorithm, extractable, usages, material);
   }
 
   // Web Crypto reports a key's algorithm as its *KeyAlgorithm dictionary,
@@ -455,7 +520,7 @@
     const run = encrypting ? _aesEncrypt : _aesDecrypt;
     const out = run(
       name,
-      key.__celloMaterial.bytes,
+      _keySlots(key).material.bytes,
       ivBytes,
       _toBuf(data),
       name === "AES-GCM"
@@ -475,16 +540,16 @@
     get [Symbol.toStringTag]() { return "SubtleCrypto"; }
 
     async digest(algorithm, data) {
-      // Web IDL's union conversion: an absent argument is not a
-      // `string or HashAlgorithm`, while an explicit null cannot initialize
-      // the dictionary, and workerd names the two cases differently.
-      if (algorithm === undefined) {
+      // Web IDL's union conversion: an omitted argument is not a
+      // `string or HashAlgorithm`, while an explicit undefined or null cannot
+      // initialize the dictionary, and workerd names the cases differently.
+      if (arguments.length === 0) {
         throw new TypeError(
           "Failed to execute 'digest' on 'SubtleCrypto': parameter 1 is not " +
             "of type 'string or HashAlgorithm'.",
         );
       }
-      if (algorithm === null) {
+      if (algorithm === undefined || algorithm === null) {
         throw new TypeError(
           "Cannot initialize HashAlgorithm with required members from an " +
             "undefined or null value.",
@@ -500,6 +565,27 @@
     }
 
     async importKey(format, keyData, algorithm, extractable, usages) {
+      // Web IDL converts `keyData` (parameter 2) before the algorithm
+      // (parameter 3). A buffer-based format needs a BufferSource, `jwk`
+      // needs a JsonWebKey; workerd words each case.
+      const isBuffer =
+        keyData instanceof ArrayBuffer || ArrayBuffer.isView(keyData);
+      if (keyData === undefined || keyData === null) {
+        throw new TypeError(
+          "Cannot initialize JsonWebKey with required members from an " +
+            "undefined or null value.",
+        );
+      }
+      if (!isBuffer && typeof keyData !== "object") {
+        throw _argumentTypeError(
+          "importKey", 2, "BufferSource or JsonWebKey");
+      }
+      if (!isBuffer && format !== "jwk") {
+        throw new TypeError(
+          "Import data provided for buffer-based import formats must be a " +
+            "buffer source.",
+        );
+      }
       _requireAlgorithm(algorithm, "ImportKeyAlgorithm");
       const name = _algorithmName(algorithm);
       const requested = _requireUsages("importKey", 5, usages);
@@ -694,11 +780,14 @@
           },
         );
       }
-      throw _notSupported("unsupported key import");
+      throw _notSupported(
+        `Unrecognized key import algorithm ` +
+          `"${_requestedAlgorithmName(algorithm)}" requested.`);
     }
 
     async exportKey(format, key) {
       _requireCryptoKey("exportKey", 2, key);
+      const slots = _keySlots(key);
       // The `raw` form of a Secure Curves public key is its 32-byte point,
       // and of an EC public key its uncompressed SEC1 point. The branch
       // below answers every `raw` request from the stored bytes, which for
@@ -706,60 +795,60 @@
       // X25519 peer key exports as 44 bytes that no counterpart can read,
       // and an EC key as 91 bytes of SPKI, and nothing reports an error.
       if (format === "raw" && key?.type === "public" &&
-          (key.__celloMaterial?.keyType === "ed25519" ||
-            key.__celloMaterial?.keyType === "x25519" ||
-            key.__celloMaterial?.keyType === "ec")) {
-        if (!key.extractable) {
+          (slots.material?.keyType === "ed25519" ||
+            slots.material?.keyType === "x25519" ||
+            slots.material?.keyType === "ec")) {
+        if (!slots.extractable) {
           throw _notExtractable(key);
         }
         return Uint8Array.from(_extra("asym-key-raw-public", {
-          der: Array.from(key.__celloMaterial.bytes),
+          der: Array.from(slots.material.bytes),
         }).bytes).buffer;
       }
-      if (format === "raw" && key?.__celloMaterial?.bytes) {
-        if (!key.extractable) {
+      if (format === "raw" && slots.material?.bytes) {
+        if (!slots.extractable) {
           throw _notExtractable(key);
         }
-        const raw = key.__celloMaterial.bytes;
+        const raw = slots.material.bytes;
         return raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength);
       }
       // A symmetric key exports as `{"kty":"oct",...}` from its bytes, with
       // the JOSE `alg` for its algorithm and length. Lengths with no JOSE
       // name export without one rather than with a wrong one.
       if (format === "jwk" && key?.type === "secret" &&
-          key?.__celloMaterial?.bytes !== undefined &&
-          key?.__celloMaterial?.keyType === undefined) {
-        if (!key.extractable) {
+          slots.material?.bytes !== undefined &&
+          slots.material?.keyType === undefined) {
+        if (!slots.extractable) {
           throw _notExtractable(key);
         }
-        const bytes = key.__celloMaterial.bytes;
-        const name = key.algorithm?.name;
+        const bytes = slots.material.bytes;
+        const name = slots.algorithm?.name;
         const jwk = {
           kty: "oct",
           k: _b64urlEncode(bytes),
-          key_ops: Array.from(key.usages),
+          key_ops: Array.from(slots.usages),
           ext: true,
         };
         const alg = _secretJwkAlg(
           String(name ?? "").toUpperCase(), bytes,
-          _hashName(key.algorithm?.hash));
+          _hashName(slots.algorithm?.hash));
         if (alg !== undefined) jwk.alg = alg;
         return jwk;
       }
-      if (format === "jwk" && key?.__celloMaterial?.jwk) {
-        if (!key.extractable) {
+      if (format === "jwk" && slots.material?.jwk) {
+        if (!slots.extractable) {
           throw _notExtractable(key);
         }
-        return structuredClone(key.__celloMaterial.jwk);
+        return structuredClone(slots.material.jwk);
       }
       // Asymmetric keys export from their normalized DER: spki and pkcs8 as
       // they are stored, jwk through the host.
-      const material = key?.__celloMaterial;
+      const material = slots.material;
       if (material?.keyType !== undefined) {
-        if (!key.extractable) {
+        if (!slots.extractable) {
           throw _notExtractable(key);
         }
-        const visibility = key.type;
+        const visibility = slots.type;
         if (format === "jwk") {
           return _extra("asym-key-export", {
             der: Array.from(material.bytes),
@@ -772,7 +861,7 @@
           return der.buffer.slice(der.byteOffset, der.byteOffset + der.byteLength);
         }
       }
-      if (!key.extractable) throw _notExtractable(key);
+      if (!slots.extractable) throw _notExtractable(key);
       throw _notSupported("unsupported key export");
     }
 
@@ -818,7 +907,7 @@
         if (!_DIGEST_ALGS.has(hash)) {
           throw _notSupported("unsupported " + name + " hash: " + hash);
         }
-        const ikm = baseKey.__celloMaterial.bytes;
+        const ikm = _keySlots(baseKey).material.bytes;
         const salt = _toBuf(algorithm?.salt ?? new Uint8Array());
         let out;
         if (name === "HKDF") {
@@ -845,7 +934,7 @@
         throw _notSupported("unsupported derive algorithm: " + name);
       }
       const publicKey = algorithm?.public;
-      if (!publicKey || publicKey.type !== "public") {
+      if (!_KEY_SLOTS.has(publicKey) || _keySlots(publicKey).type !== "public") {
         throw new TypeError(name + " requires a public key in algorithm.public");
       }
       // X25519 carries no `namedCurve`, so it cannot ride the curve match
@@ -853,8 +942,8 @@
       // answer the raw shared secret, so everything below is shared.
       const shared = Uint8Array.from(_extra(
         name === "X25519" ? "x25519-derive" : "ecdh-derive", {
-          private: Array.from(_toBuf(baseKey.__celloMaterial.bytes)),
-          public: Array.from(_toBuf(publicKey.__celloMaterial.bytes)),
+          private: Array.from(_toBuf(_keySlots(baseKey).material.bytes)),
+          public: Array.from(_toBuf(_keySlots(publicKey).material.bytes)),
         }).bytes);
       if (length === null || length === undefined) return shared.buffer;
       const bytes = Number(length) / 8;
@@ -1022,9 +1111,18 @@
       const bytes = _toBuf(_requireBufferSource("sign", 3, data));
       const name = _algorithmName(algorithm);
       _checkKeyUsage(key, requested, "sign");
+      // Web Crypto makes the RSA-PSS salt an explicit parameter on both
+      // halves; workerd refuses to sign or verify without it.
+      if (name === "RSA-PSS" && algorithm?.saltLength === undefined) {
+        throw new DOMException(
+          "Failed to provide salt for RSA-PSS key operation which requires " +
+            "a salt",
+          "DataError",
+        );
+      }
       if (name === "HMAC") {
-        const hash = _hashName(key?.algorithm?.hash);
-        const sig = _hmacSign(hash, key.__celloMaterial.bytes, bytes);
+        const hash = _hashName(_keySlots(key).algorithm?.hash);
+        const sig = _hmacSign(hash, _keySlots(key).material.bytes, bytes);
         if (!sig) throw _operationError("HMAC sign failed");
         return sig.buffer.slice(sig.byteOffset, sig.byteOffset + sig.byteLength);
       }
@@ -1039,19 +1137,20 @@
               : null;
       if (!operation) throw _notSupported("unsupported sign algorithm: " + name);
       if (name === "ECDSA") {
-        if (_canonicalEcCurve(key?.algorithm?.namedCurve) !== "P-256") {
+        if (_canonicalEcCurve(_keySlots(key).algorithm?.namedCurve) !== "P-256") {
           throw _notSupported("ECDSA signatures support only P-256");
         }
         if (_hashName(algorithm?.hash) !== "SHA-256") {
           throw _notSupported("ECDSA P-256 supports only SHA-256");
         }
       }
+      const slots = _keySlots(key);
       const result = _extra(operation, {
-        key: Array.from(key?.__celloMaterial?.bytes || []),
+        key: Array.from(slots.material?.bytes || []),
         data: Array.from(bytes),
         // RSA carries its hash on the key; the others ignore the field.
-        hash: _hashName(key?.algorithm?.hash),
-        saltLength: Number(algorithm?.saltLength ?? 0),
+        hash: _hashName(slots.algorithm?.hash),
+        saltLength: Number(algorithm?.saltLength),
       });
       return Uint8Array.from(result.bytes).buffer;
     }
@@ -1064,10 +1163,16 @@
       const dataBytes = _toBuf(_requireBufferSource("verify", 4, data));
       const name = _algorithmName(algorithm);
       _checkKeyUsage(key, requested, "verify");
+      if (name === "RSA-PSS" && algorithm?.saltLength === undefined) {
+        throw new TypeError(
+          "Failed to provide salt for RSA-PSS key operation which requires " +
+            "a salt",
+        );
+      }
       if (name === "HMAC") {
         return _hmacVerify(
-          _hashName(key?.algorithm?.hash),
-          key.__celloMaterial.bytes,
+          _hashName(_keySlots(key).algorithm?.hash),
+          _keySlots(key).material.bytes,
           signatureBytes,
           dataBytes,
         );
@@ -1088,10 +1193,11 @@
       if (!operation) {
         throw _notSupported("unsupported verify algorithm: " + name);
       }
-      const material = key?.__celloMaterial?.bytes;
+      const slots = _keySlots(key);
+      const material = slots.material?.bytes;
       if (!material) throw _notSupported("verify needs an spki public key");
       if (name === "ECDSA") {
-        if (_canonicalEcCurve(key?.algorithm?.namedCurve) !== "P-256") {
+        if (_canonicalEcCurve(_keySlots(key).algorithm?.namedCurve) !== "P-256") {
           throw _notSupported("ECDSA signatures support only P-256");
         }
         if (_hashName(algorithm?.hash) !== "SHA-256") {
@@ -1104,8 +1210,11 @@
         signature: Array.from(signatureBytes),
         // ECDSA carries its hash on the call, RSASSA on the key.
         hash: _hashName(
-          name === "ECDSA" ? algorithm?.hash : key?.algorithm?.hash,
+          name === "ECDSA" ? algorithm?.hash : slots.algorithm?.hash,
         ),
+        // RSA-PSS verification is bound to the salt length the caller names;
+        // a signature whose salt differs must not verify.
+        saltLength: name === "RSA-PSS" ? Number(algorithm?.saltLength) : 0,
       }).ok;
     }
 
@@ -1129,12 +1238,12 @@
         return _aes(name, algorithm, key, bytes, true);
       }
       if (name === "RSA-OAEP") {
-        const hash = _hashName(key?.algorithm?.hash);
+        const hash = _hashName(_keySlots(key).algorithm?.hash);
         if (!_RSA_OAEP_HASHES.has(hash)) {
           throw _notSupported("unsupported RSA-OAEP hash: " + hash);
         }
         const result = _extra("rsa-oaep-encrypt", {
-          key: Array.from(key?.__celloMaterial?.bytes || []),
+          key: Array.from(_keySlots(key).material?.bytes || []),
           data: Array.from(bytes),
           hash,
           label: _rsaOaepLabel(algorithm),
@@ -1167,13 +1276,13 @@
           : exported,
       );
       if (name === "AES-KW") {
-        if (wrappingKey.type !== "secret") {
+        if (_keySlots(wrappingKey).type !== "secret") {
           throw new DOMException(
             "AES-KW wrapping key must be a secret key", "InvalidAccessError");
         }
         try {
           const out = _extra("aes-kw-wrap", {
-            key: Array.from(wrappingKey.__celloMaterial.bytes),
+            key: Array.from(_keySlots(wrappingKey).material.bytes),
             data: Array.from(raw),
           });
           return Uint8Array.from(out.bytes).buffer;
@@ -1196,7 +1305,7 @@
       _checkKeyUsage(unwrappingKey, requested, "unwrapKey");
       if (_AES_MODES.has(name)) _aesValidate(name, unwrapAlgorithm, false);
       if (name === "AES-KW") {
-        if (unwrappingKey.type !== "secret") {
+        if (_keySlots(unwrappingKey).type !== "secret") {
           throw new DOMException(
             "AES-KW unwrapping key must be a secret key",
             "InvalidAccessError");
@@ -1204,7 +1313,7 @@
         let raw;
         try {
           const out = _extra("aes-kw-unwrap", {
-            key: Array.from(unwrappingKey.__celloMaterial.bytes),
+            key: Array.from(_keySlots(unwrappingKey).material.bytes),
             data: Array.from(wrappedBytes),
           });
           raw = Uint8Array.from(out.bytes);
@@ -1240,12 +1349,12 @@
         return _aes(name, algorithm, key, bytes, false);
       }
       if (name === "RSA-OAEP") {
-        const hash = _hashName(key?.algorithm?.hash);
+        const hash = _hashName(_keySlots(key).algorithm?.hash);
         if (!_RSA_OAEP_HASHES.has(hash)) {
           throw _notSupported("unsupported RSA-OAEP hash: " + hash);
         }
         const result = _extra("rsa-oaep-decrypt", {
-          key: Array.from(key?.__celloMaterial?.bytes || []),
+          key: Array.from(_keySlots(key).material?.bytes || []),
           data: Array.from(bytes),
           hash,
           label: _rsaOaepLabel(algorithm),
@@ -1397,4 +1506,8 @@
   // the module is lazy, so it always resolves after this script runs.
   __cello.$$keyAlgorithm = _keyAlgorithm;
   __cello.$$canonicalEcCurve = _canonicalEcCurve;
+  // The clone reviver and node:crypto construct and read keys through these;
+  // guest modules cannot reach `__cello`, and the slots never leave it.
+  __cello.$$makeCryptoKey = _makeKey;
+  __cello.$$cryptoKeyMaterial = (key) => _KEY_SLOTS.get(key)?.material;
 })();

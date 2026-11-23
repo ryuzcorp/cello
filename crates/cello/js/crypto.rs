@@ -862,10 +862,9 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
             };
             Ok(serde_json::json!({ "ok": ok }))
         }
-        // Web Crypto RSA-PSS. Signing takes the caller's salt length —
-        // the spec makes it an explicit parameter — and verification
-        // recovers the salt length from the signature, which accepts
-        // every salt the signer could legally have used.
+        // Web Crypto RSA-PSS. Both halves take the caller's salt length:
+        // verification with a different salt than the signer used must fail,
+        // as it does on workerd.
         "rsa-pss-sign" => {
             use rsa::pkcs8::DecodePrivateKey;
             use rsa::signature::RandomizedSigner;
@@ -908,11 +907,15 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("SHA-256")
                 .to_string();
+            let salt_len = args
+                .get("saltLength")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize;
             let key = rsa::RsaPublicKey::from_public_key_der(&key)
                 .map_err(|_| anyhow!("invalid RSA SPKI key"))?;
             macro_rules! verify {
                 ($hash:ty) => {{
-                    let key = rsa::pss::VerifyingKey::<$hash>::new(key);
+                    let key = rsa::pss::VerifyingKey::<$hash>::new_with_salt_len(key, salt_len);
                     rsa::pss::Signature::try_from(signature.as_slice())
                         .map(|signature| key.verify(&data, &signature).is_ok())
                         .unwrap_or(false)
@@ -2021,13 +2024,16 @@ pub(super) fn op_webcrypto_hmac_verify(
 /// AES-GCM for the Web Crypto ops.
 ///
 /// Web Crypto permits any non-empty IV length; 96 bits is the recommendation,
-/// not the rule. The `aes-gcm` crate fixes the nonce and tag sizes in the type,
-/// so it can only be instantiated for 12- and 16-byte IVs with 12..=16-byte
-/// tags. Workerd accepts every length (the sweep measured 1 through 65536-byte
-/// IVs and 4- and 8-byte tags), so the mode is implemented here over the same
-/// `aes` and `ghash` crates the AEAD uses, following NIST SP 800-38D section
-/// 7.2 for J0 and the counter. A 96-bit IV is J0 verbatim with the counter
-/// 1; every other length is `GHASH(IV || 0^s || [len(IV)]64)`.
+/// not the rule. A 96-bit IV goes through the audited `aes-gcm` AEAD: the
+/// crate's types fix the tag length, so the full 16-byte tag is truncated to
+/// the caller's prefix. For a 4- or 8-byte tag the crate cannot verify a
+/// truncated tag directly, so the plaintext is recovered with the counter and
+/// re-encrypted through the crate, whose GHASH then authenticates it.
+///
+/// Any other IV length cannot be expressed in the crate's type, so it is
+/// implemented here over the same `aes` and `ghash` crates, following NIST
+/// SP 800-38D section 7.2 for J0 and the counter. Workerd accepts every length
+/// (the sweep measured 1 through 65536-byte IVs and 4- and 8-byte tags).
 ///
 /// An empty IV and an unsupported tag length are rejected in the JS layer, by
 /// name, before reaching here; the guards below keep the op safe to call
@@ -2040,6 +2046,9 @@ fn webcrypto_aes_gcm(
     tag_size: usize,
     encrypting: bool,
 ) -> Option<Vec<u8>> {
+    if iv.is_empty() || !matches!(tag_size, 4 | 8 | 12 | 13 | 14 | 15 | 16) {
+        return None;
+    }
     match key.len() {
         16 => webcrypto_aes_gcm_with::<aes::Aes128>(
             key,
@@ -2077,31 +2086,29 @@ where
         + aes::cipher::KeyInit
         + aes::cipher::BlockSizeUser<BlockSize = aes::cipher::generic_array::typenum::U16>,
 {
+    if iv.len() == 12 {
+        return webcrypto_aes_gcm_96::<C>(key, iv, additional_data, data, tag_size, encrypting);
+    }
+
     use aes::cipher::KeyInit;
     use ghash::universal_hash::UniversalHash;
+    use subtle::ConstantTimeEq;
 
-    if iv.is_empty() || !matches!(tag_size, 4 | 8 | 12 | 13 | 14 | 15 | 16) {
-        return None;
-    }
     let cipher = <C as KeyInit>::new_from_slice(key).ok()?;
 
     // H = E_K(0^128) keys GHASH; J0 is the initial counter block.
     let mut h = ghash::Block::default();
     cipher.encrypt_block(&mut h);
     let ghash = ghash::GHash::new(&h);
-    let j0 = if iv.len() == 12 {
-        let mut block = ghash::Block::default();
-        block[..12].copy_from_slice(iv);
-        block[15] = 1;
-        block
-    } else {
+    let mut j0 = ghash::Block::default();
+    {
         let mut hash = ghash.clone();
         hash.update_padded(iv);
         let mut length = ghash::Block::default();
         length[8..].copy_from_slice(&((iv.len() as u64) * 8).to_be_bytes());
         hash.update(&[length]);
-        hash.finalize()
-    };
+        j0.copy_from_slice(&hash.finalize());
+    }
 
     // The tag mask is the keystream block at J0 itself.
     let mut mask = j0;
@@ -2133,17 +2140,88 @@ where
         let (body, provided) = data.split_at(split);
         let expected = tag_for(body);
         // The tag comparison is constant time: no early exit on a mismatch.
-        let mut difference = 0u8;
-        for (left, right) in expected[..tag_size].iter().zip(provided) {
-            difference |= left ^ right;
-        }
-        if difference != 0 {
+        if expected[..tag_size].ct_eq(provided).unwrap_u8() == 0 {
             return None;
         }
         let mut out = body.to_vec();
         ctr32_apply(&cipher, &j0, &mut out)?;
         Some(out)
     }
+}
+
+/// The 96-bit-IV arm, through the audited AEAD. The crate's tag types start at
+/// 12 bytes; a shorter tag keeps the crate for the GHASH and compares the
+/// truncated prefix in constant time.
+fn webcrypto_aes_gcm_96<C>(
+    key: &[u8],
+    iv: &[u8],
+    additional_data: &[u8],
+    data: &[u8],
+    tag_size: usize,
+    encrypting: bool,
+) -> Option<Vec<u8>>
+where
+    C: aes::cipher::BlockCipher
+        + aes::cipher::BlockEncrypt
+        + aes::cipher::KeyInit
+        + aes::cipher::BlockSizeUser<BlockSize = aes::cipher::generic_array::typenum::U16>,
+{
+    use aes_gcm::aead::consts::{U12, U13, U14, U15, U16};
+    use aes_gcm::aead::{AeadInPlace, KeyInit};
+    use subtle::ConstantTimeEq;
+
+    let nonce = aes_gcm::Nonce::<U12>::from_slice(iv);
+    if encrypting {
+        let cipher = aes_gcm::AesGcm::<C, U12, U16>::new_from_slice(key).ok()?;
+        let mut out = data.to_vec();
+        let tag = cipher
+            .encrypt_in_place_detached(nonce, additional_data, &mut out)
+            .ok()?;
+        out.extend_from_slice(&tag[..tag_size]);
+        return Some(out);
+    }
+
+    let split = data.len().checked_sub(tag_size)?;
+    let (body, provided) = data.split_at(split);
+    if tag_size >= 12 {
+        macro_rules! open {
+            ($tag_size:ty) => {{
+                let cipher = aes_gcm::AesGcm::<C, U12, $tag_size>::new_from_slice(key).ok()?;
+                let tag = aes_gcm::Tag::<$tag_size>::clone_from_slice(provided);
+                let mut out = body.to_vec();
+                cipher
+                    .decrypt_in_place_detached(nonce, additional_data, &mut out, &tag)
+                    .ok()?;
+                Some(out)
+            }};
+        }
+        return match tag_size {
+            12 => open!(U12),
+            13 => open!(U13),
+            14 => open!(U14),
+            15 => open!(U15),
+            _ => open!(U16),
+        };
+    }
+
+    // A 4- or 8-byte tag: recover the plaintext with the counter, then let the
+    // crate authenticate the ciphertext by re-encrypting it, and compare the
+    // tag's truncated prefix in constant time.
+    let cipher = <C as KeyInit>::new_from_slice(key).ok()?;
+    let mut j0 = ghash::Block::default();
+    j0[..12].copy_from_slice(iv);
+    j0[15] = 1;
+    let mut plaintext = body.to_vec();
+    ctr32_apply(&cipher, &j0, &mut plaintext)?;
+    let gcm = aes_gcm::AesGcm::<C, U12, U16>::new_from_slice(key).ok()?;
+    let mut check = plaintext.clone();
+    let tag = gcm
+        .encrypt_in_place_detached(nonce, additional_data, &mut check)
+        .ok()?;
+    if tag[..tag_size].ct_eq(provided).unwrap_u8() == 0 {
+        return None;
+    }
+    Some(plaintext)
 }
 
 /// XORs `buffer` with the GCM counter-mode keystream, which starts one block
@@ -2459,7 +2537,11 @@ mod aes_gcm_tests {
         let key = [1u8; 16];
         let aad = b"aad";
         let plaintext = b"payload";
-        let cases: [(&[u8], usize, &str); 6] = [
+        let cases: [(&[u8], usize, &str); 8] = [
+            // 96-bit IVs go through the audited AEAD, including the truncated
+            // 4- and 8-byte tags it does not type directly.
+            (&[2; 12], 4, "2385690fa94f22d18d4735"),
+            (&[2; 12], 8, "2385690fa94f22d18d4735ddda1cf3"),
             (
                 &[1, 2, 3, 4],
                 16,
