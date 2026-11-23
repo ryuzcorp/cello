@@ -1135,6 +1135,26 @@ pub(super) fn op_storage_sync_list_next(
 
 struct StorageValueDelegate;
 
+/// Throw what Workerd's storage clone throws: a `DOMException` named
+/// `DataCloneError` ("() => 1 could not be cloned."), not the `TypeError`
+/// V8's serializer raises by default. The message comes from V8; only the
+/// class changes. `DOMException` is the harness class in this realm, so it is
+/// looked up rather than constructed natively; a realm without it (early
+/// bootstrap) falls back to the plain V8 error.
+fn throw_storage_data_clone_error(scope: &mut v8::PinScope, message: v8::Local<v8::String>) {
+    let global = scope.get_current_context().global(scope);
+    let exception = v8::String::new(scope, "DOMException")
+        .and_then(|key| global.get(scope, key.into()))
+        .and_then(|ctor| v8::Local::<v8::Function>::try_from(ctor).ok())
+        .and_then(|ctor| {
+            let name = v8::String::new(scope, "DataCloneError")?;
+            ctor.new_instance(scope, &[message.into(), name.into()])
+                .map(Into::into)
+        })
+        .unwrap_or_else(|| v8::Exception::type_error(scope, message));
+    scope.throw_exception(exception);
+}
+
 impl v8::ValueSerializerImpl for StorageValueDelegate {
     fn throw_data_clone_error(&self, scope: &mut v8::PinScope, message: v8::Local<v8::String>) {
         throw_storage_data_clone_error(scope, message);
