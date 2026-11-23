@@ -89,8 +89,10 @@ enum ZlibStream {
     // Workerd's brotli stream: quality 5 with a 19-bit window reproduces its
     // bytes exactly (measured against workerd 1.20261121.1 for several
     // inputs; qualities 5 and 6 are byte-identical on them).
-    BrotliEncode(brotli::CompressorWriter<Vec<u8>>),
-    BrotliDecode(brotli::DecompressorWriter<Vec<u8>>),
+    // Boxed: a brotli encoder is ~5.6 KiB of state, and the enum would
+    // otherwise carry that size in every variant (clippy::large_enum_variant).
+    BrotliEncode(Box<brotli::CompressorWriter<Vec<u8>>>),
+    BrotliDecode(Box<brotli::DecompressorWriter<Vec<u8>>>),
 }
 
 /// The writer types share `write`/`get_ref`/`get_mut` but not `finish`,
@@ -143,7 +145,9 @@ impl ZlibStream {
             ("brotli", false) => {
                 Self::BrotliEncode(brotli::CompressorWriter::new(sink(), 4096, 5, 19))
             }
-            ("brotli", true) => Self::BrotliDecode(brotli::DecompressorWriter::new(sink(), 4096)),
+            ("brotli", true) => {
+                Self::BrotliDecode(Box::new(brotli::DecompressorWriter::new(sink(), 4096)))
+            }
             _ => return None,
         })
     }
