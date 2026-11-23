@@ -6,8 +6,11 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
 
 Two more `WritableStream` divergences from workerd are fixed, and the
 tee-skew conformance test no longer assumes which of a tee's copies the skew
-budget ends. The differential gate gained three cases (45 in total). No
-configuration, data, or bucket-format changes.
+budget ends. A third change is breaking: a Worker can no longer generate code
+at run time (#194), described below. The differential gate gained six cases
+(48 in total). No configuration, data, or bucket-format changes. The `eval`,
+`Function` and wasm runtime-compilation changes are listed after the stream
+fixes because they break bundles that relied on them.
 
 - **A `WritableStream` refuses each state with workerd's own message**
   (#132). A second `writer.close()` on a closed stream reported the shared
@@ -48,6 +51,17 @@ configuration, data, or bucket-format changes.
   scheduling-independent contract: the handler answers, at least one copy
   reports the skew cap, and every copy that reports success carries the whole
   40 MiB.
+
+**Breaking:** a Worker can no longer generate code at run time (#194).
+`eval()`, `new Function()` and `Function(...)` throw `EvalError: Code
+generation from strings disallowed for this context`, and compiling wasm from
+JavaScript bytes — `new WebAssembly.Module(bytes)`, `WebAssembly.compile()`
+and `WebAssembly.instantiate(bytes)` — throws `CompileError: Wasm code
+generation disallowed by embedder`, exactly as on workerd. A bundle that
+evaluated strings on Cello must ship the code it generated. A `.wasm` import
+still gives a compiled `WebAssembly.Module`, and
+`WebAssembly.instantiate()` of an already-compiled module still works;
+`WebAssembly.validate()` is unchanged.
 
 ## v0.2.8
 
