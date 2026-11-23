@@ -1,0 +1,6 @@
+{
+  "name": "crypto",
+  "main": "index.js",
+  "compatibility_date": "2026-11-01",
+  "no_bundle": true
+}

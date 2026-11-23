@@ -184,6 +184,48 @@ disagreeing and answered by the sequence that write recorded, so no repair
 scan runs on open and no stale MD5 survives. No object data is rewritten,
 and `cello dev` opens an existing store in place.
 
+Web Crypto now enforces the usages a `CryptoKey` was created with, validates
+its arguments with workerd's error types and text, and accepts the AES-GCM
+IV and tag lengths workerd accepts. The security-relevant change is the
+first: a key imported for `verify` can no longer sign, and a usage string an
+algorithm does not define is refused at import instead of stored on the key.
+
+- **A `CryptoKey`'s usages are enforced on every operation** (#197).
+  `importKey`, `generateKey` and `deriveKey` now reject a usage the
+  algorithm does not define with a `SyntaxError`, reject a secret or private
+  key with no usage, and store the usages in the algorithm's own order. Every
+  operation (`sign`, `verify`, `encrypt`, `decrypt`, `wrapKey`, `unwrapKey`,
+  `deriveBits`, `deriveKey`) checks the key's algorithm name and its declared
+  usage before doing any work, raising `InvalidAccessError` when either does
+  not match. `sign()` on a verify-only key, `encrypt()` with an Ed25519 key
+  and `unwrapKey()` with a wrap-only KEK now fail as they do on Cloudflare.
+  `deriveKey` requires `deriveKey` on the base key without also requiring
+  `deriveBits`.
+- **Web Crypto argument validation matches workerd** (#198). An absent or
+  `null` algorithm, a non-`CryptoKey` key, a non-`BufferSource` data,
+  signature or IV, an absent `iv`/`counter`, a non-integer
+  `getRandomValues` view and an unknown digest, import format or generation
+  algorithm now raise the same `TypeError`, `NotSupportedError`,
+  `TypeMismatchError` or `QuotaExceededError` with the same message text.
+  The internal `Cannot read properties of undefined` paths in `sign`,
+  `verify`, `encrypt`, `decrypt`, `wrapKey`, `unwrapKey`, `deriveBits` and
+  `exportKey` are gone.
+- **AES-GCM accepts any non-empty IV length and the full tag-length set**
+  (#199). The host implemented the AEAD with a fixed-type nonce, so only
+  12- and 16-byte IVs worked; J0 is now derived per NIST SP 800-38D for any
+  length, and 32- and 64-bit authentication tags are accepted alongside
+  96-128 bits. A payload written on Cloudflare with a short IV now decrypts
+  here.
+- **The non-extractable export error and several `getRandomValues` and AES
+  messages use workerd's wording** (#214). This is text only, apart from
+  `exportKey` now checking extractability before an unknown format.
+
+The differential gate gained five Web Crypto cases (`crypto-usages`,
+`crypto-operations`, `crypto-validation`, `crypto-aes-gcm`, `crypto-values`):
+the usage tables measured against workerd 1.20261121.1, the operation
+checks, the validation probes, the IV and tag ranges, and the digest, HMAC,
+AES-GCM, ECDSA, Ed25519, `getRandomValues`, `timingSafeEqual` and
+`DigestStream` values the earlier sweep already measured as agreeing.
 
 ## v0.2.8
 
