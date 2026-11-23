@@ -309,7 +309,7 @@ Durable Object and WebSocket fixes:
   statement reports 0/0 where workerd reports 1/2; see
   [Durable Objects](../services/durable-objects.md).
 
-The differential gate gained 21 cases across the `do`, `ws`, `ws-legacy`,
+The differential gate gained 23 cases across the `do`, `ws`, `ws-legacy`,
 `ws-hib`, and `queues` fixtures, including a raw-frame WebSocket probe.
 
 One behaviour is deliberately **not** changed: a boolean bound into Durable
