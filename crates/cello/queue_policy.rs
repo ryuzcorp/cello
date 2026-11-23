@@ -224,22 +224,52 @@ pub(crate) fn run(request: &serde_json::Value) -> Result<serde_json::Value> {
         }
         Some("refusal") => {
             let now = integer(request, "now")?;
+            let kind = match request.get("kind").and_then(serde_json::Value::as_str) {
+                Some("budget") => cello_logic::queue::RefusalKind::Budget,
+                Some("pressure") => cello_logic::queue::RefusalKind::Pressure,
+                other => return Err(anyhow!("unknown Queue refusal kind {other:?}")),
+            };
+            let unfittable = request
+                .get("unfittable")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
             let prior = match (
                 optional_integer(request, "priorCount")?,
+                optional_integer(request, "priorStartedAt")?,
                 optional_integer(request, "priorAt")?,
             ) {
-                (Some(count), Some(at)) => Some(cello_logic::queue::RefusalStreak {
-                    count: u16::try_from(count)
-                        .map_err(|_| anyhow!("Queue refusal streak is out of range"))?,
-                    at,
-                }),
+                (Some(count), Some(started_at), Some(at)) => {
+                    let prior_kind =
+                        match request.get("priorKind").and_then(serde_json::Value::as_str) {
+                            Some("budget") => cello_logic::queue::RefusalKind::Budget,
+                            Some("pressure") => cello_logic::queue::RefusalKind::Pressure,
+                            other => return Err(anyhow!("unknown Queue refusal kind {other:?}")),
+                        };
+                    Some(cello_logic::queue::RefusalStreak {
+                        count: u16::try_from(count)
+                            .map_err(|_| anyhow!("Queue refusal streak is out of range"))?,
+                        kind: prior_kind,
+                        started_at,
+                        at,
+                    })
+                }
                 _ => None,
             };
-            let refusal = cello_logic::queue::refuse_batch(now, prior);
+            let refusal = cello_logic::queue::refuse_batch(now, kind, unfittable, prior);
+            let action = match refusal.action {
+                cello_logic::queue::RefusalAction::Release => "release",
+                cello_logic::queue::RefusalAction::ChargeFailure => "charge",
+            };
             Ok(serde_json::json!({
                 "count": refusal.streak.count,
+                "kind": match refusal.streak.kind {
+                    cello_logic::queue::RefusalKind::Budget => "budget",
+                    cello_logic::queue::RefusalKind::Pressure => "pressure",
+                },
+                "startedAt": refusal.streak.started_at,
                 "at": refusal.streak.at,
                 "delayMs": refusal.delay_ms,
+                "action": action,
             }))
         }
         Some("batch") => {

@@ -157,15 +157,20 @@ services, APIs, and Wrangler configuration.
   reduced admission, exactly as it does after a heap-limit hit.
 - A Queue batch is host bytes like any other, so an isolate at its budget
   refuses the batch before the consumer handler runs. The broker does not
-  count that as a delivery: it releases the lease and retries the rows after
-  a backoff (one second, doubling to five, starting over after 30 quiet
-  seconds) instead of immediately, so `message.attempts` stays a count of
-  real deliveries and a refused message never reaches the dead-letter queue.
-  A consumer that throws, calls `retry()`, or leaves its lease to expire
-  still spends an attempt. The residual is an isolate that can never fit a
-  batch: its messages stay in the queue until four-day retention discards
-  them, so size the budget above the largest batch a consumer may receive
-  (100 messages of 128,000 bytes).
+  count that as a delivery by itself: it releases the lease and retries the
+  rows after a backoff -- one second doubling to five minutes for a full
+  isolate, from five seconds when the node itself has no capacity -- instead
+  of immediately, so the isolate is not dispatched to in a loop. The free
+  release is bounded: after six consecutive refusals, or about a minute after
+  the streak began, each further refusal spends an attempt, so a batch whose
+  bodies can never fit, or a squeeze that outlasts the backoff, reaches
+  `max_retries` and the dead-letter queue rather than cycling until four-day
+  retention deletes it. A batch whose bodies exceed the whole budget is
+  charged at once, because no collection can ever make room. A successful
+  delivery resets the streak; a consumer that throws, calls `retry()`, or
+  leaves its lease to expire spends an attempt as before, and so does a
+  release that is lost (a stale lease, a routing failure, or a crash before
+  the release commits), which lets the lease expire.
 - A refused host store is never presented as a partial value. A stream chunk
   that does not fit rejects the `read()` promise with the budget's
   `RangeError`; a host buffer for a synchronous host call throws at that

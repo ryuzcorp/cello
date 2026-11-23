@@ -46,7 +46,7 @@ delivery attempt. Under `CELLO_V8_EXTERNAL_LIMIT_MB` pressure the broker
 counted each refusal as a delivery the consumer never ran, so a message
 walked towards `max_retries` and the dead-letter queue untouched by
 application code. The batch is now released with the settlement's own fence
-and retried after a bounded backoff. No configuration, data, or bucket-format
+and retried after a bounded backoff that ends in a charged attempt. No configuration, data, or bucket-format
 changes: the refusal streak lives in the queue cell's existing metadata table.
 
 - **A budget-refused Queue batch is released without spending an attempt**
@@ -56,12 +56,21 @@ changes: the refusal streak lives in the queue cell's existing metadata table.
   host reports the refusal back to the queue cell, which clears the lease in
   one transaction, leaves `attempts` untouched, and makes the rows visible
   again after a delay that doubles per consecutive refusal (one second up to
-  five) and starts over after 30 quiet seconds. That backoff is what keeps a
-  full isolate from being dispatched to in a loop, and it puts the refused
-  rows behind whatever is already waiting. A handler that throws,
+  five minutes) and starts over after a quiet spell longer than one maximum
+  backoff, or a successful delivery. That backoff is what keeps a full
+  isolate from being dispatched to in a loop, and it puts the refused rows
+  behind whatever is already waiting. A handler that throws,
   `message.retry()`, `batch.retryAll()`, and a lease that expires unsettled
   still spend an attempt. If the release itself is lost, the lease expires
-  and spends the attempt exactly as before, so no message is lost.
+  and spends the attempt exactly as before, so no message is lost. The free
+  release is bounded -- six consecutive refusals, or about a minute after the
+  streak began, and a batch whose bodies exceed the whole budget is charged at
+  once -- so a batch that can never fit reaches `max_retries` and its
+  dead-letter queue instead of cycling until retention deletes it. A node that
+  is out of capacity, rather than one isolate at its budget, waits from five
+  seconds and on the same ladder, which now grows to five minutes instead of
+  five seconds.
+
 ## v0.2.7
 
 Five stream and body divergences from workerd are fixed, all found by the

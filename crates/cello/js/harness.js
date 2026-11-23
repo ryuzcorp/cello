@@ -9217,55 +9217,88 @@ class __QueueCell {
     return matches ? rows : null;
   }
 
-  _refusalStreak(now) {
+  _refusalPolicy(now, kind, unfittable) {
     const count = Number(this._meta("refusal_count") ?? "0");
+    const startedAt = Number(this._meta("refusal_started_at") ?? "0");
     const at = Number(this._meta("refusal_at") ?? "0");
+    const priorKind = this._meta("refusal_kind");
+    const known = Number.isSafeInteger(count) && count > 0 &&
+      Number.isSafeInteger(startedAt) && startedAt > 0 &&
+      Number.isSafeInteger(at) && at > 0 &&
+      (priorKind === "budget" || priorKind === "pressure");
     return __queuePolicy({
       op: "refusal",
       now,
-      priorCount: Number.isSafeInteger(count) && count > 0 ? count : null,
-      priorAt: Number.isSafeInteger(at) && at > 0 ? at : null,
+      kind,
+      unfittable,
+      priorCount: known ? count : null,
+      priorKind: known ? priorKind : null,
+      priorStartedAt: known ? startedAt : null,
+      priorAt: known ? at : null,
     });
   }
 
-  // A batch its consumer isolate refused for want of capacity was never
-  // delivered: the isolate could not materialize the message bodies, so no
-  // line of the handler ran. Releasing the lease therefore must not spend an
-  // attempt -- charging it would walk a message towards `max_retries` and the
-  // dead-letter queue while the consumer never saw it.
+  // A batch its consumer isolate could not take never ran a line of the
+  // handler, so the delivery attempt is not the consumer's to spend. The cell
+  // decides between two outcomes, and the decision is persisted with the rows:
   //
-  // The rows return to ordinary queue state after a backoff that grows with
-  // consecutive refusals: an immediate release would redeliver into the same
-  // full isolate on the next alarm, and the delay also puts the refused rows
-  // behind whatever is already waiting. The fence is the settlement's own, so
-  // a release that lost a race with a new lease clears nothing.
-  async _releaseRefused(body) {
+  //   release -- clear the lease and make the rows visible after a backoff, so
+  //     a full isolate is not dispatched to in a loop and the rows land behind
+  //     whatever is already waiting;
+  //   charge  -- spend the attempt and apply the ordinary retry delay (or the
+  //     dead-letter move) by expiring the lease now, which is the transition
+  //     `_leaseBatch` already runs for a lease that expired on its own. That
+  //     is what terminates a batch that can never fit, or a squeeze that
+  //     outlasts the free releases: the message reaches `max_retries` and its
+  //     dead-letter queue instead of cycling until retention deletes it.
+  //
+  // The fence is the settlement's own, so a report that lost a race with a
+  // new lease clears nothing. A success clears the streak in `_settle`, so
+  // intermittent refusals never ratchet a healthy queue into charging.
+  async _refuse(body) {
     const rows = this._matchingLease(body);
-    if (rows === null) return false;
+    if (rows === null) return null;
     const now = Date.now();
-    const refusal = this._refusalStreak(now);
-    const visibleAt = now + refusal.delayMs;
+    const kind = body.kind === "pressure" ? "pressure" : "budget";
+    const refusal = this._refusalPolicy(now, kind, body.unfittable === true);
     const sql = this._open();
     this.ctx.storage.transactionSync(() => {
-      for (const row of rows) {
-        sql.exec(
-          `UPDATE ${__QUEUE_MESSAGES}
-              SET lease_id = NULL, leased_until = NULL, visible_at = ?
-            WHERE seq = ? AND lease_id = ? AND lease_generation = ?`,
-          visibleAt,
-          row.seq,
-          body.leaseId,
-          row.lease_generation,
-        );
+      if (refusal.action === "charge") {
+        for (const row of rows) {
+          sql.exec(
+            `UPDATE ${__QUEUE_MESSAGES}
+                SET leased_until = ?
+              WHERE seq = ? AND lease_id = ? AND lease_generation = ?`,
+            now,
+            row.seq,
+            body.leaseId,
+            row.lease_generation,
+          );
+        }
+      } else {
+        const visibleAt = now + refusal.delayMs;
+        for (const row of rows) {
+          sql.exec(
+            `UPDATE ${__QUEUE_MESSAGES}
+                SET lease_id = NULL, leased_until = NULL, visible_at = ?
+              WHERE seq = ? AND lease_id = ? AND lease_generation = ?`,
+            visibleAt,
+            row.seq,
+            body.leaseId,
+            row.lease_generation,
+          );
+        }
       }
-      // One transaction with the release: a stop before it commits leaves the
+      // One transaction with the rows: a stop before it commits leaves the
       // lease to expire as before, so no attempt is spent twice and no lease
       // is lost.
       this._setMeta("refusal_count", refusal.count);
+      this._setMeta("refusal_kind", refusal.kind);
+      this._setMeta("refusal_started_at", refusal.startedAt);
       this._setMeta("refusal_at", now);
     });
     await this._rearm(now);
-    return true;
+    return refusal.action;
   }
 
   async _settle(body) {
@@ -9356,6 +9389,16 @@ class __QueueCell {
         );
       }
     });
+    // A consumer ran here, so whatever was refusing the isolate is over: the
+    // next refusal starts free instead of resuming at the sustained streak's
+    // ladder. Only the three keys are read, so a healthy queue pays one
+    // metadata lookup per settlement, not a write.
+    if (this._meta("refusal_count") !== undefined) {
+      this._setMeta("refusal_count", null);
+      this._setMeta("refusal_kind", null);
+      this._setMeta("refusal_started_at", null);
+      this._setMeta("refusal_at", null);
+    }
     try {
       await this._driveDlq();
     } catch (error) {
@@ -9576,11 +9619,12 @@ class __QueueCell {
           : new Response("stale Queue settlement", { status: 409 });
       }
       // The host reports back a batch its consumer isolate could not take.
-      // This is not a settlement: attempts are left untouched.
+      // This is not a settlement by the consumer: the cell either releases the
+      // lease without an attempt or charges the attempt, and answers which.
       if (path === "/__qRefuse") {
-        return await this._releaseRefused(body)
-          ? new Response(null, { status: 204 })
-          : new Response("stale Queue lease", { status: 409 });
+        const action = await this._refuse(body);
+        if (action === null) return new Response("stale Queue lease", { status: 409 });
+        return Response.json({ action });
       }
       if (body.op === "info") {
         if (!operator) return refuse("info", "cello queue info");

@@ -30,8 +30,15 @@
 //! metadata) keeps it from being redelivered into the same full isolate in a
 //! loop, and `attempts` reaches the consumer as `1`.
 //!
-//! The second test is the other half of the classifier: a consumer that
-//! throws is a delivery that failed, so it must keep spending attempts.
+//! The free release is bounded, and the bound is policy, not this file: a
+//! stateless isolate that stays full is *reclaimed* by the pool once it is idle
+//! (the next dispatch lands on a fresh one with a full budget), so a black-box
+//! test cannot hold an isolate refusable for a minute without also pinning
+//! `CELLO_MAX_STATELESS_ISOLATES` and keeping it busy. `cello_logic::queue`'s
+//! unit tests cover the bound, the pressure ladder, the unfittable batch and
+//! the reset; this file covers the part only a real node can show. The second
+//! test is the other half of the classifier: a consumer that throws is a
+//! delivery that failed, so it must keep spending attempts.
 
 mod common;
 
@@ -369,6 +376,13 @@ fn a_refused_batch_is_delivered_after_the_isolate_frees_memory() {
         assert_eq!(delivery["size"], MESSAGE_BYTES, "{delivery}");
     }
 
+    // A consumer ran, so the streak is cleared: the next refusal is free
+    // again rather than resuming the sustained ladder.
+    assert!(
+        !refusal_streak_present(&db),
+        "a successful delivery must reset the refusal streak"
+    );
+
     // Nothing was dead-lettered and the source drained.
     let current = get_json(&node, "/metrics");
     assert_eq!(current["result"]["refuse"]["backlog"], 0, "{current}");
@@ -381,6 +395,16 @@ fn a_refused_batch_is_delivered_after_the_isolate_frees_memory() {
             "a refusal was dead-lettered"
         );
     }
+}
+
+fn refusal_streak_present(db: &Connection) -> bool {
+    db.query_row(
+        "SELECT COUNT(*) FROM __queue_meta WHERE name LIKE 'refusal%'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .expect("count refusal meta rows")
+        != 0
 }
 
 #[test]
