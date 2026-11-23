@@ -428,6 +428,27 @@ const conformance = async () => {
     );
   }
 
+  // 15. Cancelling the readable errors the writable with the cancel reason,
+  //     so a later close() rejects with that reason instead of a fresh
+  //     TypeError, and writer.closed reports the same reason.
+  {
+    const { readable, writable } = new TransformStream();
+    const writer = writable.getWriter();
+    await readable.getReader().cancel('bye');
+    const close = await outcome(writer.close());
+    check(
+      'close after cancel',
+      close.state === 'rejected' && close.value === 'bye',
+      `close() settled as ${close.state}:${String(close.value)}`,
+    );
+    const closed = await outcome(writer.closed);
+    check(
+      'closed after cancel',
+      closed.state === 'rejected' && closed.value === 'bye',
+      `writer.closed settled as ${closed.state}:${String(closed.value)}`,
+    );
+  }
+
   return { failures };
 };
 

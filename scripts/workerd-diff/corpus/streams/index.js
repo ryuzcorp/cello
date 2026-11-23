@@ -293,6 +293,22 @@ const routes = {
     return report({ writing: await writing, reading: await reading, closed: await closed });
   },
 
+  async "/transform-close-after-cancel"() {
+    // Issue #129: cancelling the readable errors the writable with the
+    // cancel reason, so a producer's later close() rejects with that reason
+    // instead of a generic TypeError.
+    const ts = new TransformStream();
+    const writer = ts.writable.getWriter();
+    const reader = ts.readable.getReader();
+    await reader.cancel("bye");
+    const describe = (error) =>
+      `${error?.name ?? "value"}: ${error?.message ?? String(error)}`;
+    return report({
+      close: await writer.close().then(() => "ok", describe),
+      closed: await writer.closed.then(() => "closed", describe),
+    });
+  },
+
   async "/transform-backpressure"() {
     const order = [];
     const ts = new TransformStream(

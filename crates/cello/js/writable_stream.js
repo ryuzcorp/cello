@@ -5,10 +5,11 @@
 // write/close is in flight (or before start settles) parks the stream in
 // 'erroring'; the in-flight operation completes normally, then
 // _finishErroring rejects the queued writes in order, runs the sink
-// abort, and rejects close/closed. Two deliberate Workerd deviations
+// abort, and rejects close/closed. Three deliberate Workerd deviations
 // from the current spec text: abort() on an errored stream rejects with
-// the stored error (spec resolves), and repeated abort() calls return
-// the same promise even after it settles.
+// the stored error (spec resolves), repeated abort() calls return the
+// same promise even after it settles, and close() on an errored stream
+// rejects with the stored error (spec rejects with a fresh TypeError).
 
 // Brand-check sentinel for internal construction.
 const _wsc_brand = Symbol("WritableStreamController");
@@ -328,8 +329,14 @@ class WritableStream {
   }
 
   _close() {
-    if (this._state === 'closed' ||
-        this._state === 'errored')
+    // Workerd rejects close() on an errored stream with its stored error
+    // (the spec text rejects with a fresh TypeError), the reason
+    // writer.closed already reports. A producer whose consumer cancelled
+    // the readable therefore observes the cancel reason instead of a
+    // generic message (#129).
+    if (this._state === 'errored')
+      return Promise.reject(this._storedError);
+    if (this._state === 'closed')
       return Promise.reject(new TypeError(
         "Stream already closed/errored"));
     if (this._closing())
