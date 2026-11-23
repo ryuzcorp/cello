@@ -654,6 +654,116 @@ const routes = {
     });
   },
 
+  async "/body-used-fetch-aborted"() {
+    // Issue #127: `fetch(request)` consumes the request's body even when the
+    // fetch never sends it, so the input reports bodyUsed and a second use is
+    // refused with Request's reconstruction error. A request with no body and
+    // an `init` carrying its own body leave the input alone.
+    const settle = (promise) => promise.then((value) => value, errorInfo);
+    const aborted = () => {
+      const controller = new AbortController();
+      controller.abort(new Error("stop"));
+      return controller.signal;
+    };
+    const request = new Request("https://diff.test/", {
+      method: "POST", body: "abc", signal: aborted(),
+    });
+    const fetchOutcome = await settle(fetch(request));
+    const bodyUsed = request.bodyUsed;
+    const reread = await settle(request.text());
+    const secondFetch = await settle(fetch(request));
+    const get = new Request("https://diff.test/get");
+    const getOutcome = await settle(fetch(get, { signal: aborted() }));
+    const getUsed = get.bodyUsed;
+    const getSecond = await settle(fetch(get, { signal: aborted() }));
+    const replaced = new Request("https://diff.test/replaced", {
+      method: "POST", body: "abc",
+    });
+    const replacedOutcome = await settle(fetch(replaced, {
+      method: "POST", body: "zzz", signal: aborted(),
+    }));
+    const replacedUsed = replaced.bodyUsed;
+    // A streaming body is adopted by the Request copy too, not refused.
+    const streamed = new Request("https://diff.test/streamed", {
+      method: "POST",
+      body: new ReadableStream({
+        start(controller) {
+          controller.enqueue(encoder.encode("abc"));
+          controller.close();
+        },
+      }),
+      signal: aborted(),
+    });
+    const streamedOutcome = await settle(fetch(streamed));
+    const streamedUsed = streamed.bodyUsed;
+    const streamedReread = await settle(streamed.text());
+    return report({
+      fetchOutcome, bodyUsed, reread, secondFetch,
+      getOutcome, getUsed, getSecond,
+      replacedOutcome, replacedUsed,
+      streamedOutcome, streamedUsed, streamedReread,
+    });
+  },
+
+  async "/iterable-body-lazy"() {
+    // Issue #126: an iterable body is pulled lazily, one value per read. The
+    // constructor pulls nothing, an all-byte iterable is a stream too, and no
+    // Content-Length is set for either (measured against workerd).
+    const count = { pulls: 0 };
+    function* strings(n) {
+      for (let i = 0; i < n; i += 1) {
+        count.pulls += 1;
+        yield String(i);
+      }
+    }
+    const response = new Response(strings(5000));
+    const afterCtor = count.pulls;
+    const contentLength = response.headers.get("content-length");
+    const reader = response.body.getReader();
+    const first = await reader.read();
+    const afterFirstRead = count.pulls;
+    const rest = [];
+    for (;;) {
+      const step = await reader.read();
+      if (step.done) break;
+      rest.push(step.value);
+    }
+    const byteCount = { pulls: 0 };
+    function* bytes() {
+      byteCount.pulls += 1;
+      yield encoder.encode("a");
+      byteCount.pulls += 1;
+      yield encoder.encode("b");
+    }
+    const byteResponse = new Response(bytes());
+    const byteAfterCtor = byteCount.pulls;
+    const byteContentLength = byteResponse.headers.get("content-length");
+    const byteText = await byteResponse.text();
+    return report({
+      afterCtor, contentLength, first: first.value, afterFirstRead,
+      chunks: rest.length, total: count.pulls,
+      byteAfterCtor, byteContentLength, byteText, bytePulls: byteCount.pulls,
+    });
+  },
+
+  async "/iterable-infinite-body"() {
+    // Issue #126: an infinite generator must not be drained by the
+    // constructor; the body is read as a bounded prefix and cancelled.
+    function* infinite() {
+      let i = 0;
+      for (;;) {
+        yield String(i);
+        i += 1;
+      }
+    }
+    const response = new Response(infinite());
+    const reader = response.body.getReader();
+    const prefix = [];
+    for (let i = 0; i < 3; i += 1) prefix.push((await reader.read()).value);
+    await reader.cancel();
+    return report({ prefix, bodyUsed: response.bodyUsed });
+  },
+
   async "/sse"() {
     const body = new ReadableStream({
       start: (c) => {

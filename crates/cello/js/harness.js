@@ -1,4 +1,4 @@
-// Modified by Ryuz Corp (Cello): ctx.container.images; clone() of streaming and disturbed bodies; bodyUsed observes the body stream; body streams reject non-byte chunks (#115, #117); a body is consumed once (#127); iterable bodies keep their chunks (#126); __cello$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event; context end aborts finished uploads; tenant egress policy; D1 export; D1 export operator gate; D1 batch; test-only fake close/signal completion; binding-forgery enforcement; Queue/KV operator fetch gate; Queue/KV stub-RPC allowlists; Queue DLQ host-op forward; Queue send/DLQ cell-side validation; trusted-RPC target pin; Queue operator internal re-checks; receiver-held RPC streams.; dropped timer ops fire their callback early so sleepers settle (upstream #317); unrefed AbortSignal.timeout timer (upstream #306); loader-fetch 101 webSocket join (upstream #305); nodejs process.env population (upstream #296); writable request /tmp files (upstream #280); Worker WebSocket close codes (upstream #279); Symbol.dispose on plain RPC results (upstream #260); workflow alarm forgets budget-orphaned drives (upstream #299); env.CELLO_NODE host-wins re-assertion on loader env (upstream #219); getCurrentTraceparent handler trace context (upstream #313).
+// Modified by Ryuz Corp (Cello): ctx.container.images; clone() of streaming and disturbed bodies; bodyUsed observes the body stream; body streams reject non-byte chunks (#115, #117); a body is consumed once, including by fetch() (#127); iterable bodies are lazy chunk streams (#126); __cello$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event; context end aborts finished uploads; tenant egress policy; D1 export; D1 export operator gate; D1 batch; test-only fake close/signal completion; binding-forgery enforcement; Queue/KV operator fetch gate; Queue/KV stub-RPC allowlists; Queue DLQ host-op forward; Queue send/DLQ cell-side validation; trusted-RPC target pin; Queue operator internal re-checks; receiver-held RPC streams.; dropped timer ops fire their callback early so sleepers settle (upstream #317); unrefed AbortSignal.timeout timer (upstream #306); loader-fetch 101 webSocket join (upstream #305); nodejs process.env population (upstream #296); writable request /tmp files (upstream #280); Worker WebSocket close codes (upstream #279); Symbol.dispose on plain RPC results (upstream #260); workflow alarm forgets budget-orphaned drives (upstream #299); env.CELLO_NODE host-wins re-assertion on loader env (upstream #219); getCurrentTraceparent handler trace context (upstream #313).
 // The DO object model and the Cloudflare-compatible runtime surface, run
 // once per isolate by `js.rs::install_harness` after the Web-API prelude.
 // Lived as a 4,000-line raw string inside js.rs until 2026-07-29; it is a
@@ -118,12 +118,16 @@ function __multipartBody(form) {
   }
   return { bytes, type: `multipart/form-data; boundary=${boundary}` };
 }
-// Workerd's "gen" bodies: an async iterable becomes a body stream that yields
-// its values; a sync iterable of buffers/views concatenates eagerly. Called
-// only for object bodies that are not streams or Blobs -- an object with a
-// custom toString/@@toPrimitive stringifies instead, unless it is an array or
-// async-iterable (Workerd's precedence). The iterable wins whatever its
-// chunks are: the constructor does not look at a chunk's type, so an
+// Workerd's "gen" bodies: every iterable -- sync or async -- becomes a body
+// stream that yields its values lazily, one pull per read, so the constructor
+// pulls nothing and no Content-Length is set. Measured against workerd: a sync
+// generator of 5000 strings reports 0 pulls after the constructor and 1 after
+// the first read, an infinite generator constructs, and an all-byte iterable
+// is a stream too (no Content-Length), so nothing is concatenated eagerly.
+// Called only for object bodies that are not streams or Blobs -- an object
+// with a custom toString/@@toPrimitive stringifies instead, unless it is an
+// array or async-iterable (Workerd's precedence). The iterable wins whatever
+// its chunks are: the constructor does not look at a chunk's type, so an
 // iterable holding a string is a body whose every read rejects with the
 // body-stream TypeError, not a value stringified into "alpha,beta" (#126).
 // Returns null for the string-coercion path.
@@ -131,53 +135,29 @@ function __iterableBody(body) {
   if (body instanceof ArrayBuffer || ArrayBuffer.isView(body))
     return null;
   const asyncIter = body[Symbol.asyncIterator];
-  if (typeof asyncIter === "function") {
-    const iterator = asyncIter.call(body);
-    return new ReadableStream({
-      async pull(controller) {
-        const result = await iterator.next();
-        if (result.done) { controller.close(); return; }
-        // The raw value, not a coercion: a consumer validates it, as it
-        // validates a chunk of any other body stream (#117, #126).
-        controller.enqueue(result.value);
-      },
-      cancel(reason) {
-        if (typeof iterator.return === "function")
-          iterator.return(reason);
-      },
-    }, { highWaterMark: 0 });
-  }
+  if (typeof asyncIter === "function")
+    return __chunkBodyStream(asyncIter.call(body));
   if (!Array.isArray(body) &&
       (body.toString !== Object.prototype.toString ||
        body[Symbol.toPrimitive] !== undefined))
     return null;
   if (typeof body[Symbol.iterator] !== "function") return null;
-  const values = [];
-  for (const chunk of body) values.push(chunk);
-  const chunks = [];
-  let length = 0;
-  for (const chunk of values) {
-    if (__bodyChunkKind(chunk) === 0) return __chunkBodyStream(values);
-    const view = __bodyChunk(chunk);
-    chunks.push(view);
-    length += view.byteLength;
-  }
-  const bytes = new Uint8Array(length);
-  let offset = 0;
-  for (const view of chunks) {
-    bytes.set(view, offset);
-    offset += view.byteLength;
-  }
-  return bytes;
+  return __chunkBodyStream(body[Symbol.iterator]());
 }
-// A body stream over an iterable's raw chunks, pulled one per read: the shape
-// workerd gives an iterable body, so the first consumer validates each chunk.
-function __chunkBodyStream(values) {
-  let next = 0;
+// A body stream over an iterator's raw values, pulled one per read: the shape
+// workerd gives an iterable body. The value is enqueued unwrapped, so the
+// first consumer validates the chunk (#117, #126), and a cancel returns the
+// producer through `iterator.return`.
+function __chunkBodyStream(iterator) {
   return new ReadableStream({
-    pull(controller) {
-      if (next >= values.length) { controller.close(); return; }
-      controller.enqueue(values[next++]);
+    async pull(controller) {
+      const result = await iterator.next();
+      if (result.done) { controller.close(); return; }
+      controller.enqueue(result.value);
+    },
+    cancel(reason) {
+      if (typeof iterator.return === "function")
+        iterator.return(reason);
     },
   }, { highWaterMark: 0 });
 }
@@ -387,11 +367,7 @@ globalThis.Response = class Response {
     if (body !== null && typeof body === "object") {
       if (body instanceof ReadableStream) stream = body;
       else if ((typed = __typedBody(body)) !== null) { /* bytes and type */ }
-      else {
-        const iterable = __iterableBody(body);
-        if (iterable instanceof ReadableStream) stream = iterable;
-        else if (iterable !== null) body = iterable;
-      }
+      else stream = __iterableBody(body);
     }
     this._bodyBytes = stream !== null
       ? null
@@ -556,11 +532,7 @@ globalThis.Request = class Request {
     if (hasBody && body !== null && typeof body === "object") {
       if (body instanceof ReadableStream) stream = body;
       else if ((typed = __typedBody(body)) !== null) { /* bytes and type */ }
-      else {
-        const iterable = __iterableBody(body);
-        if (iterable instanceof ReadableStream) stream = iterable;
-        else if (iterable !== null) body = iterable;
-      }
+      else stream = __iterableBody(body);
     }
     if (!hasBody && prior && prior._bodyBytes === null) {
       // Adopt the prior request's stream; per spec the prior body
@@ -842,11 +814,32 @@ const __dataUrlResponse = (url) => {
 };
 // Must match the host's `egress::FETCH_REFUSAL_MARKER` exactly.
 const __EGRESS_REFUSAL_MARKER = "CELLO_EGRESS_REFUSED:";
+// `fetch(request)` consumes the request's body: workerd's Request copy steals
+// it, so the input reports `bodyUsed` afterwards and a second fetch is
+// refused with Request's reconstruction error. The Request constructor itself
+// stays non-marking -- `clone()` and `new Request(r)` rebuild an unused body
+// from the bytes -- so every fetch surface that forwards the body takes it
+// here (#127). A request with no body (a GET) is not consumed, and an `init`
+// with its own `body` leaves the input alone, both as workerd behaves.
+const __FETCH_USED = "Cannot reconstruct a Request with a used body.";
+const __fetchAdoptsBody = (input, init) =>
+  input instanceof Request && input.body !== null &&
+  !(init !== null && typeof init === "object" &&
+    Object.prototype.hasOwnProperty.call(init, "body"));
+// Run before the Request copy: the constructor marks a streaming prior as it
+// adopts its stream, so checking afterwards would refuse an unused input.
+const __fetchTakeBody = (input) => {
+  if (input.bodyUsed) throw new TypeError(__FETCH_USED);
+  __markBodyUsed(input);
+};
 globalThis.fetch = async (input, init) => {
   const rawUrl = typeof input === "string" ? input : input?.url;
+  const adoptsBody = __fetchAdoptsBody(input, init);
   if (typeof rawUrl === "string" && rawUrl.startsWith("data:")) {
+    if (adoptsBody) __fetchTakeBody(input);
     return __dataUrlResponse(rawUrl);
   }
+  if (adoptsBody) __fetchTakeBody(input);
   const req = new Request(input, init);
   // `fetch(url, { headers: { Upgrade: "websocket" } })` is the other way
   // Cloudflare opens an outbound socket, and the one most examples use.
@@ -2433,6 +2426,8 @@ class DurableObjectFacets {
     const manager = this;
     target.fetch = async function(input, init) {
       return invoke(async ([loader, className, id, propsSc]) => {
+        const adoptsBody = __fetchAdoptsBody(input, init);
+        if (adoptsBody) __fetchTakeBody(input);
         const req = new Request(input, init);
         const headers = JSON.stringify(req.headers.__celloHeaderList);
         const { body, streamId } = await __subrequestBody(req);
@@ -2663,6 +2658,8 @@ class ContainerPort {
     this._port = port;
   }
   async fetch(input, init) {
+    const adoptsBody = __fetchAdoptsBody(input, init);
+    if (adoptsBody) __fetchTakeBody(input);
     const request = new Request(input, init);
     const url = new URL(request.url);
     if (url.protocol === "https:")
@@ -3573,6 +3570,8 @@ __cello.__makeLoader = () => {
     const target = {
       async fetch(input, init) {
         const { id, tails } = await loadPromise;
+        const adoptsBody = __fetchAdoptsBody(input, init);
+        if (adoptsBody) __fetchTakeBody(input);
         const req = new Request(input, init);
         // The caller's signal, never the incoming request's own, as for a
         // service binding.
@@ -3865,6 +3864,8 @@ const __makeServiceBinding = __cello.__makeServiceBinding =
   (script, entrypoint = null, propsSc = undefined) => {
   const target = {
   async fetch(input, init) {
+    const adoptsBody = __fetchAdoptsBody(input, init);
+    if (adoptsBody) __fetchTakeBody(input);
     const req = new Request(input, init);
     const signal = req._signalForSubrequests;
     if (signal?.aborted) throw signal.reason;
@@ -6721,6 +6722,8 @@ class DurableObjectNamespace {
       }
     };
     const doFetch = async (input, init) => {
+        const adoptsBody = __fetchAdoptsBody(input, init);
+        if (adoptsBody) __fetchTakeBody(input);
         const req = new Request(input, init);
         const signal = req._signalForSubrequests;
         if (signal?.aborted) throw signal.reason;

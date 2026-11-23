@@ -50,6 +50,9 @@ export const cases = [
   { name: "body-chunk-shadows", fixture: "streams", path: "/body-chunk-shadows" },
   { name: "iterable-string-body", fixture: "streams", path: "/iterable-string-body" },
   { name: "body-read-twice", fixture: "streams", path: "/body-read-twice" },
+  { name: "body-used-fetch-aborted", fixture: "streams", path: "/body-used-fetch-aborted" },
+  { name: "iterable-body-lazy", fixture: "streams", path: "/iterable-body-lazy" },
+  { name: "iterable-infinite-body", fixture: "streams", path: "/iterable-infinite-body" },
   {
     name: "cache-put-string-chunks",
     fixture: "cache",

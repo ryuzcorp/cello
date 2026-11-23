@@ -28,15 +28,19 @@ bucket-format changes.
   `FixedLengthStream` cancel reaches the same path with workerd's converted
   `Error`. The differential gate gained the `transform-close-after-cancel`
   case.
-- **An iterable body is a stream of its chunks, not a stringified value**
-  (#126). `new Response(["alpha", "beta"])` (or the same on a `Request`, a
-  `Set`, or any other sync or async iterable) stringified to `"alpha,beta"`
-  because the constructor fell through to the string-coercion path whenever a
-  chunk was not bytes. Workerd makes the iterable the body stream regardless
-  of chunk type and validates each chunk at consumption, so it rejected every
-  read with `TypeError: This ReadableStream did not return bytes.`; Cello now
-  does the same. An iterable of buffers or views still concatenates eagerly,
-  and a non-iterable object with its own `toString` still stringifies.
+- **An iterable body is a lazy stream of its own chunks** (#126).
+  `new Response(["alpha", "beta"])` (or the same on a `Request`, a `Set`, or
+  any other sync or async iterable) stringified to `"alpha,beta"` because the
+  constructor fell through to the string-coercion path whenever a chunk was
+  not bytes; a byte iterable was concatenated eagerly, which pulled the whole
+  producer inside the constructor and hung on an infinite one. Every iterable
+  is now workerd's body stream: the iterable becomes the body whatever its
+  chunk types, a chunk is validated at consumption, the constructor pulls
+  nothing, each read pulls one value, and no `Content-Length` is set.
+  `new Response(["alpha", "beta"]).text()` therefore rejects with
+  `TypeError: This ReadableStream did not return bytes.`, an infinite
+  generator constructs and reads a bounded prefix, and a non-iterable object
+  with its own `toString` still stringifies.
 - **A body can be consumed once** (#127). A buffered body re-served its bytes
   on every `text()`, `json()`, `formData()`, `blob()`, `arrayBuffer()`, or
   `bytes()` call, so a Worker that read a body twice (or through two
@@ -44,8 +48,13 @@ bucket-format changes.
   `TypeError: Body has already been used. It can only be used once. Use tee()
   first if you need to read it twice.` Both `Response` and `Request` now
   reject a second read with workerd's error, whether the first read was a
-  buffered consumer or a reader on the body stream. A `null` body carries
-  nothing and stays readable, as in workerd.
+  buffered consumer or a reader on the body stream. `fetch(request)` consumes
+  the request's body too, even when the fetch never sends it — an aborted
+  signal still leaves `bodyUsed` true and a second `fetch` refused with
+  `TypeError: Cannot reconstruct a Request with a used body.` — while a
+  request with no body and an `init` carrying its own body leave the input
+  alone, as workerd behaves. A `null` body carries nothing and stays
+  readable, as in workerd.
 - **`cache.put()` takes a string chunk as its UTF-8 bytes** (#128). The capped
   drain summed `chunk.byteLength`, which is `NaN` for a string, then copied
   into an empty target and threw `RangeError: offset is out of bounds` without
