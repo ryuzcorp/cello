@@ -306,15 +306,17 @@ const routes = {
         DOMException: [DOMException.name, DOMException.length],
       },
       responseJson: Response.json({ a: 1 }).headers.get("content-type"),
+      // getAll() is workerd's Set-Cookie accessor: any other name is a
+      // TypeError, and the refusal text is part of the pinned shape.
       headersGetAll: (() => {
-        const headers = new Headers([["a", "1"]]);
-        headers.append("a", "2");
-        headers.append("b", "3");
+        const headers = new Headers([["set-cookie", "a=1"]]);
+        headers.append("set-cookie", "b=2");
+        headers.append("x", "3");
         return {
-          a: headers.getAll("a"),
-          b: headers.getAll("b"),
-          missing: headers.getAll("missing"),
-          get: headers.get("a"),
+          cookies: headers.getAll("set-cookie"),
+          other: new Headers().getAll("set-cookie"),
+          get: headers.get("set-cookie"),
+          refused: attempt(() => headers.getAll("x")),
         };
       })(),
       objectUrl,

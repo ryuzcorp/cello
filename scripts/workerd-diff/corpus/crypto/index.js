@@ -413,13 +413,13 @@ export default {
         }
       }
 
-      // A forged Blob that copies a real Blob's constructor brand property is
-      // still not in the internal brand set: V8 refuses the function-valued
-      // property, and the bytes are never revived as a Blob.
+      // A Blob-shaped object that is not a constructed Blob carries no brand
+      // and no bytes: its state lives in a private slot now (#206), so
+      // assigning the old own fields grants nothing and the clone never
+      // revives it as a Blob.
       const realBlob = new Blob(["hi"]);
       const forgedBlob = Object.create(Blob.prototype);
       forgedBlob._bytes = utf8("hi");
-      forgedBlob.__celloHost = realBlob.__celloHost;
       const copied = attemptSync(() => structuredClone(forgedBlob));
       out.copiedBlobBrand = {
         ok: copied.ok,

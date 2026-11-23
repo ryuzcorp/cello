@@ -230,8 +230,14 @@ class Headers {
   }
   // Workerd's nonstandard Fetch extension: every value for a name, one entry
   // per append, where `get` joins them into one comma-separated value.
+  // Workerd's getAll() is the Set-Cookie accessor only: every other name is a
+  // TypeError with this text, measured against 1.20261121.1 (#206).
   getAll(name) {
-    const lower = _lower(_checkName(name));
+    const key = _checkName(name);
+    if (_lower(key) !== "set-cookie")
+      throw new TypeError(
+        'getAll() can only be used with the header name "Set-Cookie".');
+    const lower = _lower(key);
     const state = this.#list;
     const out = [];
     for (let i = 0; i < state.lower.length; i++)
