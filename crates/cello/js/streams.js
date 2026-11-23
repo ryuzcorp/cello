@@ -196,10 +196,13 @@ const __rsState = (stream) => {
     throw new TypeError("Illegal invocation");
   return state;
 };
+// Captured: the host storage predicate calls this while a guest may have
+// patched `WeakMap.prototype.has`.
+const __rsStatesHas = WeakMap.prototype.has;
 const __rsIs = (value) =>
-  (typeof value === 'object' && value !== null) ||
-  typeof value === 'function'
-    ? _readableStates.has(value) : false;
+  ((typeof value === 'object' && value !== null) ||
+   typeof value === 'function')
+    ? Reflect.apply(__rsStatesHas, _readableStates, [value]) : false;
 
 // Resolve one pending read request from queue.
 function __resolveRead(st) {

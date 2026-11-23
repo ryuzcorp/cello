@@ -333,6 +333,11 @@
   const _KEY_SLOTS = new WeakMap();
   const _KEY_CONSTRUCTION = Symbol("CryptoKey construction");
 
+  // Captured for the host storage predicate: a guest may patch the prototype.
+  const _KEY_SLOTS_HAS = WeakMap.prototype.has;
+  __cello.$$isCryptoKey = (value) =>
+    value !== null && typeof value === "object" &&
+    Reflect.apply(_KEY_SLOTS_HAS, _KEY_SLOTS, [value]);
   function _keySlots(key) {
     const slots = _KEY_SLOTS.get(key);
     if (slots === undefined) throw new TypeError("Illegal invocation");

@@ -141,12 +141,11 @@ removals are listed again in the breaking-changes section below.
   `Headers`, `Blob`, `CryptoKey` or a stream -- as a host value, so it takes
   the lift path instead of a structured clone that would have flattened it to
   `{}`. The queue, attachment, workflow and batched-storage paths refuse those
-  values with workerd's `DataCloneError` text. A stream still crosses a caller
-  boundary as a `DataCloneError`, exactly as before. **Not yet covered:** a
-  single-key `storage.put(key, value)` still hands the value to the host
-  serializer, which stores `{}` for a private-slot host; refusing it there
-  needs the check on the host side, because a JavaScript pre-walk would run a
-  stored stub's traps.
+  values with workerd's `DataCloneError` text, and so does `storage.put()` on
+  both the single-key and batch paths: the refusal sits in the host
+  serializer's own delegate, driven by a module-private, brand-only predicate,
+  so it stores nothing and runs no guest code. A stream still crosses a caller
+  boundary as a `DataCloneError`, exactly as before.
 
 Two more `WritableStream` divergences from workerd are fixed, and the
 tee-skew conformance test no longer assumes which of a tee's copies the skew

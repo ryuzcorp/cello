@@ -63,8 +63,11 @@ function _checkValue(value) {
 // prototype flattens to plain data (#221). Workerd keeps no brand on the
 // instance, so the set stays module-private (#170).
 const _headersInstances = new WeakSet();
+// Captured: the host storage predicate calls this while a guest may have
+// patched `WeakSet.prototype.has`.
+const _headersHas = WeakSet.prototype.has;
 __cello.$$isHeadersInstance = (value) =>
-  WeakSet.prototype.has.call(_headersInstances, value);
+  Reflect.apply(_headersHas, _headersInstances, [value]);
 
 // The spec's header list, plus the sorted pair list derived from it.
 //

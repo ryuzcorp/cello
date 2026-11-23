@@ -1206,30 +1206,35 @@ __cello.$$isResponseInstance = (value) => __weakSetHas(__responseInstances, valu
 // whose state is all private would be stored as `{}` where it used to be
 // refused by an uncloneable function brand. Walk the graph and refuse the
 // host instances this codec cannot round-trip.
+// Brand-only: every test is a WeakSet/WeakMap membership read through a
+// captured intrinsic, so it runs no guest code -- not a Proxy trap, not a
+// patched `has`. The host serializer calls this too (through
+// `__cello.__storageHostName`), which is why it must never read a property.
+const __brandCheck = (name) => (value) =>
+  typeof __cello[name] === "function" && __cello[name](value) === true;
 const __cloneHostName = (value) => {
-  // An RPC stub, service stub or opaque Proxy is never one of these hosts:
-  // it is stored through the stub envelope, and asking `instanceof` would run
-  // its traps (which touch guest-patchable builtins) inside the storage path.
-  if (typeof __stubMeta !== "undefined" &&
-      (__weakHas(__stubMeta, value) ||
-       __weakHas(__svcMeta, value) ||
-       __do_is_stub(value))) return null;
-  if (__util_proxy_details(value) !== undefined) return null;
+  if (value === null || typeof value !== "object") return null;
+  // Brands only: WeakSet/WeakMap membership keyed by identity. A stub is not
+  // a host here (it crosses through its own envelope) and probing it would
+  // run its traps, so nothing below reads a property or a symbol.
   if (__cello.$$isRequestInstance(value)) return "Request";
   if (__cello.$$isResponseInstance(value)) return "Response";
   if (__cello.$$isHeadersInstance(value)) return "Headers";
   if (__cello.$$isFormDataInstance(value)) return "FormData";
   if (__cello.$$isAbortSignalInstance(value)) return "AbortSignal";
-  if (typeof __cello.$$isMessagePortInstance === "function" &&
-      __cello.$$isMessagePortInstance(value)) return "MessagePort";
+  if (__brandCheck("$$isMessagePortInstance")(value)) return "MessagePort";
   if (__cello.__isBlobInstance(value)) return "Blob";
-  if (typeof __cello.$$isCryptoKey === "function" &&
-      __cello.$$isCryptoKey(value)) return "CryptoKey";
-  if (value instanceof ReadableStream) return "ReadableStream";
-  if (value instanceof WritableStream) return "WritableStream";
-  if (value instanceof TransformStream) return "TransformStream";
+  if (__brandCheck("$$isCryptoKey")(value)) return "CryptoKey";
+  if (__brandCheck("$$isReadableStream")(value)) return "ReadableStream";
+  if (__brandCheck("$$isWritableStream")(value)) return "WritableStream";
+  if (__brandCheck("$$isTransformStream")(value)) return "TransformStream";
+  if (__brandCheck("$$isR2Bucket")(value)) return "R2Bucket";
   return null;
 };
+// The storage serializer's host-object predicate: module-private, brand-only,
+// and reachable from Rust only through `internal_value` on the harness's own
+// internals object. A guest can neither call it nor replace it.
+__cello.__storageHostName = __cloneHostName;
 // Refuse the host instances the plain codec cannot round-trip, before any
 // queueing: `put()`'s single-key path hands the value straight to the Rust
 // serializer, which would store `{}` for a private-slot object instead of
@@ -2624,9 +2629,6 @@ class DurableObjectStorage {
     if (source.length === 0) return;
     const entries =
       source.map(([key, value]) => [String(key), value]);
-    // A batch refuses a host instance up front too: the native batch op
-    // serializes each entry itself and would store `{}` for one.
-    for (const [, value] of entries) __scRefuseHost(value);
     try {
       __storage_queue_put_many(this._scope, entries);
     } catch (error) {
