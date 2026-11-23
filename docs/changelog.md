@@ -8,7 +8,7 @@ Two more `WritableStream` divergences from workerd are fixed, and the
 tee-skew conformance test no longer assumes which of a tee's copies the skew
 budget ends. A third change is breaking: a Worker can no longer generate code
 at run time (#194), described below. The differential gate gained six cases
-from those fixes and nine Request/body cases from the changes below, 57 in
+from those fixes and fourteen Request/body cases from the changes below, 62 in
 total. No configuration, data, or bucket-format changes. The `eval`,
 `Function` and wasm runtime-compilation changes are listed after the stream
 fixes because they break bundles that relied on them.
@@ -86,8 +86,10 @@ harness:
   reader had disturbed -- into a fresh, usable Request, so a Worker that
   accidentally rebuilt an already-read request silently re-sent the payload.
   It now throws workerd's `TypeError: Cannot reconstruct a Request with a
-  used body.`; `clone()` still copies an unused body and tees a live stream.
-  The gate gained the `request-copy-used` case.
+  used body.`; a body that is locked by a reader that has read nothing is
+  refused too, with workerd's `TypeError: The ReadableStream has been locked
+  to a reader.` `clone()` still copies an unused body and tees a live stream.
+  The gate gained the `request-copy-used` and `request-copy-locked` cases.
 - **A bodyless `Request` has `body === null`** (#142). A POST built without a
   body used to get an empty body stream: `request.body` was readable where
   workerd's is `null`, and `text()` marked it used so a second read threw.
@@ -105,9 +107,12 @@ harness:
   three, and a tight backing buffer made the reply empty. It now reads the
   captured `%TypedArray.prototype`/`DataView` getters and maps a forged
   prototype to workerd's `TypeError: This ReadableStream did not return
-  bytes.` The same slot reads back the constructors' body path. The gate
-  gained `chunk-shadow-response`, `chunk-shadow-response-tight` and
-  `chunk-shadow-response-dataview`.
+  bytes.` The same slot reads back the constructors' body path, `Blob` parts,
+  the KV value encoder and value-stream drain, and a queued `WebSocket.send`
+  (which now snapshots the bytes, as workerd does). The gate gained
+  `chunk-shadow-response`, `chunk-shadow-response-tight`,
+  `chunk-shadow-response-dataview`, `blob-part-shadow`, `kv-string-chunk`,
+  `kv-view-shadow` and `websocket-send-copy`.
 
 ## v0.2.8
 

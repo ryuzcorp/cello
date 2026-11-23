@@ -51,6 +51,9 @@ export const cases = [
   { name: "string-chunks", fixture: "streams", path: "/string-chunks" },
   { name: "string-chunks-response", fixture: "streams", path: "/string-chunks-response" },
   { name: "body-chunk-shadows", fixture: "streams", path: "/body-chunk-shadows" },
+  { name: "blob-part-shadow", fixture: "streams", path: "/blob-part-shadow" },
+  { name: "request-copy-locked", fixture: "streams", path: "/request-copy-locked" },
+  { name: "websocket-send-copy", fixture: "streams", path: "/websocket-send-copy" },
   { name: "chunk-shadow-response", fixture: "streams", path: "/chunk-shadow-response" },
   { name: "chunk-shadow-response-tight", fixture: "streams", path: "/chunk-shadow-response-tight" },
   { name: "chunk-shadow-response-dataview", fixture: "streams", path: "/chunk-shadow-response-dataview" },
@@ -62,6 +65,8 @@ export const cases = [
     requests: [{ method: "POST", path: "/incoming-bodyless", noFraming: true }],
   },
   { name: "incoming-empty", fixture: "streams", requests: [{ method: "POST", path: "/incoming-empty" }] },
+  { name: "kv-string-chunk", fixture: "kv", path: "/kv-string-chunk" },
+  { name: "kv-view-shadow", fixture: "kv", path: "/kv-view-shadow" },
   { name: "incoming-get-framed", fixture: "streams", requests: [{ method: "GET", path: "/incoming-empty" }] },
   {
     name: "incoming-get-bodyless",
