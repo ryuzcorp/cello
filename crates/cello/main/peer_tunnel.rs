@@ -54,6 +54,11 @@ pub(crate) const OPERATOR_HEADER: &str = "x-cells-operator";
 /// distinction workerd reports (#142). An older peer sends no flag, and B
 /// treats the body as present, which is what it did before.
 pub(crate) const BODY_HEADER: &str = "x-cells-rpc-body";
+/// Node A's establishment flag that it reserves [`BODY_HEADER`]. Without it,
+/// an older peer forwards a Worker's application header of that name, and its
+/// `"0"` must not discard a real body. Unknown establishment headers are
+/// ignored, so the flag crosses a rolling upgrade in both directions.
+pub(crate) const BODY_FLAG_HEADER: &str = "x-cells-tunnel-body";
 /// A peer that sends this header on establishment forwards only host-set
 /// markers: it strips the marker headers from application input (fetch) or
 /// never takes them from it (RPC). Older peers on the same tunnel version
@@ -98,6 +103,15 @@ pub(crate) struct TunnelControl {
 fn negotiated_markers(headers: &hyper::HeaderMap) -> bool {
     headers
         .get(MARKERS_HEADER)
+        .is_some_and(|value| value.as_bytes() == b"1")
+}
+
+/// Node B honors [`BODY_HEADER`] only from a peer that negotiated it. An
+/// older peer does not reserve the name, so an application header `"0"` would
+/// otherwise drop a body it is sending.
+fn negotiated_body(headers: &hyper::HeaderMap) -> bool {
+    headers
+        .get(BODY_FLAG_HEADER)
         .is_some_and(|value| value.as_bytes() == b"1")
 }
 
@@ -184,6 +198,7 @@ pub(crate) fn accept(mut request: Request<Incoming>, app: AppHandle) -> HttpRepl
     // in the cell's operator-only branch with the usual "is an operator
     // operation" refusal.
     let marker_aware = negotiated_markers(headers);
+    let body_aware = negotiated_body(headers);
     let upgrade = hyper::upgrade::on(&mut request);
     tokio::spawn(async move {
         let upgraded = match upgrade.await {
@@ -191,7 +206,7 @@ pub(crate) fn accept(mut request: Request<Incoming>, app: AppHandle) -> HttpRepl
             Err(_) => return,
         };
         match kind {
-            TunnelKind::Do => serve_do(upgraded, app, marker_aware).await,
+            TunnelKind::Do => serve_do(upgraded, app, marker_aware, body_aware).await,
             TunnelKind::Rpc => serve_rpc(upgraded, app, marker_aware).await,
         }
     });
@@ -215,7 +230,12 @@ pub(crate) fn accept(mut request: Request<Incoming>, app: AppHandle) -> HttpRepl
 /// dispatch it exactly as the enveloped path did, and let the reply stream
 /// back as an ordinary HTTP response. The connection serves calls until the
 /// peer closes it or an inner upgrade consumes it.
-async fn serve_do(upgraded: hyper::upgrade::Upgraded, app: AppHandle, marker_aware: bool) {
+async fn serve_do(
+    upgraded: hyper::upgrade::Upgraded,
+    app: AppHandle,
+    marker_aware: bool,
+    body_aware: bool,
+) {
     let service = service_fn(move |mut inner: Request<Incoming>| {
         let app = app.clone();
         async move {
@@ -275,11 +295,13 @@ async fn serve_do(upgraded: hyper::upgrade::Upgraded, app: AppHandle, marker_awa
                 .collect();
             // An absent body crosses as absence, not as the empty stream its
             // `Content-Length: 0` framing would suggest (#142). An older peer
-            // sends no flag, and its body was present, as before.
-            let has_body = parts
-                .headers
-                .get(BODY_HEADER)
-                .is_none_or(|value| value.as_bytes() != b"0");
+            // never negotiated the flag, so a header of that name there is
+            // application input and its body was present, as before.
+            let has_body = !body_aware
+                || parts
+                    .headers
+                    .get(BODY_HEADER)
+                    .is_none_or(|value| value.as_bytes() != b"0");
             // Streaming by construction: the inner body is handed to the
             // isolate as a stream whatever its size, bounded the way the
             // enveloped path bounded its frame.
@@ -436,6 +458,7 @@ async fn establish(peer: &Peer<'_>, kind: &'static str) -> anyhow::Result<Tunnel
         .header(reqwest::header::CONNECTION, "upgrade")
         .header(VERSION_HEADER, TUNNEL_VERSION)
         .header(MARKERS_HEADER, "1")
+        .header(BODY_FLAG_HEADER, "1")
         .header(KIND_HEADER, kind)
         .header(
             peer_auth::RESPONSE_VERSION_HEADER,
@@ -1041,6 +1064,32 @@ mod operator_tests {
         )
         .expect("inner request");
         assert!(!plain.headers().contains_key(TRUSTED_HEADER));
+    }
+
+    fn body_establishment(flag: Option<&'static str>) -> hyper::HeaderMap {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::HeaderName::from_static(VERSION_HEADER),
+            hyper::header::HeaderValue::from_static(TUNNEL_VERSION),
+        );
+        if let Some(flag) = flag {
+            headers.insert(
+                hyper::header::HeaderName::from_static(BODY_FLAG_HEADER),
+                hyper::header::HeaderValue::from_static(flag),
+            );
+        }
+        headers
+    }
+
+    #[test]
+    fn body_flag_is_negotiated() {
+        // Only a peer that announces it reserves the body header. Without the
+        // flag an old peer's application header named `x-cells-rpc-body` must
+        // not discard a body (#142).
+        assert!(negotiated_body(&body_establishment(Some("1"))));
+        assert!(!negotiated_body(&body_establishment(None)));
+        assert!(!negotiated_body(&body_establishment(Some("0"))));
+        assert!(!negotiated_body(&body_establishment(Some("yes"))));
     }
 
     #[test]
