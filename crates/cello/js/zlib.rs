@@ -143,7 +143,7 @@ impl ZlibStream {
             ("deflate-raw", false) => Self::RawEncode(z::DeflateEncoder::new(sink(), level)),
             ("deflate-raw", true) => Self::RawDecode(z::DeflateDecoder::new(sink())),
             ("brotli", false) => {
-                Self::BrotliEncode(brotli::CompressorWriter::new(sink(), 4096, 5, 19))
+                Self::BrotliEncode(Box::new(brotli::CompressorWriter::new(sink(), 4096, 5, 19)))
             }
             ("brotli", true) => {
                 Self::BrotliDecode(Box::new(brotli::DecompressorWriter::new(sink(), 4096)))
@@ -155,10 +155,7 @@ impl ZlibStream {
     fn decompress(&self) -> bool {
         matches!(
             self,
-            Self::GzipDecode(_)
-                | Self::ZlibDecode(_)
-                | Self::RawDecode(_)
-                | Self::BrotliDecode(_)
+            Self::GzipDecode(_) | Self::ZlibDecode(_) | Self::RawDecode(_) | Self::BrotliDecode(_)
         )
     }
 
@@ -205,10 +202,8 @@ impl ZlibStream {
         const INCOMPLETE: &str = "Called close() on a decompression stream with incomplete data";
         let failure = self.failure();
         match self {
-            Self::BrotliEncode(writer) => Ok(writer.into_inner()),
-            Self::BrotliDecode(writer) => {
-                writer.into_inner().map_err(|_| anyhow!(INCOMPLETE))
-            }
+            Self::BrotliEncode(writer) => Ok((*writer).into_inner()),
+            Self::BrotliDecode(writer) => (*writer).into_inner().map_err(|_| anyhow!(INCOMPLETE)),
             other => zlib_each_flate!(other, w => w.finish().map_err(|error| {
                 if error.kind() == std::io::ErrorKind::UnexpectedEof {
                     anyhow!(INCOMPLETE)
