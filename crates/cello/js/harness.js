@@ -808,6 +808,10 @@ globalThis.Response = class Response {
       type: "default",
       url: "",
       cf: init.cf,
+      // Set by __attachResponseRequestCancellation: the hop's request
+      // controllers and whether its body was already wrapped.
+      requestControllers: undefined,
+      cancellationWrapped: false,
     };
     __weakSetAdd(__responseInstances, this);
     // Hono rebuilds a response after middleware with
@@ -1203,6 +1207,14 @@ __cello.$$isResponseInstance = (value) => __weakSetHas(__responseInstances, valu
 // refused by an uncloneable function brand. Walk the graph and refuse the
 // host instances this codec cannot round-trip.
 const __cloneHostName = (value) => {
+  // An RPC stub, service stub or opaque Proxy is never one of these hosts:
+  // it is stored through the stub envelope, and asking `instanceof` would run
+  // its traps (which touch guest-patchable builtins) inside the storage path.
+  if (typeof __stubMeta !== "undefined" &&
+      (__weakHas(__stubMeta, value) ||
+       __weakHas(__svcMeta, value) ||
+       __do_is_stub(value))) return null;
+  if (__util_proxy_details(value) !== undefined) return null;
   if (__cello.$$isRequestInstance(value)) return "Request";
   if (__cello.$$isResponseInstance(value)) return "Response";
   if (__cello.$$isHeadersInstance(value)) return "Headers";
@@ -1218,7 +1230,11 @@ const __cloneHostName = (value) => {
   if (value instanceof TransformStream) return "TransformStream";
   return null;
 };
-const __scEncodeStrict = (value) => {
+// Refuse the host instances the plain codec cannot round-trip, before any
+// queueing: `put()`'s single-key path hands the value straight to the Rust
+// serializer, which would store `{}` for a private-slot object instead of
+// raising workerd's DataCloneError.
+const __scRefuseHost = (value) => {
   const seen = new __primSet();
   const stack = [value];
   while (stack.length > 0) {
@@ -1232,6 +1248,13 @@ const __scEncodeStrict = (value) => {
         'Could not serialize object of type "' + host +
         '". This type does not support serialization.', "DataCloneError");
     }
+    // A stub crosses through its own envelope, so neither its traps nor its
+    // captured handles are walked here: `instanceof` on one runs guest-visible
+    // code inside the storage path.
+    if (typeof __stubMeta !== "undefined" &&
+        (__weakHas(__stubMeta, v) ||
+         __weakHas(__svcMeta, v) ||
+         __do_is_stub(v))) continue;
     if (v instanceof Date || v instanceof RegExp || v instanceof Error ||
         v instanceof ArrayBuffer || ArrayBuffer.isView(v) ||
         (typeof SharedArrayBuffer !== "undefined" &&
@@ -1249,13 +1272,13 @@ const __scEncodeStrict = (value) => {
     const keys = __primObjectKeys(v);
     for (let i = 0; i < keys.length; i++) stack.push(v[keys[i]]);
   }
+};
+const __scEncodeStrict = (value) => {
+  __scRefuseHost(value);
   return __sc_encode(value);
 };
 __cello.$$setResponseUrl = (response, url) => {
   __responseState(response).url = url;
-};
-__cello.$$setResponseWebSocket = (response, webSocket) => {
-  __responseState(response).webSocket = webSocket;
 };
 const __makeRequest = __cello.__makeRequest = (
   url, method, body, headersJson = "[]", signal = undefined,
@@ -1529,8 +1552,15 @@ const __fetchWebSocketUpgrade = __cello.__fetchWebSocketUpgrade =
     return response;
   }
   socketState.protocol = raw.protocol ?? "";
-  const response = new Response(null, { status: 101 });
-  __cello.$$setResponseWebSocket(response, socket);
+  // The host decides who drains the socket: it registered a pull queue only
+  // for a socket no cell owns, and recovered the dial's cell for a
+  // post-response continuation (#254). Adopt that answer instead of the
+  // actor-scope guess, which is empty exactly there.
+  socketState.polled = raw.pull === true;
+  // The socket is already bound to the host id, so it can ride the
+  // constructor: a 101 without a WebSocket (or an internal upgrade target)
+  // is refused, and setting it afterwards threw there (#165).
+  const response = new Response(null, { status: 101, webSocket: socket });
   __cello.$$setResponseUrl(response, req.url);
   return response;
 };
@@ -2077,6 +2107,8 @@ class R2Bucket {
 __webidlTag(R2Bucket, "R2Bucket");
 __webidlPrototype(R2Bucket);
 globalThis.R2Bucket = R2Bucket;
+// Brand for the clone codec: a bucket minted by the host, never a forged one.
+__cello.$$isR2Bucket = (value) => __weakGet(__r2BucketStates, value) !== undefined;
 __cello.__makeR2Bucket = (binding, bucketName) =>
   new R2Bucket(__r2Create, binding, bucketName);
 // A host timer op resolves once, so an interval arms a new one after every
@@ -2592,6 +2624,9 @@ class DurableObjectStorage {
     if (source.length === 0) return;
     const entries =
       source.map(([key, value]) => [String(key), value]);
+    // A batch refuses a host instance up front too: the native batch op
+    // serializes each entry itself and would store `{}` for one.
+    for (const [, value] of entries) __scRefuseHost(value);
     try {
       __storage_queue_put_many(this._scope, entries);
     } catch (error) {
@@ -6082,7 +6117,10 @@ const __stubLift = (value, allowCapabilities = true, originals, collector = null
   // crosses as a stream handle (a capability, so the reply
   // roots its callee context and the pulls keep working).
   const liftBody = (v) => {
-    if (__responseState(v).bytes !== null) return __responseState(v).bytes;
+    // Owner-aware: `#s` is a distinct private brand on Request and Response,
+    // so a Request's body state must be read through its own class.
+    const state = __bodyOwnerState(v);
+    if (state.bytes !== null) return state.bytes;
     caps = true;
     return __liftStream(v.body, host, collector);
   };
@@ -7735,21 +7773,18 @@ const __attachResponseRequestCancellation = (
       response.body === null) {
     return;
   }
-  const requestControllers = Array.isArray(
-    response.__celloRequestControllers,
-  )
-    ? response.__celloRequestControllers
-    : [requestController];
-  if (requestControllers !== response.__celloRequestControllers) {
-    Object.defineProperty(response, "__celloRequestControllers", {
-      value: requestControllers,
-    });
+  // The bookkeeping lives in the response's private state: an own field is
+  // guest-visible, and `body` is a prototype accessor now (#206).
+  const state = __responseState(response);
+  let requestControllers = state.requestControllers;
+  if (requestControllers === undefined) {
+    requestControllers = state.requestControllers = [requestController];
   } else {
     requestControllers.push(requestController);
   }
-  if (!wrapBody || response.__celloCancellationWrapped) return;
-  const reader = response.body.getReader();
-  response.body = new ReadableStream({
+  if (!wrapBody || state.cancellationWrapped === true) return;
+  const reader = state.body.getReader();
+  state.body = new ReadableStream({
     async pull(controller) {
       const result = await reader.read();
       if (result.done) controller.close();
@@ -7765,9 +7800,7 @@ const __attachResponseRequestCancellation = (
       } catch {}
     },
   }, { highWaterMark: 0 });
-  Object.defineProperty(response, "__celloCancellationWrapped", {
-    value: true,
-  });
+  state.cancellationWrapped = true;
 };
 // called on the owner node by the /__do/<scope> endpoint: run one object.
 // Returns the Response; Rust's read_response unwraps it (don't double-wrap).
@@ -8643,8 +8676,11 @@ __cello.__wsOpen = async (scope, wsId, protocol) => {
     const socket = inst.__celloState._socket(wsId);
     if (socket.readyState !== WebSocket.READY_STATE_CONNECTING) return;
     await __ctxRun(ctxId, async () => {
-      socket.protocol = protocol;
-      socket.readyState = WebSocket.READY_STATE_OPEN;
+      // Both are prototype accessors now, so the host writes the private
+      // socket state (#206).
+      const socketState = __wsState(socket);
+      socketState.protocol = protocol;
+      socketState.readyState = WebSocket.READY_STATE_OPEN;
       socket.dispatchEvent(new Event("open"));
     });
   } finally {
@@ -14737,10 +14773,6 @@ class ServiceWorkerGlobalScope extends WorkerGlobalScope {
   constructor(...args) { if (args[0] !== __interfaceToken) __illegal(); }
   get [Symbol.toStringTag]() { return "ServiceWorkerGlobalScope"; }
 }
-class Body {
-  constructor(...args) { if (args[0] !== __interfaceToken) __illegal(); }
-  get [Symbol.toStringTag]() { return "Body"; }
-}
 class Crypto {
   constructor(...args) { if (args[0] !== __interfaceToken) __illegal(); }
   get [Symbol.toStringTag]() { return "Crypto"; }
@@ -14757,7 +14789,9 @@ Object.defineProperty(TraceEvent, "name", {
 globalThis.PromiseRejectionEvent = PromiseRejectionEvent;
 globalThis.WorkerGlobalScope = WorkerGlobalScope;
 globalThis.ServiceWorkerGlobalScope = ServiceWorkerGlobalScope;
-globalThis.Body = Body;
+// `Body` is the real mixin installed with Request/Response; assigning the
+// empty stub here would orphan it, leaving `instanceof Body` false and
+// `Body.prototype` with no members (#206).
 globalThis.Crypto = Crypto;
 // `origin` is a global string on workerd, not the per-request URL.
 Object.defineProperty(globalThis, "origin", {
@@ -14942,6 +14976,11 @@ if (!globalThis.structuredClone) {
     // Types the runtime refuses to clone. They carry a constructor brand, so
     // a forged prototype clones as plain data as workerd does; a genuine
     // instance keeps the runtime's "Unsupported object type" refusal.
+    // A tuple's optional third entry is the refusal text: a stream and a
+    // bucket have their own in workerd, everything else answers the generic
+    // "Unsupported object type" (#206).
+    const brandFn = (name) => (v) =>
+      typeof __cello[name] === "function" && __cello[name](v) === true;
     const unsupported = [
       [Request, (v) => __cello.$$isRequestInstance(v)],
       [Response, (v) => __cello.$$isResponseInstance(v)],
@@ -14953,10 +14992,24 @@ if (!globalThis.structuredClone) {
         (v) => typeof __cello.$$isMessagePortInstance === "function" &&
           __cello.$$isMessagePortInstance(v)],
       [AbortSignal, (v) => __cello.$$isAbortSignalInstance(v)],
+      // The interfaces whose state moved into private slots without a brand
+      // entry: a genuine instance must refuse, not flatten to `{}` (#206).
+      [globalThis.ReadableStream, brandFn("$$isReadableStream"),
+        "ReadableStream can only be serialized for RPC"],
+      [globalThis.WritableStream, brandFn("$$isWritableStream"),
+        "WritableStream can only be serialized for RPC"],
+      [globalThis.TransformStream, brandFn("$$isTransformStream"),
+        'Could not serialize object of type "TransformStream". This type ' +
+        "does not support serialization."],
+      [globalThis.R2Bucket, brandFn("$$isR2Bucket"),
+        "An R2 bucket binding cannot be serialized."],
     ];
-    for (const [constructor, brand] of unsupported) {
+    for (const [constructor, brand, message] of unsupported) {
       if (typeof constructor !== "function") continue;
-      defineHostType(constructor.prototype, null, brand);
+      defineHostType(constructor.prototype,
+        message === undefined ? null : function() {
+          throw new DOMException(message, "DataCloneError");
+        }, brand);
     }
 
     let result;

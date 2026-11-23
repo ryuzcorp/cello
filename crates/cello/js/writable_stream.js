@@ -1001,6 +1001,13 @@ globalThis.TransformStreamDefaultController =
 // TransformStream's pair through these hooks; tenant code cannot reach
 // `__cello`.
 __cello.$$writableStreamState = __wsState;
+// Brands for the clone codec: a constructed stream, not a forged prototype.
+__cello.$$isWritableStream = (value) =>
+  value !== null && typeof value === "object" &&
+  _writableStates.has(value);
+__cello.$$isTransformStream = (value) =>
+  value !== null && typeof value === "object" &&
+  _transformStates.has(value);
 __cello.$$errorStream = (stream, e) =>
   __errorStream(__wsState(stream), e);
 __cello.$$setTransformPair = (target, readable, writable) => {

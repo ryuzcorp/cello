@@ -547,6 +547,12 @@ pub(super) fn op_ws_upgrade(
         owner.sockets.lock().unwrap().push(id);
         pull_tx
     });
+    // The reply tells the harness who drains this socket: a registered queue
+    // means the isolate pumps it, and a cell-owned socket with no queue is
+    // pushed by the host. The JS guessed from its actor scope, which is empty
+    // in a post-response continuation even when the host recovered the dial's
+    // cell (upstream #254).
+    let polled_by_isolate = pull.is_some();
     let (tx, rx) = tokio::sync::oneshot::channel();
     let sent = outbound_ws_tx().is_some_and(|sender| {
         sender
@@ -584,6 +590,7 @@ pub(super) fn op_ws_upgrade(
             None => serde_json::json!({
                 "upgraded": true,
                 "protocol": open.protocol.unwrap_or_default(),
+                "pull": polled_by_isolate,
             })
             .to_string(),
         })

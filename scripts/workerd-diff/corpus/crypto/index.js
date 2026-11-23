@@ -352,9 +352,9 @@ export default {
     }
 
     if (path === "/isolation-strict") {
-      // The Cello-only side of the same contract (workerd's own properties are
-      // mutable and its sign reads internal slots; Cello serves frozen copies,
-      // so a mutation attempt throws). Driven by the Rust conformance test.
+      // What the key reports vs what it does: the attributes are non-writable
+      // own data members whose values are mutable decoys, and every operation
+      // reads the internal slots. Driven by the Rust conformance test.
       const key = await crypto.subtle.importKey("raw", utf8("s"), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
       const before = hex(await crypto.subtle.sign("HMAC", key, utf8("m")));
       let mutate = "ok";
@@ -383,7 +383,17 @@ export default {
         accessor: descriptor.get !== undefined,
         enumerable: descriptor.enumerable,
         configurable: descriptor.configurable,
+        writable: descriptor.writable,
       };
+      // Reassigning the attribute itself is refused, as workerd refuses it.
+      let assign = "ok";
+      try {
+        key.type = "bogus";
+      } catch (error) {
+        assign = `${error.name}: ${error.message}`;
+      }
+      out.assignThrew = assign !== "ok";
+      out.typeAfterAssign = key.type;
 
       // The old registry's brand was a discoverable symbol. Assert no
       // symbol on the key or its prototype is callable as a serializer, and

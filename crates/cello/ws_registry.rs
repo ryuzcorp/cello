@@ -2090,6 +2090,30 @@ pub(crate) fn ws_close_facet(scope: &str, reason: &str) {
 }
 
 #[cfg(test)]
+mod socket_id_tests {
+    use super::*;
+
+    /// Script names sockets by number, so a sequential counter would let any
+    /// script adopt any socket. The ids a fresh allocator hands out are
+    /// unguessable: far above any sequential range a test fixture would
+    /// probe, never zero, and distinct from each other.
+    #[test]
+    fn allocated_socket_ids_are_unguessable() {
+        let mut ids = Vec::new();
+        for _ in 0..64 {
+            let id = ws_next_id();
+            assert!(id > 1_000_000, "a sequential socket id: {id}");
+            assert!(id <= 0x1FFF_FFFF_FFFF, "not f64-exact: {id}");
+            assert!(!ids.contains(&id), "allocator returned a duplicate: {id}");
+            ids.push(id);
+        }
+        ids.sort_unstable();
+        let span = ids[ids.len() - 1] - ids[0];
+        assert!(span > 1_000_000_000, "allocated ids are clustered: {ids:?}");
+    }
+}
+
+#[cfg(test)]
 mod join_handoff_tests {
     use super::*;
 

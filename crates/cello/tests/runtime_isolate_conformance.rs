@@ -128,7 +128,10 @@ impl TestNode {
     fn boot(app_project: &Path) -> Self {
         // Port zero: the OS assigns the worker port, so parallel boots
         // can never claim the same one; discovery below learns it.
-        let mut child = cello_command(app_project, [("NO_COLOR", "1")])
+        // The fixture reaches the D1 binding's test-only `_stub`, which the
+        // node defines only with CELLO_TEST_WAIT=1 (shipping isolates never
+        // have it), the way d1_export_gate.rs boots.
+        let mut child = cello_command(app_project, [("NO_COLOR", "1"), ("CELLO_TEST_WAIT", "1")])
             .arg("dev")
             .arg(app_project)
             .arg("--port")

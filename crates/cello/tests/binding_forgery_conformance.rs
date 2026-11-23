@@ -820,12 +820,19 @@ fn binding_forgery_conformance() {
         "{err}"
     );
 
-    // Socket ids are unguessable: a fresh allocation is never sequential.
+    // A socket exposes no host field at all: the id lives in the private
+    // socket state (#206). The allocator's unguessability is a host property
+    // and is pinned by a Rust unit test next to `ws_alloc`.
     let shape = get_json(&node, "/ws-id-shape");
     assert_eq!(shape["ok"], true, "{shape}");
-    assert!(
-        shape["id"].as_u64().unwrap_or(0) > 1_000_000,
-        "/ws-id-shape allocates a guessable id: {shape}"
+    assert_eq!(
+        shape["exposed"], false,
+        "/ws-id-shape exposes a socket field: {shape}"
+    );
+    assert_eq!(
+        shape["keys"],
+        serde_json::json!([]),
+        "/ws-id-shape has own keys: {shape}"
     );
 
     // Joining another cell's upgrade without its token is refused.
