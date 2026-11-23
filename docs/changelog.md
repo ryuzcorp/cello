@@ -101,6 +101,29 @@ columns, which is backward compatible (see below). The `eval`,
 `Function` and wasm runtime-compilation changes are listed after the stream
 fixes because they break bundles that relied on them.
 
+- **A released `WritableStreamDefaultWriter` matches workerd** (#193). A
+  released writer's `desiredSize` kept reporting the stream's size, and
+  `null` once the stream had errored; workerd throws
+  `TypeError: This WritableStream writer has been released.` in every
+  state, and so does cello now. `releaseLock()` also left `writer.ready`
+  carrying the stream's error, where workerd installs a freshly rejected
+  ready: a read after the release is always the released error, while a
+  handler attached before the release keeps the old settlement (still
+  resolved, or still the stream's error). `writer.closed` keeps its own
+  settlement once it has one, and still rejects with the released error
+  while pending. `write()`, `close()` and `abort()` keep rejecting with the
+  released error. The gate gained the `writer-released` case; both compared
+  against workerd 1.20261121.1.
+- **A compression stream's writable side closes after a failed write**
+  (#223). `DecompressionStream` and `CompressionStream` are internal
+  streams in workerd, and a failed push closes their writable side instead
+  of erroring it: a later `close()` or `write()` rejects with `TypeError:
+  This WritableStream has been closed.` instead of the stored
+  `Decompression failed.`, `desiredSize` is `0` and `abort()` resolves,
+  while `writer.closed` rejects with the failure and `writer.ready`
+  resolves. A plain `TransformStream` whose transform throws still errors
+  both sides, as before. The gate gained the
+  `decompression-close-after-error` case.
 - **A `WritableStream` refuses each state with workerd's own message**
   (#132). A second `writer.close()` on a closed stream reported the shared
   `TypeError: Stream already closed/errored` from the same early path as an
