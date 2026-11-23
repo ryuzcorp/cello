@@ -35,7 +35,9 @@ removals are listed again in the breaking-changes section below.
   close. An unknown format is rejected at construction with workerd's
   `TypeError: The compression format must be either 'deflate', 'deflate-raw',
   'gzip' or 'brotli'.`; a missing argument gets its
-  `constructor parameter 1 is not of type 'string'.` message. `flate2` is
+  `constructor parameter 1 is not of type 'string'.` message; a present
+  argument is stringified first, so an object with a `toString` or a number
+  gets the format message, as on workerd. `flate2` is
   bumped to 1.1.11 (patch) because 1.1.9 reports a truncated gzip stream as a
   checksum error, and only the newer release distinguishes it from corrupt
   input.
@@ -55,8 +57,10 @@ removals are listed again in the breaking-changes section below.
   `PerformanceObserver` exist. `mark()` returns a `PerformanceMark`, a
   measure's `start`/`end` resolve mark names, and `JSON.stringify` produces
   workerd's fields. The clock is unchanged: `timeOrigin` is `0` and both
-  clocks advance only at an I/O boundary. `PerformanceObserver` exists but
-  never delivers a callback inside a request, matching workerd.
+  clocks advance only at an I/O boundary. Mark and measure names are coerced
+  with `String()`, only a missing name throws, and `detail: null` is refused
+  as workerd does (only `undefined` means absent). `PerformanceObserver`
+  exists but never delivers a callback inside a request, matching workerd.
 - **The global scope has workerd's interface constructors and values** (#204,
   #205, #209). `reportError`, `origin` (`"null"`),
   `globalThis[Symbol.toStringTag]` (`"ServiceWorkerGlobalScope"`), the
@@ -64,13 +68,16 @@ removals are listed again in the breaking-changes section below.
   `TailEvent`, `TraceEvent`, `PromiseRejectionEvent`, `WorkerGlobalScope`,
   `ServiceWorkerGlobalScope` and `Body` constructors, and
   `URL.createObjectURL`/`revokeObjectURL` (both throwing workerd's
-  not-implemented `Error`) are present. `crypto` is a `Crypto` instance and
+  not-implemented `Error`) are present. `reportError` dispatches the `error`
+  event synchronously with workerd's `Uncaught <value>` message. `crypto` is a
+  `Crypto` instance and
   `navigator` a `Navigator` instance with `platform` `""` and `sendBeacon`.
   `console` has `context`, no `createTask`, and the `console` tag.
 - **Timers behave like workerd's** (#208, #219). `setTimeout`/`setInterval`
   are named functions with workerd's arity, return a `Timeout` object with
-  `refresh`/`ref`/`unref`/`hasRef`/`close` and a numeric primitive, and a
-  non-function callback throws
+  `refresh`/`ref`/`unref`/`hasRef`/`close` and a numeric primitive;
+  `close()` returns the handle, and `clearTimeout`/`clearInterval` accept the
+  handle or its numeric value. A non-function callback throws
   `TypeError: The "callback" argument must be of type function. Received …`
   synchronously instead of failing later as an unhandled rejection.
 - **Error text matches workerd where the type already did** (#214). `atob`,
@@ -513,8 +520,9 @@ Still divergent and left for the slices that own them: the internal-own-key and
 
 **Breaking:** four globals workerd does not define are removed (#204):
 `DigestStream` (a global alias; `crypto.DigestStream` remains), `FileReader`
-(construction only ever threw), `Temporal` (workerd's V8 build leaves it off),
-and `DurableObjectRoutingError` (an internal class that was never documented).
+(construction only ever threw), `Temporal` (workerd's V8 build leaves it off,
+including V8's `Date.prototype.toTemporalInstant` entry point), and
+`DurableObjectRoutingError` (an internal class that was never documented).
 A bundle that named one of them relied on Cello-only surface and gets
 `undefined` now, as on Cloudflare.
 

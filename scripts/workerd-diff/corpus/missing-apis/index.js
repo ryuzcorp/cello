@@ -145,6 +145,14 @@ const routes = {
         unknown: sync(() => new CompressionStream("bogus")),
         upper: sync(() => new CompressionStream("BROTLI")),
         decompressUnknown: sync(() => new DecompressionStream("bogus")),
+        // A present argument is stringified; only a missing one is the
+        // "parameter 1" error.
+        objectFormat: typeof new CompressionStream({ toString() { return "gzip"; } }),
+        boxedString: typeof new CompressionStream(new String("gzip")),
+        number: sync(() => new CompressionStream(5)),
+        explicitUndefined: sync(() => new CompressionStream(undefined)),
+        nullFormat: sync(() => new CompressionStream(null)),
+        decompressNumber: sync(() => new DecompressionStream(5)),
       },
       formats: Object.fromEntries(["gzip", "deflate", "deflate-raw"].map(
         (format) => [format, typeof new CompressionStream(format)])),
@@ -260,7 +268,21 @@ const routes = {
       },
       markErrors: {
         none: sync(() => performance.mark()),
+        measureNone: sync(() => performance.measure()),
         detail: sync(() => performance.mark("x", { detail: "s" })),
+        // Only undefined is the absent detail; null is not an Object.
+        detailNull: sync(() => performance.mark("x", { detail: null })),
+        measureDetailNull: sync(() => performance.measure("x", { detail: null })),
+        detailUndefined: performance.mark("x", { detail: undefined }).detail,
+      },
+      // DOMString coercion: only a missing name throws.
+      nameCoercion: {
+        markNumber: performance.mark(5).name,
+        markBoolean: performance.mark(true).name,
+        markNull: performance.mark(null).name,
+        measureNumber: performance.measure(5).name,
+        constructNumber: new PerformanceMark(5).name,
+        constructNull: new PerformanceMark(null).name,
       },
       observeAcceptsAnything: sync(() => {
         const any = new PerformanceObserver(() => {});
@@ -289,6 +311,22 @@ const routes = {
         length: reportError.length,
         returns: reportError(new Error("probe")) === undefined,
         noArgument: sync(() => reportError()),
+        // Workerd dispatches synchronously, message "Uncaught " + String(v).
+        dispatch: (() => {
+          const events = [];
+          const listener = (event) => events.push({
+            type: event.type,
+            message: event.message,
+            error: event.error && event.error.message,
+            cancelable: event.cancelable,
+          });
+          addEventListener("error", listener);
+          reportError(new Error("x"));
+          const afterError = events.length;
+          reportError("plain");
+          removeEventListener("error", listener);
+          return { afterError, events };
+        })(),
       },
       constructors: Object.fromEntries([
         "Body", "Crypto", "FetchEvent", "Navigator", "Performance", "PromiseRejectionEvent",
@@ -332,6 +370,8 @@ const routes = {
       },
       extras: Object.fromEntries(["DigestStream", "DurableObjectRoutingError", "FileReader",
         "Temporal"].map((name) => [name, typeof globalThis[name]])),
+      // Removing the namespace must remove V8's Date entry point too.
+      temporalEntryPoint: typeof Date.prototype.toTemporalInstant,
       digestStream: typeof crypto.DigestStream,
       cryptoInstance: {
         ctor: crypto.constructor.name,
@@ -354,9 +394,11 @@ const routes = {
     const hasRef = handle.hasRef();
     const refReturns = handle.ref() === handle;
     const unrefReturns = handle.unref() === handle;
+    const closeHandle = setTimeout(() => {}, 100000);
+    const closeReturns = closeHandle.close() === closeHandle;
     clearInterval(handle);
     clearInterval(handle);
-    return report(await new Promise((resolve) => {
+    const base = await new Promise((resolve) => {
       order.push("sync");
       const timeout = setTimeout(() => order.push("timeout"), 0);
       Promise.resolve().then(() => order.push("microtask"));
@@ -379,6 +421,7 @@ const routes = {
             hasRef,
             refReturns,
             unrefReturns,
+            closeReturns,
           },
           clearedTwice: true,
           clearNumber: clearTimeout(1) === undefined,
@@ -392,7 +435,33 @@ const routes = {
         });
       };
       setTimeout(callback, 0, "delivered");
-    }));
+    });
+    // A numeric id is a valid clear handle (a bundle may persist `+handle`).
+    const numberClear = await new Promise((resolve) => {
+      let fired = false;
+      const timeout = setTimeout(() => { fired = true; }, 0);
+      clearTimeout(Number(timeout));
+      setTimeout(() => resolve({ fired }), 0);
+    });
+    const numberClearInterval = await new Promise((resolve) => {
+      let ticks = 0;
+      const interval = setInterval(() => { ticks++; }, 0);
+      clearInterval(Number(interval));
+      setTimeout(() => resolve({ ticks }), 0);
+    });
+    // A fired one-shot's id is spent: clearing it must not cancel the
+    // refreshed arm, which got a new id.
+    const staleId = await new Promise((resolve) => {
+      let count = 0;
+      const timeout = setTimeout(() => { count++; }, 0);
+      const stale = Number(timeout);
+      setTimeout(() => {
+        timeout.refresh();
+        clearTimeout(stale);
+        setTimeout(() => resolve({ count }), 0);
+      }, 0);
+    });
+    return report({ ...base, numberClear, numberClearInterval, staleId });
   },
 
   // #214: error text where the type and code already agreed.

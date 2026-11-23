@@ -25,6 +25,9 @@
   // exposes DigestStream but no global does; FileReader and the internal
   // routing error have no workerd counterpart at all.
   delete globalThis.Temporal;
+  // V8's Temporal build also hangs an entry point off Date; leaving it makes
+  // `if (Date.prototype.toTemporalInstant)` feature detection true.
+  delete Date.prototype.toTemporalInstant;
   delete globalThis.DigestStream;
   delete globalThis.FileReader;
   delete globalThis.DurableObjectRoutingError;

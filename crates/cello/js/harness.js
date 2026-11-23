@@ -1880,6 +1880,10 @@ const __invalidTimerCallback = (callback) => {
   return new TypeError(
     'The "callback" argument must be of type function. ' + received);
 };
+// Numeric ids back to their handle, so `clearTimeout(Number(handle))` cancels
+// as workerd does (a bundle that persists or does arithmetic on the handle
+// loses the object but keeps the id).
+const __timerHandles = new Map();
 class Timeout {
   #id;
   #op = 0;
@@ -1895,6 +1899,7 @@ class Timeout {
     this.#args = args;
     this.#repeat = repeat;
     this.#arm();
+    __timerHandles.set(id, this);
   }
   #arm() {
     const op = __timer_alloc();
@@ -1915,7 +1920,13 @@ class Timeout {
       // `clearInterval` inside the callback must end the interval, and
       // arming after the callback would undo it.
       if (this.#repeat) this.#arm();
-      else this.#live = false;
+      else {
+        this.#live = false;
+        // A fired one-shot is spent: a stale numeric id must not find it.
+        if (__timerHandles.get(this.#id) === this) {
+          __timerHandles.delete(this.#id);
+        }
+      }
       this.#callback(...this.#args);
     };
     __op_timer(op, this.#delay).then(fire, fire);
@@ -1923,11 +1934,15 @@ class Timeout {
   refresh() {
     if (this.#live) this.#cancel();
     this.#id = __timer_alloc();
+    __timerHandles.set(this.#id, this);
     this.#arm();
     return this;
   }
   #cancel() {
     this.#live = false;
+    if (__timerHandles.get(this.#id) === this) {
+      __timerHandles.delete(this.#id);
+    }
     if (this.#op !== 0) {
       __timer_cancel(this.#op);
       this.#op = 0;
@@ -1936,7 +1951,7 @@ class Timeout {
   ref() { return this; }
   unref() { return this; }
   hasRef() { return true; }
-  close() { this.#cancel(); }
+  close() { this.#cancel(); return this; }
   [Symbol.toPrimitive]() { return this.#id; }
 }
 globalThis.setTimeout = function setTimeout(callback, ms, ...args) {
@@ -1952,6 +1967,8 @@ globalThis.setInterval = function setInterval(callback, ms, ...args) {
 // One id space and one cancel, because a caller can cross the two.
 const __closeTimer = (handle) => {
   if (handle instanceof Timeout) handle.close();
+  else if (typeof handle === "number")
+    __timerHandles.get(handle)?.close();
 };
 globalThis.clearTimeout = function clearTimeout(handle) {
   __closeTimer(handle);
@@ -13847,8 +13864,9 @@ const __perfToken = Symbol("cello.Performance");
 const __perfEntryToken = Symbol("cello.PerformanceEntry");
 const __perfListToken = Symbol("cello.PerformanceObserverEntryList");
 const __perfDetail = (detail) => {
-  if (detail === undefined || detail === null) return null;
-  if (typeof detail !== "object" && typeof detail !== "function")
+  if (detail === undefined) return null;
+  if (detail === null ||
+      (typeof detail !== "object" && typeof detail !== "function"))
     throw new TypeError(
       "Incorrect type for the 'detail' field on 'Options': the provided " +
       "value is not of type 'Object'.");
@@ -13880,11 +13898,11 @@ class PerformanceEntry {
 // mark() changes the entry).
 class PerformanceMark extends PerformanceEntry {
   constructor(...args) {
-    const name = args[0];
-    if (args.length === 0 || typeof name !== "string")
+    if (args.length === 0)
       throw new TypeError(
         "Failed to construct 'PerformanceMark': constructor parameter 1 " +
         "is not of type 'string'.");
+    const name = String(args[0]);
     super(__perfEntryToken);
     const options = args[1] == null ? {} : args[1];
     __perfData.set(this, {
@@ -14078,21 +14096,21 @@ class Performance extends EventTarget {
       (entry) => entry.entryType === String(type));
   }
   mark(...args) {
-    const name = args[0];
-    if (args.length === 0 || typeof name !== "string")
+    if (args.length === 0)
       throw new TypeError(
         "Failed to execute 'mark' on 'Performance': parameter 1 is not " +
         "of type 'string'.");
+    const name = String(args[0]);
     const entry = new PerformanceMark(name, args[1]);
     __perfEntries.push(entry);
     return entry;
   }
   measure(...args) {
-    const name = args[0];
-    if (args.length === 0 || typeof name !== "string")
+    if (args.length === 0)
       throw new TypeError(
         "Failed to execute 'measure' on 'Performance': parameter 1 is " +
         "not of type 'string'.");
+    const name = String(args[0]);
     const second = args[1];
     let start;
     let end;
@@ -14270,12 +14288,10 @@ globalThis.reportError = function reportError(...args) {
       "parameter 1 is not of type 'Value'.");
   const value = args[0];
   const error = value instanceof Error ? value : undefined;
-  queueMicrotask(() => {
-    globalThis.dispatchEvent(new ErrorEvent("error", {
-      error,
-      message: error ? error.message : String(value),
-    }));
-  });
+  globalThis.dispatchEvent(new ErrorEvent("error", {
+    error,
+    message: "Uncaught " + String(value),
+  }));
 };
 // Object URLs need a blob registry workerd does not implement either: both
 // statics exist and throw its own message.

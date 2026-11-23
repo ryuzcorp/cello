@@ -436,19 +436,22 @@ interface constructors workerd defines exist here too — `Crypto`,
 `instanceof` agree. Only `PerformanceMark` and `PerformanceObserver` are
 constructible from script; every other one throws `TypeError: Illegal
 constructor`. `crypto` is a `Crypto` instance and `navigator` a `Navigator`
-instance (with `platform` `""` and `sendBeacon`). `reportError` exists;
-`URL.createObjectURL` and `URL.revokeObjectURL` exist and throw workerd's
+instance (with `platform` `""` and `sendBeacon`). `reportError` exists and
+dispatches the global `error` event synchronously, with workerd's
+`Uncaught <value>` message; `URL.createObjectURL` and `URL.revokeObjectURL`
+exist and throw workerd's
 `Error: URL.createObjectURL() is not implemented`, because it does not
 implement them either.
 
 Four globals Cello used to expose have been removed to match workerd:
 `DigestStream` (it remains at `crypto.DigestStream`), `FileReader`,
-`Temporal` (workerd's V8 build leaves it off), and the internal
+`Temporal` (workerd's V8 build leaves it off, along with V8's
+`Date.prototype.toTemporalInstant`), and the internal
 `DurableObjectRoutingError`. `MessageEvent` is constructible with workerd's
 `data`/`origin`/`lastEventId`/`source`/`ports` and its own non-writable
 properties. A `CompressionStream`/`DecompressionStream` accepts `brotli`
-(byte-identical to workerd's output) and rejects an unknown format with
-workerd's own TypeError. A `structuredClone` of a compiled
+(byte-identical to workerd's output), stringifies a present format argument,
+and rejects an unknown format with workerd's own TypeError. A `structuredClone` of a compiled
 `WebAssembly.Module` throws `Error: Unable to deserialize cloned data.`, as
 on workerd, so a module never crosses the clone boundary.
 
@@ -488,8 +491,11 @@ inside a request — measured on workerd 1.20261121.1, and `takeRecords()`
 returns an empty array on both.
 
 A timer returns a `Timeout` object rather than a number: `refresh()`,
-`ref()`, `unref()`, `hasRef()`, `close()`, and a numeric primitive. A
-non-function callback throws workerd's TypeError synchronously.
+`ref()`, `unref()`, `hasRef()`, `close()` (returning the handle), and a
+numeric primitive. `clearTimeout`/`clearInterval` accept either the handle or
+its numeric value. A non-function callback throws workerd's TypeError
+synchronously. Mark and measure names are coerced with `String()`, and
+`detail: null` is refused where `undefined` means absent.
 
 ### [Node.js compatibility](https://developers.cloudflare.com/workers/runtime-apis/nodejs/)
 
