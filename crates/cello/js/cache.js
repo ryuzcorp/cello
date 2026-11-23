@@ -47,9 +47,10 @@
   // coercion a string chunk made `size` NaN, the target array empty, and the
   // copy threw `RangeError: offset is out of bounds` with nothing stored.
   const encoder = new TextEncoder();
-  // Captured at install time: the harness declares `__bodyChunk` in its own
-  // script scope, so it reaches this script only through `__cello`.
+  // Captured at install time: the harness declares these in its own script
+  // scope, so they reach this script only through `__cello`.
   const bodyChunk = __cello.__bodyChunk;
+  const markBodyUsed = __cello.__markBodyUsed;
   const chunkBytes = (value) =>
     typeof value === "string" ? encoder.encode(value) : bodyChunk(value);
 
@@ -68,7 +69,7 @@
       const buffered = new Uint8Array(await response.arrayBuffer());
       return buffered.byteLength > MAX_ENTRY_BYTES ? null : buffered;
     }
-    __cello.__markBodyUsed(response);
+    markBodyUsed(response);
     const reader = response.body.getReader();
     const chunks = [];
     let size = 0;
