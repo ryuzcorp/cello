@@ -1161,6 +1161,8 @@ globalThis.ByteLengthQueuingStrategy =
 // The runtime's own modules read a stream's private state and close it out
 // through these hooks; tenant code cannot reach `__cello`.
 __cello.$$readableState = __rsState;
+// Brand for the clone codec: a constructed stream, not a forged prototype.
+__cello.$$isReadableStream = __rsIs;
 __cello.$$isReadableStream = __rsIs;
 __cello.$$finishCloseStream = (stream) =>
   __finishClose(__rsState(stream));

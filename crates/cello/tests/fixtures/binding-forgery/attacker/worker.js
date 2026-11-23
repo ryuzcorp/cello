@@ -1347,11 +1347,17 @@ export default {
           return { stored, rpc, forged };
         }
         case 'ws-id-shape': {
-          // The id lives in the private socket state (#206); the conformance
-          // node boots with CELLO_TEST_WAIT=1, which defines the test-only
-          // reader for it.
+          // The id and every other host field live in the private socket
+          // state now (#206): a guest must see none of them. The allocator's
+          // unguessability is a host property and is checked by a Rust unit
+          // test (ws_alloc), not from inside the isolate.
           const pair = new WebSocketPair();
-          return { id: globalThis.__celloSocketIdForTestOnly?.(pair[0]) };
+          return {
+            ok: true,
+            exposed: Object.getOwnPropertyNames(pair[0]).length > 0 ||
+              pair[0]._id !== undefined,
+            keys: Object.getOwnPropertyNames(pair[0]),
+          };
         }
         case 'ws-bind-forge': {
           const scope = `AttackerDO:${await doIdHex(

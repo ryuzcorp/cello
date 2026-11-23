@@ -318,8 +318,9 @@ fn crypto_key_state_lives_in_internal_slots() {
         "KeyObject.from(non-extractable).export() succeeded: {isolation}"
     );
 
-    // Cello-only shape: the properties are frozen copies and operations read
-    // slots, so a mutation attempt cannot change a signature.
+    // workerd's shape: the attribute itself is a non-writable own data member
+    // holding a mutable decoy, and every operation reads the internal slots,
+    // so neither a reassignment nor a nested mutation changes a signature.
     let strict = json(&node.public, "/isolation-strict");
     let mutation = strict.get("mutation").expect("mutation probe");
     assert_eq!(
@@ -327,40 +328,57 @@ fn crypto_key_state_lives_in_internal_slots() {
         Some(true),
         "mutating key.algorithm changed the HMAC hash: {strict}"
     );
+    // The decoy is mutable, exactly as workerd's is: the reported hash and
+    // the usages array change, while the signature above did not.
     assert_eq!(
         mutation.get("reported").and_then(|v| v.as_str()),
-        Some("SHA-256"),
-        "the key reported the mutated hash: {strict}"
+        Some("SHA-1"),
+        "the algorithm copy is not the mutable decoy workerd exposes: {strict}"
     );
     assert_eq!(
         strict.get("mutateThrew").and_then(|v| v.as_bool()),
-        Some(true),
-        "the algorithm copy is not frozen: {strict}"
+        Some(false),
+        "mutating the algorithm copy threw: {strict}"
     );
     assert_eq!(
         strict.get("pushThrew").and_then(|v| v.as_bool()),
-        Some(true),
-        "the usages copy is not frozen: {strict}"
+        Some(false),
+        "pushing into the usages copy threw: {strict}"
     );
     assert_eq!(
         strict.get("usagesAfterPush"),
-        Some(&serde_json::json!(["sign"])),
-        "usages changed: {strict}"
+        Some(&serde_json::json!(["sign", "verify"])),
+        "usages copy is not live: {strict}"
     );
     assert_eq!(
         strict.get("algorithmFrozen").and_then(|v| v.as_bool()),
-        Some(true),
-        "algorithm dictionary is not frozen: {strict}"
+        Some(false),
+        "algorithm dictionary is frozen: {strict}"
     );
     assert_eq!(
         strict.get("usagesFrozen").and_then(|v| v.as_bool()),
-        Some(true),
-        "usages array is not frozen: {strict}"
+        Some(false),
+        "usages array is frozen: {strict}"
     );
+    // ... but the attribute itself cannot be reassigned (workerd throws).
+    assert_eq!(
+        strict.get("assignThrew").and_then(|v| v.as_bool()),
+        Some(true),
+        "reassigning key.type was allowed: {strict}"
+    );
+    assert_eq!(
+        strict.get("typeAfterAssign").and_then(|v| v.as_str()),
+        Some("secret"),
+        "key.type changed by assignment: {strict}"
+    );
+    // workerd reflects `algorithm` as an own enumerable data member, not an
+    // accessor (#206); the value is a detached copy, which the mutation
+    // assertions above already prove.
     let descriptor = strict.get("descriptor").expect("descriptor probe");
     assert_eq!(
         descriptor.get("accessor").and_then(|v| v.as_bool()),
-        Some(true)
+        Some(false),
+        "algorithm is not an own data member: {strict}"
     );
     assert_eq!(
         descriptor.get("enumerable").and_then(|v| v.as_bool()),
@@ -369,6 +387,11 @@ fn crypto_key_state_lives_in_internal_slots() {
     assert_eq!(
         descriptor.get("configurable").and_then(|v| v.as_bool()),
         Some(true)
+    );
+    assert_eq!(
+        descriptor.get("writable").and_then(|v| v.as_bool()),
+        Some(false),
+        "algorithm attribute is writable: {strict}"
     );
 
     // The clone registry leaves no symbol to steal, and copying a real

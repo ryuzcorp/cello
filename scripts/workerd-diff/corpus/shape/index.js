@@ -290,6 +290,11 @@ const routes = {
       reqMethodDescriptor: d(reqProto, "method"),
       responseStatusDescriptor: d(resProto, "status"),
       bodyIsGlobal: typeof globalThis.Body,
+      // The global must name the mixin that is really in the prototype
+      // chain, or `instanceof Body` is false and its members vanish (#206).
+      requestIsBody: request instanceof Body,
+      responseIsBody: response instanceof Body,
+      bodyProtoMembers: Object.getOwnPropertyNames(Body.prototype).sort(),
       bodyCtorProto: String(Object.getPrototypeOf(bodyProto.constructor).name),
       domExceptionIsError: new DOMException("m", "AbortError") instanceof Error,
       domExceptionCtorOwn: Object.getOwnPropertyNames(DOMException).join(" | "),

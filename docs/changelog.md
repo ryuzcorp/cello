@@ -123,21 +123,30 @@ removals are listed again in the breaking-changes section below.
   1.20261121.1; the remaining, reflection-only differences (interface
   `prototype` writability, V8's method `length`s and D1 sessions) are listed
   in the compatibility page.
+- **A released writer and a failed compression write answer as workerd does**
+  (#193, #223) after the stream state moved into private slots: a released
+  `WritableStreamDefaultWriter` throws from `desiredSize` in every state and
+  installs a fresh rejected `ready`, and a failed compression write closes the
+  writable side instead of erroring it (`closesOnError` is a field of the
+  private writable state, so the opt-in cannot be lost).
 - **The differential gate now pins the reflected shape of every interface**
   (#170, #171, #206, #207). Nine `shape-*` cases compare own properties,
   prototype members and their enumerability, the interface tags, constructor
   names and lengths, `JSON.stringify` output and `Object.prototype.toString`
   between workerd 1.20261121.1 and Cello, for the Fetch types, events, the
   stream family, Web Crypto, the KV/R2/D1 bindings and `WebSocket`. Every case
-  agrees.
-- **A host value can no longer cross RPC or storage as inert data** (#170).
-  The RPC projection marks a private-state host -- a signal, `Request`,
-  `Response`, `Headers`, `Blob`, `CryptoKey` or a stream -- as a host value,
-  so it takes the lift path instead of a structured clone that would have
-  flattened it to `{}`. The persisted codec refuses those values outright
-  with workerd's `DataCloneError` text, where a private slot used to store
-  `{}`. A stream still crosses a caller boundary as a
-  `DataCloneError`, exactly as before.
+  agrees -- 201 cases, including the stream-edge cases from #193/#223.
+- **A host value can no longer cross RPC as inert data** (#170). The RPC
+  projection marks a private-state host -- a signal, `Request`, `Response`,
+  `Headers`, `Blob`, `CryptoKey` or a stream -- as a host value, so it takes
+  the lift path instead of a structured clone that would have flattened it to
+  `{}`. The queue, attachment, workflow and batched-storage paths refuse those
+  values with workerd's `DataCloneError` text. A stream still crosses a caller
+  boundary as a `DataCloneError`, exactly as before. **Not yet covered:** a
+  single-key `storage.put(key, value)` still hands the value to the host
+  serializer, which stores `{}` for a private-slot host; refusing it there
+  needs the check on the host side, because a JavaScript pre-walk would run a
+  stored stub's traps.
 
 Two more `WritableStream` divergences from workerd are fixed, and the
 tee-skew conformance test no longer assumes which of a tee's copies the skew

@@ -339,21 +339,20 @@
     return slots;
   }
 
-  // A detached copy of a key algorithm dictionary: arrays and typed arrays
-  // are new, and the dictionaries are frozen so a mutation cannot reach the
-  // slots. `Object.freeze` throws on a typed array with elements, so views
-  // are copied but left extensible.
+  // A detached copy of a key algorithm dictionary. Workerd's own attribute
+  // is a mutable decoy: `key.algorithm.name = "bogus"` takes effect on what
+  // the object reports, while the operations keep reading the internal slots
+  // (measured on 1.20261121.1). The copy is deep so a nested mutation cannot
+  // alias the slots, but it is deliberately not frozen.
   function _copyKeyAlgorithm(value) {
     if (ArrayBuffer.isView(value)) return value.slice();
-    if (Array.isArray(value)) {
-      return Object.freeze(value.map(_copyKeyAlgorithm));
-    }
+    if (Array.isArray(value)) return value.map(_copyKeyAlgorithm);
     if (value !== null && typeof value === "object") {
       const copy = {};
       for (const [name, member] of Object.entries(value)) {
         copy[name] = _copyKeyAlgorithm(member);
       }
-      return Object.freeze(copy);
+      return copy;
     }
     return value;
   }
@@ -374,26 +373,27 @@
       material,
     };
     _KEY_SLOTS.set(this, slots);
-    // Workerd's own-property shape: four enumerable data members in the
-    // order usages, algorithm, extractable, type (#206). These are detached
-    // copies for reflection only -- every operation reads the slots, so a
-    // guest assignment cannot change what a key does (#197 review F2).
+    // Workerd's own-property shape: four enumerable, non-writable data
+    // members in the order usages, algorithm, extractable, type (#206).
+    // The values are mutable copies for reflection only -- every operation
+    // reads the slots, so neither reassigning the member nor mutating the
+    // copy can change what a key does (#197 review F2).
     Object.defineProperties(this, {
       usages: {
-        value: Object.freeze(Array.from(slots.usages)),
-        writable: true, enumerable: true, configurable: true,
+        value: Array.from(slots.usages),
+        writable: false, enumerable: true, configurable: true,
       },
       algorithm: {
         value: _copyKeyAlgorithm(slots.algorithm),
-        writable: true, enumerable: true, configurable: true,
+        writable: false, enumerable: true, configurable: true,
       },
       extractable: {
         value: slots.extractable,
-        writable: true, enumerable: true, configurable: true,
+        writable: false, enumerable: true, configurable: true,
       },
       type: {
         value: slots.type,
-        writable: true, enumerable: true, configurable: true,
+        writable: false, enumerable: true, configurable: true,
       },
     });
   }
