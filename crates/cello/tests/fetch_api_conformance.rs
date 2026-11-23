@@ -9,28 +9,31 @@
 
 //! The Fetch API object model answers what workerd 1.20261121.1 answers.
 //!
-//! Every assertion here is one divergence the differential harness found and
-//! filed: a string body's default `content-type` (#159), cache modes (#160),
-//! an incoming request's `manual` redirect mode (#161), `Response` status
-//! validation (#163), a body on a null-body status (#165), CR/LF in
+//! Every test below is one group of divergences the differential harness found
+//! and filed: a string body's default `content-type` (#159), cache modes
+//! (#160), an incoming request's `manual` redirect mode (#161), `Response`
+//! status validation (#163), a body on a null-body status (#165), CR/LF in
 //! `statusText` (#167), immutable incoming headers (#169), the abort reason
 //! wording (#172), a followed redirect's `url`/`redirected` (#173), relative
 //! URLs in `new Request` (#175), a GET/HEAD body (#176), `integrity`/
 //! `keepalive` defaults (#177), a non-signal `signal` and a non-empty
 //! `integrity` (#178), `File.lastModified` (#179), the retained
 //! `content-length` (#180), header validation messages (#182), URL /
-//! `AbortSignal.any` / redirect error messages (#184), `blob().type` (#186),
-//! a FormData Blob's name (#188) and TRACE (#190).
+//! `AbortSignal.any` / redirect error messages (#184), `blob().type` (#186), a
+//! FormData Blob's name (#188) and TRACE (#190).
 //!
-//! The same Worker runs on workerd under `scripts/workerd-diff`, so the
-//! transcripts are pinned on both sides.
+//! One test per group, each booting its own `cello dev`, so a regression names
+//! the behaviour it broke instead of stopping at the first assertion. The
+//! boots are serialized: eight dev nodes at once would only fight for the
+//! machine. The same Worker runs on workerd under `scripts/workerd-diff`, so
+//! the transcripts are pinned on both sides.
 
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 mod common;
@@ -43,6 +46,16 @@ const GZIP_BODY: [u8; 30] = [
     31, 139, 8, 0, 0, 0, 0, 0, 0, 3, 203, 72, 205, 201, 201, 87, 72, 175, 202, 44, 0, 0, 25, 106,
     210, 223, 10, 0, 0, 0,
 ];
+
+/// One boot at a time: every test needs a `cello dev`, and eight concurrent
+/// nodes only contend for CPU. A panicking test poisons the lock, which the
+/// next one must survive, so the poison is taken over rather than unwrapped.
+fn serial() -> MutexGuard<'static, ()> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poison: std::sync::PoisonError<_>| poison.into_inner())
+}
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -77,8 +90,15 @@ fn copy_dir(src: &Path, dst: &Path, origin_port: u16) {
     .expect("write worker.js");
 }
 
-/// A booted `cello dev` and its address. Kills the child on drop, so a
-/// failing assertion cannot leak a server onto its port.
+/// A booted `cello dev`, its fixture copy and its helper origin. The child is
+/// killed on drop, so a failing assertion cannot leak a server onto its port.
+struct Booted {
+    node: TestNode,
+    /// Held only for its lifetime: dropping the tempdir removes the fixture
+    /// copy the node booted from.
+    _project: tempfile::TempDir,
+}
+
 struct TestNode {
     child: Child,
     public: String,
@@ -127,6 +147,21 @@ impl Drop for TestNode {
     }
 }
 
+/// Boots one fixture copy and the helper origin its `fetch()` calls reach.
+fn boot(prefix: &str) -> Booted {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind origin");
+    let origin_port = listener.local_addr().expect("origin addr").port();
+    std::thread::spawn(move || serve_origin(listener));
+    let fixture = fixture_dir();
+    let project = fixture_tempdir(prefix);
+    copy_dir(&fixture, project.path(), origin_port);
+    let node = TestNode::boot(project.path());
+    Booted {
+        node,
+        _project: project,
+    }
+}
+
 fn read_head(stream: &mut TcpStream) -> Vec<u8> {
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
@@ -141,7 +176,8 @@ fn read_head(stream: &mut TcpStream) -> Vec<u8> {
 }
 
 /// The helper origin the fixture fetches, so its `fetch()` calls do not target
-/// this Worker. It answers plain HTTP/1.1 on loopback.
+/// this Worker. It answers plain HTTP/1.1 on loopback, one response per
+/// connection, always with an exact `Content-Length`.
 fn serve_origin(listener: TcpListener) {
     for stream in listener.incoming() {
         let Ok(mut stream) = stream else {
@@ -156,27 +192,26 @@ fn serve_origin(listener: TcpListener) {
             let method = parts.next().unwrap_or_default();
             let target = parts.next().unwrap_or_default();
             if target.starts_with("/redirect") {
-                let code = target
-                    .split("code=")
-                    .nth(1)
-                    .and_then(|rest| rest.split('&').next())
-                    .unwrap_or("302");
-                let to = target
-                    .split("to=")
-                    .nth(1)
-                    .and_then(|rest| rest.split('&').next())
-                    .unwrap_or("/target");
-                let response = format!(
-                    "HTTP/1.1 {code} Found\r\nLocation: {to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                let code = query(&target, "code").unwrap_or("302");
+                let to = query(&target, "to").unwrap_or("/target");
+                respond(
+                    &mut stream,
+                    &format!("{code} Found"),
+                    &[("Location", to), ("Content-Length", "0")],
+                    b"",
                 );
-                let _ = stream.write_all(response.as_bytes());
             } else if target.starts_with("/gzip") {
-                let head = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    GZIP_BODY.len()
+                let length = GZIP_BODY.len().to_string();
+                respond(
+                    &mut stream,
+                    "200 OK",
+                    &[
+                        ("Content-Type", "text/plain"),
+                        ("Content-Encoding", "gzip"),
+                        ("Content-Length", &length),
+                    ],
+                    &GZIP_BODY,
                 );
-                let _ = stream.write_all(head.as_bytes());
-                let _ = stream.write_all(&GZIP_BODY);
             } else if target.starts_with("/echo") {
                 // Reproduce the request head so the test can assert the
                 // subrequest carried a default content type (#159).
@@ -196,24 +231,47 @@ fn serve_origin(listener: TcpListener) {
                     "headers": Value::Object(headers),
                 })
                 .to_string();
-                let head = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
+                let length = body.len().to_string();
+                respond(
+                    &mut stream,
+                    "200 OK",
+                    &[
+                        ("Content-Type", "application/json"),
+                        ("Content-Length", &length),
+                    ],
+                    body.as_bytes(),
                 );
-                let _ = stream.write_all(head.as_bytes());
-                let _ = stream.write_all(body.as_bytes());
             } else {
-                let body = b"target-body";
-                let head = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
+                respond(
+                    &mut stream,
+                    "200 OK",
+                    &[
+                        ("Content-Type", "text/plain"),
+                        ("Content-Length", &"target-body".len().to_string()),
+                    ],
+                    b"target-body",
                 );
-                let _ = stream.write_all(head.as_bytes());
-                let _ = stream.write_all(body);
             }
             let _ = stream.flush();
         });
     }
+}
+
+fn query<'a>(target: &'a str, name: &str) -> Option<&'a str> {
+    target
+        .split('&')
+        .find_map(|pair| pair.strip_prefix(&format!("{name}=")))
+}
+
+/// One HTTP/1.1 response, framed by an exact `Content-Length` and closed.
+fn respond(stream: &mut TcpStream, status: &str, headers: &[(&str, &str)], body: &[u8]) {
+    let mut head = format!("HTTP/1.1 {status}\r\n");
+    for (name, value) in headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str("Connection: close\r\n\r\n");
+    let _ = stream.write_all(head.as_bytes());
+    let _ = stream.write_all(body);
 }
 
 fn get(addr: &str, path: &str) -> Result<(u16, String), String> {
@@ -304,20 +362,13 @@ fn assert_outcome(value: &Value, expected: &str, what: &str) {
     assert_eq!(outcome(value), expected, "{what}: {value}");
 }
 
+// #159 / #186: a string body's default type, bytes staying untyped, and the
+// parsed MIME type of a Blob built from a response.
 #[test]
-fn fetch_api_object_model_matches_workerd() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind origin");
-    let origin_port = listener.local_addr().expect("origin addr").port();
-    std::thread::spawn(move || serve_origin(listener));
-
-    let fixture = fixture_dir();
-    let project = fixture_tempdir("cello-fetch-api-");
-    copy_dir(&fixture, project.path(), origin_port);
-    let node = TestNode::boot(project.path());
-
-    // #159 / #186: a string body's default type, bytes staying untyped, and
-    // the parsed MIME type of a Blob built from a response.
-    let body = route(&node, "/body-defaults");
+fn response_body_types_match_workerd() {
+    let _serial = serial();
+    let booted = boot("cello-fetch-api-body-");
+    let body = route(&booted.node, "/body-defaults");
     assert_eq!(
         body["string"],
         serde_json::json!([["content-type", "text/plain;charset=UTF-8"]]),
@@ -369,9 +420,15 @@ fn fetch_api_object_model_matches_workerd() {
         "#186: an unparsable type is empty"
     );
     assert_eq!(body["text"], "hello");
+}
 
-    // #163 / #165 / #167.
-    let status = route(&node, "/response-status");
+// #163: status range and integer conversion. #165: a null-body status with
+// a body. #167: CR/LF in statusText.
+#[test]
+fn response_status_validation_matches_workerd() {
+    let _serial = serial();
+    let booted = boot("cello-fetch-api-status-");
+    let status = route(&booted.node, "/response-status");
     let range = "RangeError: Responses may only be constructed with status codes in the range 200 to 599, inclusive.";
     for code in ["0", "99", "101", "600", "junk"] {
         assert_outcome(
@@ -423,9 +480,14 @@ fn fetch_api_object_model_matches_workerd() {
         "RangeError: Responses with a WebSocket must have status code 101.",
         "#163",
     );
+}
 
-    // #160 / #175 / #176 / #177 / #178 / #184 / #190.
-    let options = route(&node, "/request-options");
+// #160 / #175 / #176 / #177 / #178 / #184 / #190.
+#[test]
+fn request_options_match_workerd() {
+    let _serial = serial();
+    let booted = boot("cello-fetch-api-request-");
+    let options = route(&booted.node, "/request-options");
     assert_eq!(options["cache"]["no-store"]["ok"], "no-store", "#160");
     assert_eq!(options["cache"]["no-cache"]["ok"], "no-cache", "#160");
     assert_outcome(
@@ -474,16 +536,13 @@ fn fetch_api_object_model_matches_workerd() {
         "#178",
     );
     assert_eq!(options["integrity"]["empty"]["ok"], "", "#178");
-    assert_outcome(
-        &options["redirect"]["error"],
-        "TypeError: Invalid redirect value, must be one of \"follow\" or \"manual\" (\"error\" won't be implemented since it does not make sense at the edge; use \"manual\" and check the response status code).",
-        "#184",
-    );
+    let bad_redirect = "TypeError: Invalid redirect value, must be one of \"follow\" or \"manual\" (\"error\" won't be implemented since it does not make sense at the edge; use \"manual\" and check the response status code).";
+    assert_outcome(&options["redirect"]["error"], bad_redirect, "#184");
     assert_eq!(
         options["redirect"]["upper"]["ok"], "follow",
         "#184: the mode is case-insensitive"
     );
-    assert_outcome(&options["redirect"]["bogus"], "TypeError: Invalid redirect value, must be one of \"follow\" or \"manual\" (\"error\" won't be implemented since it does not make sense at the edge; use \"manual\" and check the response status code).", "#184");
+    assert_outcome(&options["redirect"]["bogus"], bad_redirect, "#184");
     assert_eq!(options["method"]["trace"]["ok"], "TRACE", "#190");
     assert_eq!(options["method"]["TRACE"]["ok"], "TRACE", "#190");
     assert_outcome(
@@ -491,9 +550,14 @@ fn fetch_api_object_model_matches_workerd() {
         "TypeError: Invalid HTTP method string: connect",
         "#190",
     );
+}
 
-    // #172 / #184.
-    let abort = route(&node, "/abort");
+// #172 the default abort reason; #184 AbortSignal.any and the URL messages.
+#[test]
+fn abort_and_url_messages_match_workerd() {
+    let _serial = serial();
+    let booted = boot("cello-fetch-api-abort-");
+    let abort = route(&booted.node, "/abort");
     assert_eq!(abort["name"], "AbortError", "#172");
     assert_eq!(abort["message"], "The operation was aborted", "#172");
     assert_outcome(
@@ -517,8 +581,7 @@ fn fetch_api_object_model_matches_workerd() {
         "#184",
     );
 
-    // #184.
-    let url = route(&node, "/url");
+    let url = route(&booted.node, "/url");
     assert_outcome(
         &url["invalidPort"],
         "TypeError: Invalid URL string.",
@@ -531,9 +594,14 @@ fn fetch_api_object_model_matches_workerd() {
         "TypeError: Cannot assign to read only property 'searchParams' of object '[object URL]'",
         "#184",
     );
+}
 
-    // #179 / #188.
-    let file = route(&node, "/file-formdata");
+// #179 File lastModified; #188 a Blob entry's name.
+#[test]
+fn file_and_formdata_match_workerd() {
+    let _serial = serial();
+    let booted = boot("cello-fetch-api-file-");
+    let file = route(&booted.node, "/file-formdata");
     assert_eq!(
         file["lastModified"]["infinity"]["ok"],
         Value::Null,
@@ -551,9 +619,14 @@ fn fetch_api_object_model_matches_workerd() {
         file["names"]["set"], "setKey",
         "#188: set() names it after the key too"
     );
+}
 
-    // #182.
-    let headers = route(&node, "/headers");
+// #182 header validation messages and the names workerd accepts.
+#[test]
+fn header_validation_matches_workerd() {
+    let _serial = serial();
+    let booted = boot("cello-fetch-api-headers-");
+    let headers = route(&booted.node, "/headers");
     assert_outcome(
         &headers["appendSpace"],
         "TypeError: Invalid header name.",
@@ -599,9 +672,14 @@ fn fetch_api_object_model_matches_workerd() {
         serde_json::json!([]),
         "#182: a function is a record"
     );
+}
 
-    // #161 / #169 / #176.
-    let incoming = route(&node, "/incoming");
+// #161 / #169 / #176 on the incoming request.
+#[test]
+fn incoming_request_guards_match_workerd() {
+    let _serial = serial();
+    let booted = boot("cello-fetch-api-incoming-");
+    let incoming = route(&booted.node, "/incoming");
     assert_eq!(incoming["redirect"], "manual", "#161");
     assert_eq!(incoming["copyRedirect"], "manual", "#161");
     for case in ["set", "append", "delete"] {
@@ -625,9 +703,14 @@ fn fetch_api_object_model_matches_workerd() {
         incoming["bodylessGet"]["clone"]["ok"], "GET",
         "#176: a host-built GET is not refused"
     );
+}
 
-    // #173 / #161 / #180 / #159 (subrequest) / #178 (fetch init).
-    let fetch = route(&node, "/fetch");
+// #173 / #161 / #180 / #159 (subrequest) / #178 (fetch init).
+#[test]
+fn fetch_semantics_match_workerd() {
+    let _serial = serial();
+    let booted = boot("cello-fetch-api-fetch-");
+    let fetch = route(&booted.node, "/fetch");
     assert_eq!(fetch["follow"]["status"], 200, "#173: {fetch}");
     assert_eq!(
         fetch["follow"]["redirected"], true,
