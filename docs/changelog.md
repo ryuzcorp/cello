@@ -34,9 +34,11 @@ bucket-format changes.
   constructor fell through to the string-coercion path whenever a chunk was
   not bytes; a byte iterable was concatenated eagerly, which pulled the whole
   producer inside the constructor and hung on an infinite one. Every iterable
-  is now workerd's body stream: the iterable becomes the body whatever its
-  chunk types, a chunk is validated at consumption, the constructor pulls
-  nothing, each read pulls one value, and no `Content-Length` is set.
+  that reaches the body path -- an array, an async iterable, or a sync
+  iterable with no custom `toString` -- is now workerd's body stream: the
+  iterable becomes the body whatever its chunk types, a chunk is validated at
+  consumption, the constructor pulls nothing, each read pulls one value, and
+  no `Content-Length` is set.
   `new Response(["alpha", "beta"]).text()` therefore rejects with
   `TypeError: This ReadableStream did not return bytes.`, an infinite
   generator constructs and reads a bounded prefix, and a non-iterable object
