@@ -9,7 +9,7 @@ tee-skew conformance test no longer assumes which of a tee's copies the skew
 budget ends. A third change is breaking: a Worker can no longer generate code
 at run time (#194), described below. The differential gate gained six cases
 from those fixes and fourteen Request/body cases from the changes below,
-plus 25 binding cases (see below), 87 in total. No configuration or
+plus 25 binding cases (see below), 86 in total. No configuration or
 bucket-format changes; the development store gains two nullable
 columns, which is backward compatible (see below). The `eval`,
 `Function` and wasm runtime-compilation changes are listed after the stream
@@ -173,12 +173,16 @@ Cache:
 - A cached response keeps its `statusText`, including an empty one (#168).
 
 Development store migration: the dev-store SQLite file gains two nullable
-columns, `etag_md5` and `version`. The change is additive and backward
-compatible. A row written by an older Cello keeps its old sequence number as
-its ETag — so a conditional write that names it still matches — and takes
-that number as its `version`; it earns a content MD5 only when it is
-rewritten. No object data is rewritten, and `cello dev` opens an existing
-store in place.
+columns, `etag_md5` and `version`, created or upgraded in one immediate
+transaction, so the `cello dev` supervisor and node cannot race the same
+`ALTER TABLE`. The change is additive and backward compatible. A row the
+older store wrote keeps its sequence number as its ETag — so a conditional
+write that names it still matches — and takes that number as its `version`;
+it earns a content MD5 only when this version rewrites it. A row the older
+store rewrites *after* the upgrade is recognised by its `etag` and `version`
+disagreeing and answered by the sequence that write recorded, so no repair
+scan runs on open and no stale MD5 survives. No object data is rewritten,
+and `cello dev` opens an existing store in place.
 
 
 ## v0.2.8

@@ -83,7 +83,7 @@ struct StoredObject {
     size: u64,
     /// The object's content ETag (its MD5 for a single-part write), which
     /// is what R2 reports as `etag`. Before 0.2.9 the store had no content
-    /// ETag at all; [`content_etag`] reads such a row's old sequence number
+    /// ETag at all; [`row_identity`] reads such a row's old sequence number
     /// as text rather than re-reading its body.
     etag: String,
     /// The store's unique id for the version that wrote the row. It is the
@@ -105,44 +105,50 @@ impl StoredObject {
     /// One row of the listing query: the body is never read, only its
     /// length, which the covering index answers without the row.
     fn from_listing_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        let (etag, version) = row_identity(row.get(2)?, row.get(3)?, row.get(4)?);
         Ok(StoredObject {
             key: row.get(0)?,
             body: row.get(1)?,
             size: row.get(7)?,
-            etag: content_etag(row, 2, 3)?,
-            version: stored_version(row, 4, 2)?,
+            etag,
+            version,
             modified_ms: row.get(5)?,
             attributes: row.get(6)?,
         })
     }
 }
 
-/// The content ETag a row carries: the MD5 a 0.2.9-or-later write stored,
-/// or the legacy sequence number a pre-0.2.9 write stored, as text.
-fn content_etag(row: &rusqlite::Row<'_>, legacy: usize, md5: usize) -> rusqlite::Result<String> {
-    if let Some(etag) = row.get::<_, Option<String>>(md5)? {
-        return Ok(etag);
+/// The content ETag and write id a row answers.
+///
+/// A write by this version stores the content MD5 in `etag_md5` and the
+/// same sequence in `etag` and `version`. The pre-0.2.9 store knows only
+/// `etag`: its upsert bumps that column (and the body) and leaves
+/// `etag_md5`/`version` behind, so the MD5 is current only while `etag` and
+/// `version` agree. When they disagree, the row was last written by an
+/// older store, and both answers are the sequence it recorded — the value a
+/// condition it answered still names. Resolving this per read needs no
+/// repair pass, cannot miss a row an older writer touches later, and never
+/// touches a row on open.
+fn row_identity(
+    etag: Option<i64>,
+    md5: Option<String>,
+    version: Option<String>,
+) -> (String, String) {
+    let md5_is_current = match (etag, version.as_deref()) {
+        (Some(etag), Some(version)) => version.parse::<i64>().ok() == Some(etag),
+        _ => false,
+    };
+    if md5_is_current {
+        if let Some(md5) = md5 {
+            return (md5, version.unwrap_or_default());
+        }
     }
-    Ok(row
-        .get::<_, Option<i64>>(legacy)?
-        .unwrap_or_default()
-        .to_string())
-}
-
-/// The write id a row carries. A row an older store wrote has none of its
-/// own, and its old etag (the sequence that named the write) fills in.
-fn stored_version(
-    row: &rusqlite::Row<'_>,
-    version: usize,
-    legacy: usize,
-) -> rusqlite::Result<String> {
-    if let Some(version) = row.get::<_, Option<String>>(version)? {
-        return Ok(version);
-    }
-    Ok(row
-        .get::<_, Option<i64>>(legacy)?
-        .unwrap_or_default()
-        .to_string())
+    let sequence = etag.map(|etag| etag.to_string()).unwrap_or_default();
+    let version = match etag {
+        Some(etag) => etag.to_string(),
+        None => version.unwrap_or_default(),
+    };
+    (sequence, version)
 }
 
 /// The exclusive upper bound of a byte-prefix range: the prefix with its
@@ -205,29 +211,7 @@ impl LocalStore {
         connection
             .pragma_update(None, "journal_mode", "WAL")
             .map_err(db_error)?;
-        connection
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS objects (
-                   key TEXT PRIMARY KEY,
-                   body BLOB NOT NULL,
-                   -- The pre-0.2.9 write sequence, which was also the etag.
-                   -- A row written since carries its content etag in
-                   -- `etag_md5` and only this sequence here, to satisfy the
-                   -- NOT NULL an upgraded table still declares.
-                   etag INTEGER,
-                   etag_md5 TEXT,
-                   version TEXT,
-                   modified_ms INTEGER NOT NULL,
-                   attributes TEXT NOT NULL
-                 );
-                 CREATE TABLE IF NOT EXISTS store_sequence (
-                   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                   next_etag INTEGER NOT NULL
-                 );
-                 INSERT OR IGNORE INTO store_sequence(singleton, next_etag) VALUES (1, 1);",
-            )
-            .map_err(db_error)?;
-        upgrade_schema(&connection)?;
+        initialize_schema(&connection)?;
         Ok(store)
     }
 
@@ -245,12 +229,13 @@ impl LocalStore {
                  FROM objects WHERE key = ?1",
                 [key],
                 |row| {
+                    let (etag, version) = row_identity(row.get(2)?, row.get(3)?, row.get(4)?);
                     Ok(StoredObject {
                         key: row.get(0)?,
                         body: row.get(1)?,
                         size: row.get(7)?,
-                        etag: content_etag(row, 2, 3)?,
-                        version: stored_version(row, 4, 2)?,
+                        etag,
+                        version,
                         modified_ms: row.get(5)?,
                         attributes: row.get(6)?,
                     })
@@ -328,9 +313,9 @@ fn apply_put(
     let attributes = encode_attributes(&options.attributes)?;
     let current = transaction
         .query_row(
-            "SELECT etag, etag_md5 FROM objects WHERE key = ?1",
+            "SELECT etag, etag_md5, version FROM objects WHERE key = ?1",
             [key],
-            |row| content_etag(row, 0, 1),
+            |row| Ok(row_identity(row.get(0)?, row.get(1)?, row.get(2)?).0),
         )
         .optional()
         .map_err(db_error)?;
@@ -521,7 +506,54 @@ impl LocalStore {
     }
 }
 
-/// Bring a database an earlier dev store wrote to the current shape.
+/// Create or upgrade the store's schema in one immediate transaction.
+///
+/// `cello dev`'s supervisor and its node are separate processes, and both
+/// open the fleet store during a reload, so two opens can reach an old
+/// store at once. `BEGIN IMMEDIATE` serializes them: the second one sees the
+/// columns the first added and does not try to add them again, which would
+/// fail with `duplicate column name`.
+fn initialize_schema(connection: &Connection) -> object_store::Result<()> {
+    connection
+        .execute_batch("BEGIN IMMEDIATE")
+        .map_err(db_error)?;
+    let applied = (|| {
+        connection
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS objects (
+                   key TEXT PRIMARY KEY,
+                   body BLOB NOT NULL,
+                   -- The pre-0.2.9 write sequence, which was also the etag.
+                   -- A row written since carries its content etag in
+                   -- `etag_md5` and only this sequence here, to satisfy the
+                   -- NOT NULL an upgraded table still declares.
+                   etag INTEGER,
+                   etag_md5 TEXT,
+                   version TEXT,
+                   modified_ms INTEGER NOT NULL,
+                   attributes TEXT NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS store_sequence (
+                   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                   next_etag INTEGER NOT NULL
+                 );
+                 INSERT OR IGNORE INTO store_sequence(singleton, next_etag) VALUES (1, 1);",
+            )
+            .map_err(db_error)?;
+        upgrade_schema(connection)
+    })();
+    match applied {
+        Ok(()) => connection.execute_batch("COMMIT").map_err(db_error),
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+/// Bring a database an earlier dev store wrote to the current shape. Runs
+/// inside [`initialize_schema`]'s transaction, and only touches a database
+/// that is missing a column or the rebuilt index.
 ///
 /// Before 0.2.9 `etag` held the store's write sequence as an INTEGER and
 /// there was no `version` column, so one number served as both. Two columns
@@ -529,8 +561,9 @@ impl LocalStore {
 /// id. A row written then keeps its sequence — inventing an MD5 would mean
 /// reading every body, and a condition a caller holds matches what the row
 /// carries either way — as its etag and takes that number as its version.
-/// Only a rewrite earns the content MD5. No schema version is stamped: the
-/// columns' presence says whether the work is done.
+/// Only a rewrite earns the content MD5. The version backfill runs when the
+/// column is added, so it never rescans the table on a later open; a row an
+/// older writer touches afterwards is resolved by [`row_identity`].
 fn upgrade_schema(connection: &Connection) -> object_store::Result<()> {
     let has_version: i64 = connection
         .query_row(
@@ -540,8 +573,15 @@ fn upgrade_schema(connection: &Connection) -> object_store::Result<()> {
         )
         .map_err(db_error)?;
     if has_version == 0 {
+        // The backfill belongs to the migration alone: after this the
+        // column exists, and no later open rescans the table. A row an
+        // older writer rewrites later is resolved by `row_identity`, not by
+        // a repair pass.
         connection
-            .execute_batch("ALTER TABLE objects ADD COLUMN version TEXT")
+            .execute_batch(
+                "ALTER TABLE objects ADD COLUMN version TEXT;
+                 UPDATE objects SET version = CAST(etag AS TEXT) WHERE version IS NULL;",
+            )
             .map_err(db_error)?;
     }
     let has_md5: i64 = connection
@@ -556,13 +596,6 @@ fn upgrade_schema(connection: &Connection) -> object_store::Result<()> {
             .execute_batch("ALTER TABLE objects ADD COLUMN etag_md5 TEXT")
             .map_err(db_error)?;
     }
-    // A row an earlier store wrote keeps its sequence as the etag a caller
-    // may already hold; inventing an MD5 would mean reading every body. The
-    // sequence also becomes the version, so the write still has an id. The
-    // row earns a content MD5 the next time it is written.
-    connection
-        .execute_batch("UPDATE objects SET version = CAST(etag AS TEXT) WHERE version IS NULL;")
-        .map_err(db_error)?;
     // The listing query selects exactly these columns, so the store answers
     // a LIST from this index without touching a row's overflow pages. The
     // 0.2.8 index lacks `version`; replacing it is a one-time migration, not
@@ -1377,6 +1410,76 @@ mod tests {
                 result.version.is_some(),
                 "a multipart write still names its version"
             );
+        });
+    }
+
+    /// A row the pre-0.2.9 store rewrites *after* the upgrade: it bumps
+    /// `etag` and the body and knows nothing of `etag_md5`/`version`, so
+    /// both are stale. The stale MD5 must not answer — that would name a
+    /// version the object no longer is — and the sequence the writer
+    /// recorded must satisfy the `onlyIf` a caller derived from the read.
+    #[test]
+    fn a_row_an_older_writer_rewrote_is_read_by_its_sequence() {
+        use md5::Digest as _;
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let (_dir, store) = open_store();
+            let location: Path = "k".to_string().into();
+            let written = store
+                .put_opts(
+                    &location,
+                    PutPayload::from(Bytes::from_static(b"abc")),
+                    PutOptions::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                written.e_tag.as_deref(),
+                Some("900150983cd24fb0d6963f7d28e17f72")
+            );
+            // What 0.2.8's upsert does: body and etag only.
+            store
+                .connect()
+                .unwrap()
+                .execute(
+                    "UPDATE objects SET body = X'646566', etag = 2 WHERE key = 'k'",
+                    [],
+                )
+                .unwrap();
+            let head = store.head(&location).await.unwrap();
+            assert_eq!(head.e_tag.as_deref(), Some("2"));
+            assert_eq!(head.version.as_deref(), Some("2"));
+            // The ETag the read answered is the one a conditional uses.
+            store
+                .put_opts(
+                    &location,
+                    PutPayload::from(Bytes::from_static(b"ghi")),
+                    put_mode(PutMode::Update(UpdateVersion {
+                        e_tag: Some("2".to_string()),
+                        version: None,
+                    })),
+                )
+                .await
+                .expect("a condition on the sequence the older writer recorded lands");
+            let rewritten = store.head(&location).await.unwrap();
+            assert_eq!(
+                rewritten.e_tag.as_deref(),
+                Some(hex(&md5::Md5::digest(b"ghi")).as_str()),
+                "a rewrite by this version earns the content MD5 again"
+            );
+            // An insert by the older store leaves `version` NULL.
+            store
+                .connect()
+                .unwrap()
+                .execute(
+                    "INSERT INTO objects(key, body, etag, modified_ms, attributes)
+                       VALUES ('older', X'61', 3, 1, '[]')",
+                    [],
+                )
+                .unwrap();
+            let older = store.head(&"older".to_string().into()).await.unwrap();
+            assert_eq!(older.e_tag.as_deref(), Some("3"));
+            assert_eq!(older.version.as_deref(), Some("3"));
         });
     }
 

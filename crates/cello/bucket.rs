@@ -415,14 +415,24 @@ impl std::fmt::Display for RangeNotSatisfiable {
 impl std::error::Error for RangeNotSatisfiable {}
 
 /// Whether a failed read failed because the range lies outside the object.
-/// The development store reports it as [`RangeNotSatisfiable`]; a real
-/// backend reports the 416 in its own words.
+///
+/// The development store reports it as the typed
+/// [`RangeNotSatisfiable`], which is matched anywhere in the chain because
+/// the read path wraps it with context. A real backend reports the 416 in
+/// its innermost cause, so only that cause is examined: the wrapped message
+/// often names the key or a request id, and a key that happens to contain
+/// "416" must not fabricate the answer. The reason phrase is matched rather
+/// than a bare status number for the same reason.
 pub fn is_range_not_satisfiable(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause.downcast_ref::<RangeNotSatisfiable>().is_some()
-            || cause.to_string().contains("not satisfiable")
-            || cause.to_string().contains("Wanted range starting at")
-            || cause.to_string().contains("416")
+    if error
+        .chain()
+        .any(|cause| cause.downcast_ref::<RangeNotSatisfiable>().is_some())
+    {
+        return true;
+    }
+    error.chain().last().is_some_and(|cause| {
+        let text = cause.to_string().to_ascii_lowercase();
+        text.contains("416 range not satisfiable") || text.contains("not satisfiable")
     })
 }
 
@@ -3602,5 +3612,49 @@ mod cas_conflict_tests {
             .block_on(bucket.put_cas("OperationAborted", b"second".to_vec(), None))
             .expect("a path lookalike must not error");
         assert_eq!(loss, None, "the lookalike key loses cleanly");
+    }
+}
+
+#[cfg(test)]
+mod range_error_tests {
+    use super::*;
+
+    /// The development store's marker is recognised through the read
+    /// path's context, whatever the context text says.
+    #[test]
+    fn the_development_store_marker_survives_context() {
+        let error = anyhow!(Error::Generic {
+            store: "dev",
+            source: Box::new(RangeNotSatisfiable),
+        })
+        .context("read dev:///state/objects.sqlite3/r2/bucket/key");
+        assert!(is_range_not_satisfiable(&error));
+    }
+
+    /// A key or request id that merely contains "416" must not turn a miss
+    /// into a range answer: only the innermost cause is examined.
+    #[test]
+    fn a_key_that_contains_416_does_not_fabricate_the_answer() {
+        let error = anyhow!(Error::NotFound {
+            path: "r2/bucket/range/416/key".to_string(),
+            source: Box::new(std::io::Error::other("not found")),
+        })
+        .context("read s3://fleet/r2/bucket/range/416/key");
+        assert!(!is_range_not_satisfiable(&error));
+    }
+
+    /// A real backend's 416 arrives in its innermost cause, where the
+    /// reason phrase is spelled out.
+    #[test]
+    fn a_backend_416_is_read_from_the_innermost_cause() {
+        let error = anyhow!(Error::Generic {
+            store: "S3",
+            source: Box::new(std::io::Error::other(
+                "Server returned non-2xx status code: 416 Range Not Satisfiable: \
+                 The requested range is not satisfiable",
+            )),
+        })
+        .context("read s3://fleet/r2/bucket/key");
+        assert!(is_range_not_satisfiable(&error));
     }
 }
