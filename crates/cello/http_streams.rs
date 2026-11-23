@@ -32,6 +32,23 @@ pub(crate) static NEXT_HTTP_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 /// the value cannot match a plausible body.
 pub(crate) const HTTP_STREAM_DONE: &str = "__cello_http_stream_end__";
 pub(crate) const HTTP_STREAM_IDLE_TIMEOUT_MS: u64 = 60_000;
+
+/// [`HTTP_STREAM_IDLE_TIMEOUT_MS`] as the node's configuration sets it:
+/// `CELLO_HTTP_STREAM_IDLE_S` (seconds, default 60), validated at startup.
+/// Read once — a stream read consults it on every chunk — and a value that
+/// would disable the bound is refused, never silently honoured.
+static STREAM_IDLE_TIMEOUT_MS: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+    crate::env_vars::positive_or(
+        "CELLO_HTTP_STREAM_IDLE_S",
+        HTTP_STREAM_IDLE_TIMEOUT_MS / 1_000,
+    )
+    .expect("validated CELLO_HTTP_STREAM_IDLE_S")
+    .saturating_mul(1_000)
+});
+
+pub(crate) fn http_stream_idle_timeout_ms() -> u64 {
+    *STREAM_IDLE_TIMEOUT_MS
+}
 pub(crate) const HTTP_STREAM_REGISTRATION_CLOSED: &str = "the HTTP stream service is closed";
 const RESPONSE_STREAM_CONSUMER_CANCELED: &str = "response stream consumer canceled";
 const RESPONSE_STREAM_CLOSE_IN_PROGRESS: &str = "response stream close is already in progress";
@@ -183,7 +200,6 @@ impl futures_util::Stream for TeeBranchStream {
 }
 
 pub(crate) enum HttpStreamSource {
-    Response(reqwest::Response),
     Receiver(tokio::sync::mpsc::Receiver<Result<Vec<u8>, String>>),
     /// One branch of a host tee. Unbounded, unlike `Receiver`: a tee's
     /// branches are independent — a consumer may drain one fully before
@@ -675,7 +691,7 @@ impl HttpStreamService {
     fn expired_error(stream_id: u64) -> String {
         format!(
             "HTTP stream {stream_id} expired after {} seconds of inactivity",
-            HTTP_STREAM_IDLE_TIMEOUT_MS / 1_000
+            http_stream_idle_timeout_ms() / 1_000
         )
     }
 
@@ -831,7 +847,7 @@ impl HttpStreamService {
                     &mut drain,
                 );
                 let generation = Self::next_sequence(&mut state.next_generation);
-                let deadline_ms = now_ms.saturating_add(HTTP_STREAM_IDLE_TIMEOUT_MS);
+                let deadline_ms = now_ms.saturating_add(http_stream_idle_timeout_ms());
                 let response = candidate_writer.is_some();
                 state.sources.insert(
                     stream_id,
@@ -1095,7 +1111,8 @@ impl HttpStreamService {
                         if let Some(now_ms) = now_ms {
                             let entry = state.sources.get_mut(&lease.stream_id).unwrap();
                             entry.source = HttpStreamSourceSlot::Available(source.take().unwrap());
-                            entry.deadline_ms = now_ms.saturating_add(HTTP_STREAM_IDLE_TIMEOUT_MS);
+                            entry.deadline_ms =
+                                now_ms.saturating_add(http_stream_idle_timeout_ms());
                             Ok(Some(bytes))
                         } else {
                             Self::close_locked(&mut state, &mut drain);
@@ -1177,7 +1194,7 @@ impl HttpStreamService {
         let Some(now_ms) = self.owner.get().and_then(|owner| owner.mono_ms().ok()) else {
             return Err(HttpStreamTerminationReason::Cancelled);
         };
-        entry.deadline_ms = now_ms.saturating_add(HTTP_STREAM_IDLE_TIMEOUT_MS);
+        entry.deadline_ms = now_ms.saturating_add(http_stream_idle_timeout_ms());
         Ok(())
     }
 
@@ -1454,7 +1471,7 @@ impl HttpStreamService {
                     }
                 }
                 if let Some(now_ms) = now_ms {
-                    entry.deadline_ms = now_ms.saturating_add(HTTP_STREAM_IDLE_TIMEOUT_MS);
+                    entry.deadline_ms = now_ms.saturating_add(http_stream_idle_timeout_ms());
                 }
                 if remove_writer {
                     removed_writer = state.response_writers.remove(&stream_id);
@@ -2199,11 +2216,6 @@ pub(crate) async fn next_http_stream_chunk(
     source: &mut HttpStreamSource,
 ) -> Result<Option<Vec<u8>>, String> {
     match source {
-        HttpStreamSource::Response(response) => response
-            .chunk()
-            .await
-            .map(|chunk| chunk.map(|bytes| bytes.to_vec()))
-            .map_err(|error| format!("response stream: {error}")),
         HttpStreamSource::Receiver(receiver) => match receiver.recv().await {
             Some(Ok(bytes)) => Ok(Some(bytes)),
             Some(Err(error)) => Err(error),
@@ -2216,6 +2228,50 @@ pub(crate) async fn next_http_stream_chunk(
         },
         HttpStreamSource::Stream(stream) => stream.next().await.transpose(),
     }
+}
+
+/// One upstream `fetch()` response body under the HTTP stream idle
+/// deadline: a read that receives no bytes for `CELLO_HTTP_STREAM_IDLE_S`
+/// fails with the idle error and ends the body, instead of parking a Worker
+/// turn — or a tee pump, or a host transfer — on a black-holed peer forever.
+/// Every received chunk starts a fresh window, so a live stream is never cut
+/// (#136). The bound lives on the source itself so every consumer inherits
+/// it: a read parked on the socket cannot observe the registry deadline,
+/// because it leases the entry and the sweeper only expires entries nobody
+/// holds (a response body is the exception, since its writer sees the
+/// termination).
+pub(crate) fn idle_bounded_stream(stream: HttpChunkStream) -> HttpChunkStream {
+    Box::pin(futures_util::stream::unfold(
+        Some(stream),
+        |state| async move {
+            let mut inner = state?;
+            let idle_ms = http_stream_idle_timeout_ms();
+            match crate::asyncrt::timeout(std::time::Duration::from_millis(idle_ms), inner.next())
+                .await
+            {
+                Ok(Some(item)) => Some((item, Some(inner))),
+                Ok(None) => None,
+                Err(_) => Some((
+                    Err(format!(
+                        "response stream: no bytes for {} seconds of inactivity",
+                        idle_ms / 1_000
+                    )),
+                    None,
+                )),
+            }
+        },
+    ))
+}
+
+/// A `reqwest` response body as the chunked stream the registry stores,
+/// under [`idle_bounded_stream`].
+pub(crate) fn response_body_stream(response: reqwest::Response) -> HttpChunkStream {
+    let chunks = response.bytes_stream().map(|chunk| {
+        chunk
+            .map(|bytes| bytes.to_vec())
+            .map_err(|error| format!("response stream: {error}"))
+    });
+    idle_bounded_stream(Box::pin(chunks))
 }
 
 pub(crate) fn settle_http_stream_read(
@@ -2585,11 +2641,6 @@ where
 /// needed: the eventual HTTP or JS consumer supplies the backpressure.
 fn http_chunk_stream(source: HttpStreamSource) -> HttpChunkStream {
     match source {
-        HttpStreamSource::Response(response) => Box::pin(response.bytes_stream().map(|chunk| {
-            chunk
-                .map(|bytes| bytes.to_vec())
-                .map_err(|error| format!("response stream: {error}"))
-        })),
         HttpStreamSource::Receiver(receiver) => {
             Box::pin(tokio_stream::wrappers::ReceiverStream::new(receiver))
         }
