@@ -216,4 +216,14 @@ export const cases = [
   { name: "request-null-body-read", fixture: "fetchapi", path: "/request/null-body-read" },
   { name: "request-body-used-incoming", fixture: "fetchapi", requests: [{ path: "/request/body-used-incoming" }] },
   { name: "issue-incoming-body", fixture: "fetchapi", path: "/issue/incoming-body" },
+  // The missing-API sweep (#195, #196, #201-#204, #214, #219, #220).
+  { name: "message-event", fixture: "missing-apis", path: "/message-event" },
+  { name: "cache-surface", fixture: "missing-apis", path: "/cache-surface" },
+  { name: "compression-brotli", fixture: "missing-apis", path: "/compression" },
+  { name: "fixed-length-lengths", fixture: "missing-apis", path: "/fixed-length" },
+  { name: "performance-surface", fixture: "missing-apis", path: "/performance" },
+  { name: "globals-surface", fixture: "missing-apis", path: "/globals" },
+  { name: "timers-surface", fixture: "missing-apis", path: "/timers" },
+  { name: "error-messages", fixture: "missing-apis", path: "/messages" },
+  { name: "clone-wasm-module", fixture: "missing-apis", path: "/clone-wasm" },
 ];

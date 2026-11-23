@@ -214,7 +214,33 @@
         ignoreMethod,
       );
     }
+
+    // Workerd 1.20261121.1 has these on the interface but answers every call
+    // with a synchronous "not implemented" Error (measured; there is no
+    // partial implementation to mirror). They exist so feature detection
+    // agrees, and they fail loudly instead of disappearing into a TypeError
+    // on `undefined`.
+    add(..._args) {
+      throw __cacheNotImplemented("add", "Cache");
+    }
+
+    addAll(..._args) {
+      throw __cacheNotImplemented("addAll", "Cache");
+    }
+
+    matchAll(..._args) {
+      throw __cacheNotImplemented("matchAll", "Cache");
+    }
+
+    keys(..._args) {
+      throw __cacheNotImplemented("keys", "Cache");
+    }
   }
+
+  const __cacheNotImplemented = (method, iface) =>
+    new Error(
+      `Failed to execute '${method}' on '${iface}': the method is not ` +
+      "implemented.");
 
   class CacheStorage {
     constructor(token = undefined) {
@@ -228,6 +254,24 @@
         throw new TypeError("Cache name is too long.");
       }
       return new Cache(kCreate, `named:${cacheName}`);
+    }
+
+    // As on Cache: present on the interface, synchronous "not implemented"
+    // Errors on workerd.
+    delete(..._args) {
+      throw __cacheNotImplemented("delete", "CacheStorage");
+    }
+
+    match(..._args) {
+      throw __cacheNotImplemented("match", "CacheStorage");
+    }
+
+    has(..._args) {
+      throw __cacheNotImplemented("has", "CacheStorage");
+    }
+
+    keys(..._args) {
+      throw __cacheNotImplemented("keys", "CacheStorage");
     }
   }
 

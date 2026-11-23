@@ -427,6 +427,31 @@ The `tail` and `email` handlers are unavailable.
 alive: the timer is unreferenced, so it fires or dies with the request,
 whichever comes first, and carries no timer id or cancellation.
 
+The global object reports `ServiceWorkerGlobalScope` as its
+`Symbol.toStringTag`, `globalThis.origin` is the string `"null"`, and the
+interface constructors workerd defines exist here too — `Crypto`,
+`Navigator`, `Performance*`, `FetchEvent`, `ScheduledEvent`, `TailEvent`,
+`TraceEvent`, `PromiseRejectionEvent`, `WorkerGlobalScope`,
+`ServiceWorkerGlobalScope`, and `Body` — so feature detection and
+`instanceof` agree. Only `PerformanceMark` and `PerformanceObserver` are
+constructible from script; every other one throws `TypeError: Illegal
+constructor`. `crypto` is a `Crypto` instance and `navigator` a `Navigator`
+instance (with `platform` `""` and `sendBeacon`). `reportError` exists;
+`URL.createObjectURL` and `URL.revokeObjectURL` exist and throw workerd's
+`Error: URL.createObjectURL() is not implemented`, because it does not
+implement them either.
+
+Four globals Cello used to expose have been removed to match workerd:
+`DigestStream` (it remains at `crypto.DigestStream`), `FileReader`,
+`Temporal` (workerd's V8 build leaves it off), and the internal
+`DurableObjectRoutingError`. `MessageEvent` is constructible with workerd's
+`data`/`origin`/`lastEventId`/`source`/`ports` and its own non-writable
+properties. A `CompressionStream`/`DecompressionStream` accepts `brotli`
+(byte-identical to workerd's output) and rejects an unknown format with
+workerd's own TypeError. A `structuredClone` of a compiled
+`WebAssembly.Module` throws `Error: Unable to deserialize cloned data.`, as
+on workerd, so a module never crosses the clone boundary.
+
 ### Code generation
 
 A Worker has no code generator, as on Cloudflare. `eval()`, `new Function()`
@@ -450,6 +475,21 @@ unchanged. See [WebAssembly](wasm.md).
 `performance.timeOrigin` is `0`, and `performance.now()` matches
 `Date.now()`. Both clocks advance at an I/O boundary and stay fixed
 during JavaScript execution.
+
+`performance` is a `Performance` instance with workerd's interface: marks,
+measures and their entry classes (`PerformanceEntry`, `PerformanceMark`,
+`PerformanceMeasure`, `PerformanceResourceTiming`), `getEntries*`,
+`clearMarks`/`clearMeasures`/`clearResourceTimings`,
+`setResourceTimingBufferSize`, `markResourceTiming`, `toJSON`, `timerify`,
+`eventLoopUtilization`, `eventCounts`, and `nodeTiming` (all-zero node
+timings; there is no libuv loop). `PerformanceObserver` exists with
+`supportedEntryTypes` `["measure", "mark"]`, but never delivers a callback
+inside a request — measured on workerd 1.20261121.1, and `takeRecords()`
+returns an empty array on both.
+
+A timer returns a `Timeout` object rather than a number: `refresh()`,
+`ref()`, `unref()`, `hasRef()`, `close()`, and a numeric primitive. A
+non-function callback throws workerd's TypeError synchronously.
 
 ### [Node.js compatibility](https://developers.cloudflare.com/workers/runtime-apis/nodejs/)
 
@@ -499,6 +539,12 @@ rules, and limits.
 - `fetch()` neither reads nor populates the cache, and `cf.cacheKey` is
   unsupported; the request URL is the whole key.
 - No API purges by `Cache-Tag`; purge by URL with `delete`.
+- `Cache.add`, `Cache.addAll`, `Cache.matchAll`, `Cache.keys`,
+  `CacheStorage.delete`, `CacheStorage.match`, `CacheStorage.has`, and
+  `CacheStorage.keys` exist as on workerd, but every call throws workerd's
+  `Error: Failed to execute '…': the method is not implemented.` — workerd
+  1.20261121.1 does not implement them, and matching that keeps a bundle's
+  feature detection and failure path identical.
 
 ### [TCP sockets](https://developers.cloudflare.com/workers/runtime-apis/tcp-sockets/)
 

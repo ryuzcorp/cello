@@ -1098,7 +1098,11 @@ const __fmt = (a) => a.map((x) => {
   try { return JSON.stringify(x); } catch { return String(x); }
 }).join(" ");
 const __consoleNoop = () => {};
-globalThis.console = {
+// Workerd's console: the methods are own properties of one object, tagged
+// `console` for Object.prototype.toString, and `context` returns another
+// console-like object. Deno's `createTask` has no workerd counterpart and
+// is gone, so feature detection agrees.
+const __makeConsole = () => ({
   debug: (...a) => __log("debug", __fmt(a)),
   error: (...a) => __log("error", __fmt(a)),
   info: (...a) => __log("info", __fmt(a)),
@@ -1121,10 +1125,12 @@ globalThis.console = {
   timeEnd: __consoleNoop,
   timeLog: __consoleNoop,
   timeStamp: __consoleNoop,
-  createTask: () => {
-    throw new Error("console.createTask() is not implemented");
-  },
-};
+  context: () => __makeConsole(),
+});
+globalThis.console = __makeConsole();
+Object.defineProperty(globalThis.console, Symbol.toStringTag, {
+  value: "console", configurable: true,
+});
 
 // async-op shims: outbound fetch + timers, driven by the host event loop.
 // Move one request body through a host subrequest seam. A body that already
@@ -1851,61 +1857,108 @@ __cello.__makeR2Bucket = (binding, bucketName) => ({
   },
 });
 // A host timer op resolves once, so an interval arms a new one after every
-// round. `__timers` maps the id the caller holds to the op that is armed
-// right now: for a timeout that is the same id, and for an interval it is a
-// fresh id each round. Clearing therefore cancels the armed op, not the id.
-const __timers = new Map();
-const __clearTimer = (id) => {
-  const armed = __timers.get(id);
-  if (armed === undefined) return;
-  __timers.delete(id);
-  __timer_cancel(armed);
+// round. Workerd hands back a `Timeout` object: its primitive value is the
+// handle's numeric id, `refresh` re-arms it with a fresh id, and
+// `clearTimeout`/`clearInterval` take the object, so ids never leave the
+// runtime. The armed op is remembered per handle, and a resolve from an op
+// that is no longer the armed one is a cancelled round: the op still
+// settles, but the callback does not run.
+const __invalidTimerCallback = (callback) => {
+  const type = typeof callback;
+  let received;
+  if (callback === null) received = "Received null";
+  else if (callback === undefined) received = "Received undefined";
+  else if (type === "object")
+    received = "Received an instance of " +
+      (callback.constructor?.name || "Object");
+  else if (type === "string") received = `Received type string ('${callback}')`;
+  else if (type === "number") received = `Received type number (${callback})`;
+  else if (type === "boolean") received = `Received type boolean (${callback})`;
+  else if (type === "bigint") received = `Received type bigint (${callback}n)`;
+  else if (type === "symbol") received = `Received type symbol (${String(callback)})`;
+  else received = "Received type " + type;
+  return new TypeError(
+    'The "callback" argument must be of type function. ' + received);
 };
-globalThis.setTimeout = (cb, ms, ...a) => {
-  const id = __timer_alloc();
-  __timers.set(id, id);
-  const fire = () => {
-    if (!__timers.delete(id)) return;
-    cb(...a);
-  };
-  // A rejected op died with its event (client disconnect): the deadline will
-  // never arrive, but the callback still runs so promises built on it settle
-  // instead of hanging to their budget (denoland/celld#294). The value the
-  // callback computes is the same one a firing would produce; only the
-  // timing is early, and timing guarantees are already void for a dead event.
-  __op_timer(id, ms | 0).then(fire, fire);
-  return id;
+class Timeout {
+  #id;
+  #op = 0;
+  #callback;
+  #delay;
+  #args;
+  #repeat;
+  #live = false;
+  constructor(id, callback, delay, args, repeat) {
+    this.#id = id;
+    this.#callback = callback;
+    this.#delay = delay;
+    this.#args = args;
+    this.#repeat = repeat;
+    this.#arm();
+  }
+  #arm() {
+    const op = __timer_alloc();
+    this.#op = op;
+    this.#live = true;
+    // A rejected op died with its event (client disconnect): the deadline
+    // will never arrive, but the callback still runs so promises built on it
+    // settle instead of hanging to their budget (denoland/celld#294). The
+    // value the callback computes is the same one a firing would produce;
+    // only the timing is early, and timing guarantees are already void for a
+    // dead event.
+    const fire = () => {
+      // Cancelling or refreshing replaces the armed op, so a round whose op
+      // is no longer the armed one is dead and stops here.
+      if (!this.#live || this.#op !== op) return;
+      this.#op = 0;
+      // Arm an interval's next round before the callback runs. A
+      // `clearInterval` inside the callback must end the interval, and
+      // arming after the callback would undo it.
+      if (this.#repeat) this.#arm();
+      else this.#live = false;
+      this.#callback(...this.#args);
+    };
+    __op_timer(op, this.#delay).then(fire, fire);
+  }
+  refresh() {
+    if (this.#live) this.#cancel();
+    this.#id = __timer_alloc();
+    this.#arm();
+    return this;
+  }
+  #cancel() {
+    this.#live = false;
+    if (this.#op !== 0) {
+      __timer_cancel(this.#op);
+      this.#op = 0;
+    }
+  }
+  ref() { return this; }
+  unref() { return this; }
+  hasRef() { return true; }
+  close() { this.#cancel(); }
+  [Symbol.toPrimitive]() { return this.#id; }
+}
+globalThis.setTimeout = function setTimeout(callback, ms, ...args) {
+  if (typeof callback !== "function")
+    throw __invalidTimerCallback(callback);
+  return new Timeout(__timer_alloc(), callback, ms | 0, args, false);
 };
-globalThis.setInterval = (cb, ms, ...a) => {
-  const id = __timer_alloc();
-  const delay = ms | 0;
-  const arm = (armed) => {
-    __timers.set(id, armed);
-    __op_timer(armed, delay).then(() => {
-      // Cancelling drops the entry and cancelling then re-arming replaces
-      // it, so a round whose op is no longer the armed one is dead and
-      // stops here. A cancelled op still resolves, which is why this test
-      // is on identity and not on the op alone.
-      if (__timers.get(id) !== armed) return;
-      // Arm the next round before the callback runs. A `clearInterval`
-      // inside the callback must end the interval, and arming after the
-      // callback would undo it.
-      arm(__timer_alloc());
-      cb(...a);
-    }, () => {
-      // The op died with its event (see setTimeout above): fire this round
-      // so waiters settle, then stop without re-arming under a dead event.
-      if (__timers.get(id) !== armed) return;
-      __timers.delete(id);
-      cb(...a);
-    });
-  };
-  arm(id);
-  return id;
+globalThis.setInterval = function setInterval(callback, ms, ...args) {
+  if (typeof callback !== "function")
+    throw __invalidTimerCallback(callback);
+  return new Timeout(__timer_alloc(), callback, ms | 0, args, true);
 };
 // One id space and one cancel, because a caller can cross the two.
-globalThis.clearTimeout = __clearTimer;
-globalThis.clearInterval = __clearTimer;
+const __closeTimer = (handle) => {
+  if (handle instanceof Timeout) handle.close();
+};
+globalThis.clearTimeout = function clearTimeout(handle) {
+  __closeTimer(handle);
+};
+globalThis.clearInterval = function clearInterval(handle) {
+  __closeTimer(handle);
+};
 
 const __sqlCursorFinalizer = typeof FinalizationRegistry === "function"
   ? new FinalizationRegistry((cursorId) => __sql_cursor_close_finalizer(cursorId))
@@ -2706,7 +2759,9 @@ class DurableObjectId {
   }
   _scope() { return this._className + ":" + this._value; }
 }
-globalThis.DurableObjectRoutingError = class DurableObjectRoutingError
+// Internal to the runtime: workerd has no such global, and a bundle that
+// catches it sees the message and code, not this class.
+const DurableObjectRoutingError = class DurableObjectRoutingError
   extends Error {
   constructor(detail = {}) {
     super("The Durable Object owner is currently unreachable");
@@ -12562,11 +12617,21 @@ if (!globalThis.ExtendableEvent) {
 // its callback must retain that position, or listeners added after `onabort`
 // run before it and observe an order that differs from the web platform.
 const __eventHandlerEntry = Symbol("eventHandlerEntry");
+// Listener lists live beside the target, not on it: workerd's EventTarget
+// subclasses (Performance included) expose no own properties, and an own
+// `_listeners` field would put one on every one of them.
+const __eventListeners = new WeakMap();
+const __listenersOf = (target) => {
+  let list = __eventListeners.get(target);
+  if (list === undefined) __eventListeners.set(target, list = new Map());
+  return list;
+};
 const __getEventHandler = (target, type) =>
-  (target._listeners.get(type) || [])
+  (__listenersOf(target).get(type) || [])
     .find((entry) => entry[__eventHandlerEntry])?.callback ?? null;
 const __setEventHandler = (target, type, callback) => {
-  const list = target._listeners.get(type) || [];
+  const listeners = __listenersOf(target);
+  const list = listeners.get(type) || [];
   const entry = list.find((item) => item[__eventHandlerEntry]);
   if (typeof callback !== "function") {
     if (entry) list.splice(list.indexOf(entry), 1);
@@ -12576,12 +12641,11 @@ const __setEventHandler = (target, type, callback) => {
     entry.callback = callback;
   } else {
     list.push({ callback, once: false, [__eventHandlerEntry]: true });
-    target._listeners.set(type, list);
+    listeners.set(type, list);
   }
 };
 if (!globalThis.EventTarget) {
   globalThis.EventTarget = class EventTarget {
-    constructor() { this._listeners = new Map(); }
     addEventListener(type, callback, options = {}) {
       if (callback === null || callback === undefined) return;
       if (typeof callback !== "function" &&
@@ -12600,10 +12664,11 @@ if (!globalThis.EventTarget) {
       const signal = object ? options.signal : undefined;
       if (signal && signal.aborted) return;
       const key = String(type);
-      const list = this._listeners.get(key) || [];
+      const listeners = __listenersOf(this);
+      const list = listeners.get(key) || [];
       if (list.some((e) => e.callback === callback)) return;
       list.push({ callback, once: object && !!options.once });
-      this._listeners.set(key, list);
+      listeners.set(key, list);
       if (signal)
         signal.addEventListener("abort", () =>
           this.removeEventListener(key, callback), { once: true });
@@ -12614,7 +12679,7 @@ if (!globalThis.EventTarget) {
         throw new TypeError(
           "Cells does not support the 'capture' option on " +
           "removeEventListener().");
-      const list = this._listeners.get(String(type));
+      const list = __listenersOf(this).get(String(type));
       if (!list) return;
       const index = list.findIndex((e) => e.callback === callback);
       if (index >= 0) list.splice(index, 1);
@@ -12627,8 +12692,9 @@ if (!globalThis.EventTarget) {
           "The event is already being dispatched.",
           "InvalidStateError");
       event._begin(this);
+      const listeners = __listenersOf(this);
       // Copy: a listener may add or remove listeners mid-dispatch.
-      for (const item of (this._listeners.get(event.type) || []).slice()) {
+      for (const item of (listeners.get(event.type) || []).slice()) {
         if (event._stopImmediate) break;
         if (item.once)
           this.removeEventListener(event.type, item.callback);
@@ -12637,7 +12703,7 @@ if (!globalThis.EventTarget) {
         else item.callback.handleEvent(event);
       }
       const handler = this["on" + event.type];
-      const hasEventHandler = (this._listeners.get(event.type) || [])
+      const hasEventHandler = (listeners.get(event.type) || [])
         .some((item) => item[__eventHandlerEntry]);
       if (!hasEventHandler && !event._stopImmediate &&
           typeof handler === "function")
@@ -12655,14 +12721,82 @@ if (typeof globalThis.addEventListener !== "function") {
     globalThis[name] = globalTarget[name].bind(globalTarget);
 }
 if (!globalThis.MessageEvent) {
+  // Workerd's MessageEvent (messageevent.c++). The five initializer members
+  // are own, enumerable, non-writable data properties, installed in this
+  // order; `ports` is a fresh array (the init array is copied, not adopted)
+  // and every absent member takes its IDL default. `source` is only ever a
+  // MessagePort; MessagePort itself installs after the harness, so the check
+  // runs at construction, not here.
   globalThis.MessageEvent = class MessageEvent extends Event {
-    constructor(type, init = {}) {
-      super(type, init);
-      this.data = init.data;
-      this.origin = String(init.origin || "");
-      this.lastEventId = String(init.lastEventId || "");
+    // Rest parameter so the IDL constructor length is 0, as workerd's is.
+    constructor(...args) {
+      const type = args[0];
+      const init = args[1];
+      // A missing argument is an error, but Web IDL converts a present
+      // non-string one (workerd constructs `new MessageEvent(5)` as "5").
+      if (args.length === 0)
+        throw new TypeError(
+          "Failed to construct 'MessageEvent': constructor parameter 1 " +
+          "is not of type 'string'.");
+      if (init !== undefined && init !== null &&
+          typeof init !== "object")
+        throw new TypeError(
+          "Failed to construct 'MessageEvent': constructor parameter 2 " +
+          "is not of type 'Initializer'.");
+      const options = init ?? {};
+      let ports = [];
+      if (options.ports !== undefined) {
+        if (!Array.isArray(options.ports))
+          throw new TypeError(
+            "Incorrect type for the 'ports' field on 'Initializer': the " +
+            "provided value is not of type 'Array'.");
+        ports = Array.prototype.slice.call(options.ports);
+        for (let index = 0; index < ports.length; index++) {
+          if (typeof MessagePort !== "function" ||
+              !(ports[index] instanceof MessagePort))
+            throw new TypeError(
+              `Incorrect type for array element ${index}: the provided ` +
+              "value is not of type 'MessagePort'.");
+        }
+      }
+      const source = options.source === undefined ? null : options.source;
+      if (source !== null &&
+          (typeof MessagePort !== "function" ||
+           !(source instanceof MessagePort)))
+        throw new TypeError(
+          "Incorrect type for the 'source' field on 'Initializer': the " +
+          "provided value is not of type 'MessagePort'.");
+      super(`${type}`, options);
+      const usv = (value) => {
+        const text = String(value ?? "");
+        return text.toWellFormed ? text.toWellFormed() : text;
+      };
+      Object.defineProperties(this, {
+        ports: {
+          value: ports, enumerable: true, writable: false,
+          configurable: true,
+        },
+        source: {
+          value: source, enumerable: true, writable: false,
+          configurable: true,
+        },
+        lastEventId: {
+          value: usv(options.lastEventId), enumerable: true, writable: false,
+          configurable: true,
+        },
+        origin: {
+          value: usv(options.origin), enumerable: true, writable: false,
+          configurable: true,
+        },
+        data: {
+          value: options.data === undefined ? null : options.data,
+          enumerable: true, writable: false, configurable: true,
+        },
+      });
     }
   };
+  Object.defineProperty(globalThis.MessageEvent.prototype,
+    Symbol.toStringTag, { value: "MessageEvent", configurable: true });
 }
 if (!globalThis.CloseEvent) {
   globalThis.CloseEvent = class CloseEvent extends Event {
@@ -13250,12 +13384,13 @@ for (const n of ["WebSocket", "EventTarget", "Event", "MessageEvent",
   "TextEncoderStream", "TextDecoderStream"]) {
   if (!globalThis[n]) globalThis[n] = class {};
 }
-// These have no implementation anywhere in cello. An empty class would
-// let `new BroadcastChannel(...)` hand back an inert object that fails
-// far from the cause; the compat contract is "reject at first use", so
-// the name loads but construction throws. (EventSource, MessageChannel,
-// and MessagePort are real; their scripts run after the harness.)
-for (const n of ["BroadcastChannel", "FileReader"]) {
+// A BroadcastChannel has no implementation anywhere in cello. An empty class
+// would let `new BroadcastChannel(...)` hand back an inert object that fails
+// far from the cause; the compat contract is "reject at first use", so the
+// name loads but construction throws. (EventSource, MessageChannel, and
+// MessagePort are real; their scripts run after the harness.) FileReader is
+// not here: workerd has no such global, so neither does cello.
+for (const n of ["BroadcastChannel"]) {
   if (!globalThis[n]) globalThis[n] = class {
     constructor() {
       throw new Error(n + " is not implemented in cello");
@@ -13702,12 +13837,321 @@ Object.defineProperty(__NativeDate.prototype, "constructor", {
   configurable: true,
 });
 globalThis.Date = __CloudflareDate;
-globalThis.performance = {
-  now: () => __ioTimestamp,
-  timeOrigin: 0,
-  mark() {},
-  measure() {},
+// ---- Performance ---------------------------------------------------------
+// Workerd's clock is I/O-bound: `Date.now()` and `performance.now()` both
+// read the turn's last-I/O timestamp, so neither advances while JavaScript
+// runs. The entry/observer surface is bookkeeping on top of that clock.
+const __perfData = new WeakMap();
+const __perfEntries = [];
+const __perfToken = Symbol("cello.Performance");
+const __perfEntryToken = Symbol("cello.PerformanceEntry");
+const __perfListToken = Symbol("cello.PerformanceObserverEntryList");
+const __perfDetail = (detail) => {
+  if (detail === undefined || detail === null) return null;
+  if (typeof detail !== "object" && typeof detail !== "function")
+    throw new TypeError(
+      "Incorrect type for the 'detail' field on 'Options': the provided " +
+      "value is not of type 'Object'.");
+  return detail;
 };
+const __perfRecord = (entry) => __perfData.get(entry);
+
+class PerformanceEntry {
+  constructor(...args) {
+    if (args[0] !== __perfEntryToken)
+      throw new TypeError("Illegal constructor");
+  }
+  get name() { return __perfRecord(this).name; }
+  get entryType() { return __perfRecord(this).entryType; }
+  get startTime() { return __perfRecord(this).startTime; }
+  get duration() { return __perfRecord(this).duration; }
+  toJSON() {
+    const entry = __perfRecord(this);
+    return {
+      name: entry.name, entryType: entry.entryType,
+      startTime: entry.startTime, duration: entry.duration,
+    };
+  }
+  get [Symbol.toStringTag]() { return "PerformanceEntry"; }
+}
+
+// Workerd's PerformanceMark is the one constructible entry, and its
+// `detail` is held by reference (measured: mutating the init object after
+// mark() changes the entry).
+class PerformanceMark extends PerformanceEntry {
+  constructor(...args) {
+    const name = args[0];
+    if (args.length === 0 || typeof name !== "string")
+      throw new TypeError(
+        "Failed to construct 'PerformanceMark': constructor parameter 1 " +
+        "is not of type 'string'.");
+    super(__perfEntryToken);
+    const options = args[1] == null ? {} : args[1];
+    __perfData.set(this, {
+      name,
+      entryType: "mark",
+      startTime: options.startTime === undefined
+        ? __ioTimestamp : Number(options.startTime),
+      duration: 0,
+      detail: __perfDetail(options.detail),
+    });
+  }
+  get detail() { return __perfRecord(this).detail; }
+  toJSON() {
+    const entry = __perfRecord(this);
+    const out = {
+      name: entry.name, entryType: entry.entryType,
+      startTime: entry.startTime, duration: entry.duration,
+    };
+    if (entry.detail !== null) out.detail = entry.detail;
+    return out;
+  }
+  get [Symbol.toStringTag]() { return "PerformanceMark"; }
+}
+
+class PerformanceMeasure extends PerformanceEntry {
+  constructor(...args) {
+    if (args[0] !== __perfEntryToken)
+      throw new TypeError("Illegal constructor");
+    super(__perfEntryToken);
+  }
+  get detail() { return __perfRecord(this).detail; }
+  toJSON() {
+    const entry = __perfRecord(this);
+    const out = {
+      name: entry.name, entryType: entry.entryType,
+      startTime: entry.startTime, duration: entry.duration,
+    };
+    if (entry.detail !== null) out.detail = entry.detail;
+    return out;
+  }
+  get [Symbol.toStringTag]() { return "PerformanceMeasure"; }
+}
+
+class PerformanceResourceTiming extends PerformanceEntry {
+  constructor(...args) {
+    if (args[0] !== __perfEntryToken)
+      throw new TypeError("Illegal constructor");
+    super(__perfEntryToken);
+  }
+  get initiatorType() { return __perfRecord(this).initiatorType; }
+  get nextHopProtocol() { return ""; }
+  get workerStart() { return 0; }
+  get redirectStart() { return 0; }
+  get redirectEnd() { return 0; }
+  get fetchStart() { return 0; }
+  get domainLookupStart() { return 0; }
+  get domainLookupEnd() { return 0; }
+  get connectStart() { return 0; }
+  get connectEnd() { return 0; }
+  get secureConnectionStart() { return 0; }
+  get requestStart() { return 0; }
+  get responseStart() { return 0; }
+  get responseStatus() { return 0; }
+  get responseEnd() { return 0; }
+  get transferSize() { return 0; }
+  get encodedBodySize() { return 0; }
+  get decodedBodySize() { return 0; }
+  get [Symbol.toStringTag]() { return "PerformanceResourceTiming"; }
+}
+
+// Workerd's nodeTiming is a PerformanceNodeTiming whose fields carry zeros
+// (there is no libuv loop here); the shape is what code reads.
+class PerformanceNodeTiming extends PerformanceEntry {
+  constructor(...args) {
+    if (args[0] !== __perfEntryToken)
+      throw new TypeError("Illegal constructor");
+    super(__perfEntryToken);
+    const fields = {
+      nodeStart: 0, v8Start: 0, bootstrapComplete: 0, environment: 0,
+      loopStart: 0, loopExit: 0, idleTime: 0,
+      uvMetricsInfo: { loopCount: 0, events: 0, eventsWaiting: 0 },
+    };
+    __perfData.set(this, {
+      name: "node", entryType: "node", startTime: 0, duration: 0, ...fields,
+    });
+    for (const key of Object.keys(fields)) {
+      Object.defineProperty(this, key, {
+        value: fields[key], enumerable: true, writable: false,
+        configurable: true,
+      });
+    }
+  }
+  toJSON() {
+    const entry = __perfRecord(this);
+    return {
+      name: entry.name, entryType: entry.entryType,
+      startTime: entry.startTime, duration: entry.duration,
+      nodeStart: entry.nodeStart, v8Start: entry.v8Start,
+      bootstrapComplete: entry.bootstrapComplete,
+      environment: entry.environment, loopStart: entry.loopStart,
+      loopExit: entry.loopExit, idleTime: entry.idleTime,
+      uvMetricsInfo: entry.uvMetricsInfo,
+    };
+  }
+  get [Symbol.toStringTag]() { return "PerformanceNodeTiming"; }
+}
+
+// An EventCounts is a Map in shape only; the prototype members are its own,
+// as workerd's are.
+class EventCounts {
+  #map = new Map();
+  get size() { return this.#map.size; }
+  get(key) { return this.#map.get(key); }
+  has(key) { return this.#map.has(key); }
+  entries() { return this.#map.entries(); }
+  keys() { return this.#map.keys(); }
+  values() { return this.#map.values(); }
+  forEach(callback, thisArg) { this.#map.forEach(callback, thisArg); }
+  get [Symbol.toStringTag]() { return "EventCounts"; }
+}
+
+class PerformanceObserverEntryList {
+  #entries;
+  constructor(...args) {
+    if (args[0] !== __perfListToken)
+      throw new TypeError("Illegal constructor");
+  }
+  getEntries() { return (this.#entries ?? []).slice(); }
+  getEntriesByType(type) {
+    return (this.#entries ?? []).filter(
+      (entry) => entry.entryType === String(type));
+  }
+  getEntriesByName(name, type) {
+    return (this.#entries ?? []).filter(
+      (entry) => entry.name === String(name) &&
+        (type === undefined || entry.entryType === String(type)));
+  }
+  get [Symbol.toStringTag]() { return "PerformanceObserverEntryList"; }
+}
+
+// Workerd's PerformanceObserver never delivers a callback inside a request
+// (measured: a mark, a real timer turn and a takeRecords all leave the
+// callback unrun), so this one records nothing and hands back an empty
+// array. Feature detection and construction are what code exercises.
+class PerformanceObserver {
+  static supportedEntryTypes = ["measure", "mark"];
+  #callback;
+  constructor(...args) { this.#callback = args[0]; }
+  observe() {}
+  disconnect() {}
+  takeRecords() { return []; }
+  get [Symbol.toStringTag]() { return "PerformanceObserver"; }
+}
+
+const __perfTime = (value) => {
+  if (typeof value === "number") return value;
+  if (value === undefined) return undefined;
+  const mark = __perfEntries.find(
+    (entry) => entry.entryType === "mark" && entry.name === String(value));
+  return mark === undefined ? undefined : mark.startTime;
+};
+
+class Performance extends EventTarget {
+  #nodeTiming;
+  constructor(...args) {
+    if (args[0] !== __perfToken)
+      throw new TypeError("Illegal constructor");
+    super();
+    this.#nodeTiming = new PerformanceNodeTiming(__perfEntryToken);
+  }
+  get timeOrigin() { return 0; }
+  now() { return __ioTimestamp; }
+  get eventCounts() { return __eventCounts; }
+  clearMarks(name) {
+    __perfClear("mark", name);
+  }
+  clearMeasures(name) {
+    __perfClear("measure", name);
+  }
+  clearResourceTimings() {
+    __perfClear("resource", undefined);
+  }
+  getEntries() { return __perfEntries.slice(); }
+  getEntriesByName(name, type) {
+    return __perfEntries.filter(
+      (entry) => entry.name === String(name) &&
+        (type === undefined || entry.entryType === String(type)));
+  }
+  getEntriesByType(type) {
+    return __perfEntries.filter(
+      (entry) => entry.entryType === String(type));
+  }
+  mark(...args) {
+    const name = args[0];
+    if (args.length === 0 || typeof name !== "string")
+      throw new TypeError(
+        "Failed to execute 'mark' on 'Performance': parameter 1 is not " +
+        "of type 'string'.");
+    const entry = new PerformanceMark(name, args[1]);
+    __perfEntries.push(entry);
+    return entry;
+  }
+  measure(...args) {
+    const name = args[0];
+    if (args.length === 0 || typeof name !== "string")
+      throw new TypeError(
+        "Failed to execute 'measure' on 'Performance': parameter 1 is " +
+        "not of type 'string'.");
+    const second = args[1];
+    let start;
+    let end;
+    let detail = null;
+    if (second !== null && typeof second === "object") {
+      start = __perfTime(second.start) ?? 0;
+      end = __perfTime(second.end) ?? __ioTimestamp;
+      detail = __perfDetail(second.detail);
+    } else {
+      start = __perfTime(second) ?? 0;
+      end = __perfTime(args[2]) ?? __ioTimestamp;
+    }
+    const entry = new PerformanceMeasure(__perfEntryToken);
+    __perfData.set(entry, {
+      name, entryType: "measure", startTime: start,
+      duration: Math.max(0, end - start), detail,
+    });
+    __perfEntries.push(entry);
+    return entry;
+  }
+  setResourceTimingBufferSize() {}
+  toJSON() { return { timeOrigin: 0 }; }
+  get nodeTiming() { return this.#nodeTiming; }
+  eventLoopUtilization() {
+    return { idle: 0, active: 0, utilization: 0 };
+  }
+  markResourceTiming() {}
+  timerify(...args) {
+    const fn = args[0];
+    if (typeof fn !== "function")
+      throw new TypeError(
+        "Failed to execute 'timerify' on 'Performance': parameter 1 is " +
+        "not of type 'function'.");
+    const wrapped = function (...inner) { return fn.apply(this, inner); };
+    Object.defineProperty(wrapped, "name", { value: "", configurable: true });
+    Object.defineProperty(wrapped, "length", {
+      value: fn.length, configurable: true,
+    });
+    return wrapped;
+  }
+  get [Symbol.toStringTag]() { return "Performance"; }
+}
+const __perfClear = (entryType, name) => {
+  for (let index = __perfEntries.length - 1; index >= 0; index--) {
+    const entry = __perfEntries[index];
+    if (entry.entryType !== entryType) continue;
+    if (name !== undefined && entry.name !== String(name)) continue;
+    __perfEntries.splice(index, 1);
+  }
+};
+const __eventCounts = new EventCounts();
+globalThis.PerformanceEntry = PerformanceEntry;
+globalThis.PerformanceMark = PerformanceMark;
+globalThis.PerformanceMeasure = PerformanceMeasure;
+globalThis.PerformanceResourceTiming = PerformanceResourceTiming;
+globalThis.PerformanceObserverEntryList = PerformanceObserverEntryList;
+globalThis.PerformanceObserver = PerformanceObserver;
+globalThis.Performance = Performance;
+globalThis.performance = new Performance(__perfToken);
 __cello.__advanceIoTime = (timestamp) => {
   __ioTimestamp = timestamp;
 };
@@ -13715,10 +14159,145 @@ __cello.__advanceIoTime = (timestamp) => {
 // enumerable data property. Libraries probe it to find the global, and
 // @cloudflare/worker-bundler throws when it is absent.
 globalThis.self = globalThis;
-if (!globalThis.navigator) globalThis.navigator = {
-  userAgent: "Cloudflare-Workers", hardwareConcurrency: 1,
-  language: "en", languages: ["en"],
+// Navigator: the five values are own, non-writable data properties of the
+// one instance, and `sendBeacon` is the only prototype member (workerd
+// installs it that way). `platform` is the empty string there.
+const __navigatorToken = Symbol("cello.Navigator");
+class Navigator {
+  constructor(...args) {
+    if (args[0] !== __navigatorToken)
+      throw new TypeError("Illegal constructor");
+    const own = (value) => ({
+      value, enumerable: true, writable: false, configurable: true,
+    });
+    Object.defineProperties(this, {
+      languages: own(["en"]),
+      language: own("en"),
+      platform: own(""),
+      hardwareConcurrency: own(1),
+      userAgent: own("Cloudflare-Workers"),
+    });
+  }
+  // Workerd queues a POST and reports whether it was queued; the request's
+  // own failure never reaches the caller. A data: URL stays inside the
+  // isolate, so a probe of the return value sends nothing outward.
+  sendBeacon(...args) {
+    if (args.length === 0)
+      throw new TypeError(
+        "Failed to execute 'sendBeacon' on 'Navigator': parameter 1 is " +
+        "not of type 'string'.");
+    const url = String(args[0]);
+    try {
+      Promise.resolve(fetch(url, { method: "POST", body: args[1] ?? null }))
+        .catch(() => {});
+    } catch { /* queueing never throws */ }
+    return true;
+  }
+  get [Symbol.toStringTag]() { return "Navigator"; }
+}
+globalThis.Navigator = Navigator;
+globalThis.navigator = new Navigator(__navigatorToken);
+// The remaining interface constructors workerd exposes. Each exists so
+// feature detection and `instanceof` agree; only PerformanceMark and
+// PerformanceObserver are constructible from script.
+const __illegal = () => {
+  throw new TypeError("Illegal constructor");
 };
+const __interfaceToken = Symbol("cello.interface");
+class FetchEvent extends ExtendableEvent {
+  constructor(...args) { if (args[0] !== __interfaceToken) __illegal(); }
+  respondWith() {}
+  passThroughOnException() {}
+  get [Symbol.toStringTag]() { return "FetchEvent"; }
+}
+class ScheduledEvent extends ExtendableEvent {
+  constructor(...args) { if (args[0] !== __interfaceToken) __illegal(); }
+  noRetry() {}
+  get [Symbol.toStringTag]() { return "ScheduledEvent"; }
+}
+class TailEvent extends ExtendableEvent {
+  constructor(...args) { if (args[0] !== __interfaceToken) __illegal(); }
+  get [Symbol.toStringTag]() { return "TailEvent"; }
+}
+class TraceEvent extends ExtendableEvent {
+  constructor(...args) { if (args[0] !== __interfaceToken) __illegal(); }
+  get [Symbol.toStringTag]() { return "TailEvent"; }
+}
+class PromiseRejectionEvent extends Event {
+  constructor(...args) { if (args[0] !== __interfaceToken) __illegal(); }
+  get [Symbol.toStringTag]() { return "PromiseRejectionEvent"; }
+}
+class WorkerGlobalScope extends EventTarget {
+  constructor(...args) { if (args[0] !== __interfaceToken) __illegal(); }
+  get [Symbol.toStringTag]() { return "WorkerGlobalScope"; }
+}
+class ServiceWorkerGlobalScope extends WorkerGlobalScope {
+  constructor(...args) { if (args[0] !== __interfaceToken) __illegal(); }
+  get [Symbol.toStringTag]() { return "ServiceWorkerGlobalScope"; }
+}
+class Body {
+  constructor(...args) { if (args[0] !== __interfaceToken) __illegal(); }
+  get [Symbol.toStringTag]() { return "Body"; }
+}
+class Crypto {
+  constructor(...args) { if (args[0] !== __interfaceToken) __illegal(); }
+  get [Symbol.toStringTag]() { return "Crypto"; }
+}
+globalThis.FetchEvent = FetchEvent;
+globalThis.ScheduledEvent = ScheduledEvent;
+globalThis.TailEvent = TailEvent;
+globalThis.TraceEvent = TraceEvent;
+// Workerd's TraceEvent carries TailEvent's name (a copy/paste in its
+// interface table); the surface dump compares the function name, so match it.
+Object.defineProperty(TraceEvent, "name", {
+  value: "TailEvent", configurable: true,
+});
+globalThis.PromiseRejectionEvent = PromiseRejectionEvent;
+globalThis.WorkerGlobalScope = WorkerGlobalScope;
+globalThis.ServiceWorkerGlobalScope = ServiceWorkerGlobalScope;
+globalThis.Body = Body;
+globalThis.Crypto = Crypto;
+// `origin` is a global string on workerd, not the per-request URL.
+Object.defineProperty(globalThis, "origin", {
+  value: "null", enumerable: true, writable: false, configurable: true,
+});
+// reportError hands a value to the global "error" event. It is not a
+// constructor and takes one required Value.
+globalThis.reportError = function reportError(...args) {
+  if (args.length === 0)
+    throw new TypeError(
+      "Failed to execute 'reportError' on 'ServiceWorkerGlobalScope': " +
+      "parameter 1 is not of type 'Value'.");
+  const value = args[0];
+  const error = value instanceof Error ? value : undefined;
+  queueMicrotask(() => {
+    globalThis.dispatchEvent(new ErrorEvent("error", {
+      error,
+      message: error ? error.message : String(value),
+    }));
+  });
+};
+// Object URLs need a blob registry workerd does not implement either: both
+// statics exist and throw its own message.
+Object.defineProperties(URL, {
+  createObjectURL: {
+    value: function createObjectURL() {
+      throw new Error("URL.createObjectURL() is not implemented");
+    },
+    enumerable: true, writable: true, configurable: true,
+  },
+  revokeObjectURL: {
+    value: function revokeObjectURL() {
+      throw new Error("URL.revokeObjectURL() is not implemented");
+    },
+    enumerable: true, writable: true, configurable: true,
+  },
+});
+// The global object is a ServiceWorkerGlobalScope in workerd; a library that
+// sniffs the tag (or Object.prototype.toString.call(globalThis)) expects it.
+Object.defineProperty(globalThis, Symbol.toStringTag, {
+  value: "ServiceWorkerGlobalScope", configurable: true,
+});
 if (!globalThis.queueMicrotask)
   globalThis.queueMicrotask = (f) => Promise.resolve().then(f);
 if (!globalThis.scheduler)

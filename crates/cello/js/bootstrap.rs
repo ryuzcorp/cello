@@ -49,6 +49,7 @@ static_source!(CACHE_SOURCE, "cache.js");
 static_source!(SOCKETS_SOURCE, "sockets.js");
 static_source!(HTML_REWRITER_SOURCE, "html_rewriter.js");
 static_source!(CRYPTO_SOURCE, "crypto.js");
+static_source!(FINALIZE_SOURCE, "finalize.js");
 
 static PRELUDE: &[BootstrapSource] = &[
     BootstrapSource {
@@ -111,6 +112,12 @@ static POST_HARNESS: &[BootstrapSource] = &[
         source: &CRYPTO_SOURCE,
     },
 ];
+
+/// Runs last: it reads what every other script installed.
+static FINALIZE: BootstrapSource = BootstrapSource {
+    name: "finalize.js",
+    source: &FINALIZE_SOURCE,
+};
 
 // The harness is fixed process data, so copying its ~450 KiB source into every
 // isolate only gives V8 another owner for the same bytes. `OneByteConst` keeps
@@ -239,6 +246,7 @@ pub(super) fn bootstrap_sources_for_test<'s>(
     PRELUDE
         .iter()
         .chain(POST_HARNESS)
+        .chain(std::iter::once(&FINALIZE))
         .map(|source| (source.name, v8_strings::source(scope, source.source)))
         .collect()
 }
@@ -306,6 +314,9 @@ pub(super) fn install_harness<'s>(
     for source in POST_HARNESS {
         run_bootstrap_static_script(scope, source, arguments)?;
     }
+    // Last: the crypto instance and the globals every earlier script installed
+    // get their final shape (see finalize.js).
+    run_bootstrap_static_script(scope, &FINALIZE, arguments)?;
     // Resolving the event hooks belongs to installing the harness, not to the
     // first event: the harness is what defines them, and a caller that
     // installed the harness without them would silently fall back to nothing

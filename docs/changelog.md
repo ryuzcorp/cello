@@ -4,14 +4,91 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to the u
 ---
 ## Unreleased
 
+The missing-API workerd differences are fixed: every `MessageEvent`, the
+`Cache`/`CacheStorage` method surface, brotli compression, `FixedLengthStream`
+length failures, the `performance` entry/observer API, the global scope's
+interface constructors, timer handles, and two error paths now match workerd
+(#195, #196, #201-#204, #205, #208, #209, #214, #219, #220). Four globals are
+removed because workerd does not define them: `DigestStream` (still at
+`crypto.DigestStream`), `FileReader`, `Temporal`, and the internal
+`DurableObjectRoutingError`. The differential gate gained nine cases. The
+removals are listed again in the breaking-changes section below.
+
+- **`new MessageEvent(...)` works for every init** (#195). Workerd's
+  `MessageEvent` is constructible with `data`, `origin`, `lastEventId`,
+  `source` and `ports`; Cello threw `TypeError` from the constructor for
+  every init and had no `ports`/`source` members. The members are own,
+  enumerable, non-writable properties in workerd's order, `ports` is a fresh
+  array of `MessagePort`s, `data` defaults to `null`, and the constructor's
+  validation messages match (`constructor parameter 1 is not of type
+  'string'`, `Incorrect type for the 'ports' field on 'Initializer'`, …).
+- **`Cache` and `CacheStorage` expose workerd's whole method surface** (#196).
+  `Cache.add`, `Cache.addAll`, `Cache.matchAll`, `Cache.keys`,
+  `CacheStorage.delete`, `CacheStorage.match`, `CacheStorage.has` and
+  `CacheStorage.keys` were missing. workerd 1.20261121.1 defines them and
+  throws `Error: Failed to execute '<method>' on '<interface>': the method is
+  not implemented.` synchronously; Cello now does exactly that, and every
+  method's `length` is 0 as JSG's are.
+- **`CompressionStream`/`DecompressionStream` support `brotli`** (#201). The
+  encoder uses quality 5 with a 19-bit window, which reproduces workerd's
+  bytes exactly for the probed inputs, and the decoder validates the stream at
+  close. An unknown format is rejected at construction with workerd's
+  `TypeError: The compression format must be either 'deflate', 'deflate-raw',
+  'gzip' or 'brotli'.`; a missing argument gets its
+  `constructor parameter 1 is not of type 'string'.` message. `flate2` is
+  bumped to 1.1.11 (patch) because 1.1.9 reports a truncated gzip stream as a
+  checksum error, and only the newer release distinguishes it from corrupt
+  input.
+- **`FixedLengthStream` reports a length failure on the readable** (#202). An
+  overflow write and an underflow close now resolve; the readable errors with
+  workerd's `TypeError: Attempt to write too many bytes through a
+  FixedLengthStream.` / `TypeError: FixedLengthStream did not see all expected
+  bytes before close().` and a later close or write keeps rejecting with the
+  stored error.
+- **`performance` has workerd's entries, observers and timers** (#203). The
+  object is a `Performance` instance with `getEntries`, `getEntriesByName`,
+  `getEntriesByType`, `clearMarks`, `clearMeasures`, `clearResourceTimings`,
+  `setResourceTimingBufferSize`, `markResourceTiming`, `toJSON`, `timerify`,
+  `eventLoopUtilization`, `eventCounts` and `nodeTiming`, and the entry
+  classes (`PerformanceEntry`, `PerformanceMark`, `PerformanceMeasure`,
+  `PerformanceResourceTiming`, `PerformanceObserverEntryList`) and
+  `PerformanceObserver` exist. `mark()` returns a `PerformanceMark`, a
+  measure's `start`/`end` resolve mark names, and `JSON.stringify` produces
+  workerd's fields. The clock is unchanged: `timeOrigin` is `0` and both
+  clocks advance only at an I/O boundary. `PerformanceObserver` exists but
+  never delivers a callback inside a request, matching workerd.
+- **The global scope has workerd's interface constructors and values** (#204,
+  #205, #209). `reportError`, `origin` (`"null"`),
+  `globalThis[Symbol.toStringTag]` (`"ServiceWorkerGlobalScope"`), the
+  `Crypto`, `Navigator`, `Performance*`, `FetchEvent`, `ScheduledEvent`,
+  `TailEvent`, `TraceEvent`, `PromiseRejectionEvent`, `WorkerGlobalScope`,
+  `ServiceWorkerGlobalScope` and `Body` constructors, and
+  `URL.createObjectURL`/`revokeObjectURL` (both throwing workerd's
+  not-implemented `Error`) are present. `crypto` is a `Crypto` instance and
+  `navigator` a `Navigator` instance with `platform` `""` and `sendBeacon`.
+  `console` has `context`, no `createTask`, and the `console` tag.
+- **Timers behave like workerd's** (#208, #219). `setTimeout`/`setInterval`
+  are named functions with workerd's arity, return a `Timeout` object with
+  `refresh`/`ref`/`unref`/`hasRef`/`close` and a numeric primitive, and a
+  non-function callback throws
+  `TypeError: The "callback" argument must be of type function. Received …`
+  synchronously instead of failing later as an unhandled rejection.
+- **Error text matches workerd where the type already did** (#214). `atob`,
+  `btoa`, an invalid `TextDecoder` label, a fatal decode, a decompression
+  stream closed with incomplete data, and the default `AbortError` message
+  now use workerd's wording.
+- **`structuredClone` refuses a compiled wasm module** (#220). It throws
+  `Error: Unable to deserialize cloned data.` as workerd does, instead of
+  transferring the module.
+
 Two more `WritableStream` divergences from workerd are fixed, and the
 tee-skew conformance test no longer assumes which of a tee's copies the skew
 budget ends. A third change is breaking: a Worker can no longer generate code
 at run time (#194), described below. The differential gate gained six cases
 from those fixes and fourteen Request/body cases from the changes below,
 plus 25 binding cases, six Web Crypto cases, 23 Durable Object and
-WebSocket cases and 66 Fetch API cases (see below), 182 in total. No
-configuration or
+WebSocket cases, 66 Fetch API cases and nine missing-API cases (all below),
+191 in total. No configuration or
 bucket-format changes; the development store gains two nullable
 columns, which is backward compatible (see below). The `eval`,
 `Function` and wasm runtime-compilation changes are listed after the stream
@@ -433,6 +510,13 @@ calls).
 Still divergent and left for the slices that own them: the internal-own-key and
 `[object Object]` tag differences (#170, #171) and the incoming GET body stream
 (#174).
+
+**Breaking:** four globals workerd does not define are removed (#204):
+`DigestStream` (a global alias; `crypto.DigestStream` remains), `FileReader`
+(construction only ever threw), `Temporal` (workerd's V8 build leaves it off),
+and `DurableObjectRoutingError` (an internal class that was never documented).
+A bundle that named one of them relied on Cello-only surface and gets
+`undefined` now, as on Cloudflare.
 
 ## v0.2.8
 

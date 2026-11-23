@@ -15524,7 +15524,8 @@ fn run_decoder(
 }
 
 fn throw_invalid_encoded_data(scope: &mut v8::PinScope) {
-    let msg = v8::String::new(scope, "The encoded data was not valid.").unwrap();
+    // Workerd's message for a fatal malformed sequence.
+    let msg = v8::String::new(scope, "Failed to decode input.").unwrap();
     let exc = v8::Exception::type_error(scope, msg);
     scope.throw_exception(exc);
 }

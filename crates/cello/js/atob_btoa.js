@@ -34,11 +34,12 @@
             s = `${s}`;
             try {
                 return _atob(s);
-            } catch (e) {
+            } catch {
                 throw new DOMException(
-                    e && e.message
-                        ? String(e.message)
-                        : "atob: invalid base64",
+                    "atob() called with invalid base64-encoded data. " +
+                    "(Only whitespace, '+', '/', alphanumeric ASCII, and " +
+                    "up to two terminal '=' signs when the input data " +
+                    "length is divisible by 4 are allowed.)",
                     "InvalidCharacterError",
                 );
             }
@@ -56,7 +57,8 @@
             for (let i = 0; i < s.length; i++) {
                 if (s.charCodeAt(i) > 0xff) {
                     throw new DOMException(
-                        "String contains a code point > U+00FF",
+                        "btoa() can only operate on characters in the " +
+                        "Latin1 (ISO/IEC 8859-1) range.",
                         "InvalidCharacterError",
                     );
                 }
