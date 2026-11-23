@@ -1628,36 +1628,49 @@ const __sqlCursorFinalizer = typeof FinalizationRegistry === "function"
   : null;
 
 // A `SqlStorageCursor` over one exec's result (Cloudflare DO SQL API).
+//
+// Workerd keeps every field of a cursor in private C++ storage: `Object.keys`,
+// spread and `JSON.stringify` of a cursor see nothing, and its prototype
+// carries only the accessors and methods below. Private fields give Cello the
+// same shape, so the host-side cursor id and the prefetched row never leak
+// into tenant data.
 class SqlCursor {
   // `res` is what `__sql_cursor_start` returns: V8 values throughout, with the
   // first row already stepped. A failing query throws out of the op, so there
   // is no in-band error field to test here.
+  #columns;
+  #rowsWritten;
+  #deferredError = null;
+  #cursorId;
+  #prefetched;
+  #rowsRead;
+  #finalizerToken = null;
   constructor(res) {
-    this.columns = res.columns;
-    this.rowsWritten = Number(res.rowsWritten || 0);
-    this.reusedCachedQueryForTest = Boolean(res.reusedCachedQuery);
-    this._deferredError = null;
-    this._cursorId = Number(res.cursorId || 0);
-    this._prefetched = res.row;
-    this.rowsRead = this._prefetched === null ? 0 : 1;
-    this._finalizerToken = null;
-    if (this._cursorId && __sqlCursorFinalizer) {
-      this._finalizerToken = {};
+    this.#columns = res.columns;
+    this.#rowsWritten = Number(res.rowsWritten || 0);
+    this.#cursorId = Number(res.cursorId || 0);
+    this.#prefetched = res.row;
+    this.#rowsRead = this.#prefetched === null ? 0 : 1;
+    if (this.#cursorId && __sqlCursorFinalizer) {
+      this.#finalizerToken = {};
       __sqlCursorFinalizer.register(
-        this, this._cursorId, this._finalizerToken,
+        this, this.#cursorId, this.#finalizerToken,
       );
     }
   }
-  _obj(r) { const o = {}; for (let i = 0; i < this.columns.length; i++) o[this.columns[i]] = r[i]; return o; }
-  _finishNative() {
-    if (this._finalizerToken && __sqlCursorFinalizer)
-      __sqlCursorFinalizer.unregister(this._finalizerToken);
-    this._finalizerToken = null;
-    this._cursorId = 0;
+  get columns() { return this.#columns; }
+  get rowsRead() { return this.#rowsRead; }
+  get rowsWritten() { return this.#rowsWritten; }
+  #obj(r) { const o = {}; for (let i = 0; i < this.#columns.length; i++) o[this.#columns[i]] = r[i]; return o; }
+  #finishNative() {
+    if (this.#finalizerToken && __sqlCursorFinalizer)
+      __sqlCursorFinalizer.unregister(this.#finalizerToken);
+    this.#finalizerToken = null;
+    this.#cursorId = 0;
   }
-  _advanceNative() {
-    if (!this._cursorId) {
-      this._prefetched = null;
+  #advanceNative() {
+    if (!this.#cursorId) {
+      this.#prefetched = null;
       return;
     }
     // The op answers with V8 values, not JSON: an array is a row, a number is
@@ -1666,31 +1679,31 @@ class SqlCursor {
     // row -- the error belongs to the call after it, not to this one.
     let result;
     try {
-      result = __sql_cursor_next(this._cursorId);
+      result = __sql_cursor_next(this.#cursorId);
     } catch (error) {
-      this._deferredError = error;
-      this._prefetched = null;
-      this._finishNative();
+      this.#deferredError = error;
+      this.#prefetched = null;
+      this.#finishNative();
       return;
     }
     if (Array.isArray(result)) {
-      this._prefetched = result;
-      this.rowsRead++;
+      this.#prefetched = result;
+      this.#rowsRead++;
       return;
     }
-    this.rowsWritten = Number(result || this.rowsWritten);
-    this._prefetched = null;
-    this._finishNative();
+    this.#rowsWritten = Number(result || this.#rowsWritten);
+    this.#prefetched = null;
+    this.#finishNative();
   }
-  _nextRaw() {
-    if (this._deferredError) {
-      const error = this._deferredError;
-      this._deferredError = null;
+  #nextRaw() {
+    if (this.#deferredError) {
+      const error = this.#deferredError;
+      this.#deferredError = null;
       throw error;
     }
-    if (this._prefetched === null) return { done: true };
-    const value = this._prefetched;
-    this._advanceNative();
+    if (this.#prefetched === null) return { done: true };
+    const value = this.#prefetched;
+    this.#advanceNative();
     return { done: false, value };
   }
   toArray() {
@@ -1699,12 +1712,12 @@ class SqlCursor {
       const result = this.next();
       if (result.done) return rows;
       rows.push(result.value);
-      // `_advanceNative` prefetches the next row after this one; when that
+      // `#advanceNative` prefetches the next row after this one; when that
       // prefetch is refused, the refusal is deferred to the next `next()` so
       // this row still arrives. Throwing the generic message here would
       // replace it, so leave the check for the heap when a refusal is
       // already pending.
-      if (this._deferredError === null && __heap_limit_excessively_exceeded())
+      if (this.#deferredError === null && __heap_limit_excessively_exceeded())
         throw new Error(
           "the isolate is over its " +
           (__heap_limit_external_exceeded()
@@ -1723,15 +1736,15 @@ class SqlCursor {
   }
   *raw() {
     while (true) {
-      const result = this._nextRaw();
+      const result = this.#nextRaw();
       if (result.done) return;
       yield result.value;
     }
   }
-  get columnNames() { return this.columns; }
+  get columnNames() { return this.#columns; }
   next() {
-    const result = this._nextRaw();
-    return result.done ? result : { done: false, value: this._obj(result.value) };
+    const result = this.#nextRaw();
+    return result.done ? result : { done: false, value: this.#obj(result.value) };
   }
   [Symbol.iterator]() { return this; }
 }
