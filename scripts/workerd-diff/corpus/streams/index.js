@@ -703,12 +703,28 @@ const routes = {
     const bodylessOutcome = await settle(fetch(bodyless, { signal: aborted() }));
     const bodylessUsed = bodyless.bodyUsed;
     const bodylessSecond = await settle(fetch(bodyless, { signal: aborted() }));
+    // A fetch that refuses its init must not burn the input: workerd copies
+    // the Request only after validation succeeds.
+    const badMethod = new Request("https://diff.test/bad-method", {
+      method: "POST", body: "abc",
+    });
+    const badMethodOutcome = await settle(fetch(badMethod, { method: "BAD METHOD" }));
+    const badMethodUsed = badMethod.bodyUsed;
+    const badMethodText = await settle(badMethod.text());
+    const badRedirect = new Request("https://diff.test/bad-redirect", {
+      method: "POST", body: "abc",
+    });
+    const badRedirectOutcome = await settle(fetch(badRedirect, { redirect: "bogus" }));
+    const badRedirectUsed = badRedirect.bodyUsed;
+    const badRedirectText = await settle(badRedirect.text());
     return report({
       fetchOutcome, bodyUsed, reread, secondFetch,
       getOutcome, getUsed, getSecond,
       replacedOutcome, replacedUsed,
       streamedOutcome, streamedUsed, streamedReread,
       bodylessOutcome, bodylessUsed, bodylessSecond,
+      badMethodOutcome, badMethodUsed, badMethodText,
+      badRedirectOutcome, badRedirectUsed, badRedirectText,
     });
   },
 
@@ -768,7 +784,40 @@ const routes = {
     const prefix = [];
     for (let i = 0; i < 3; i += 1) prefix.push((await reader.read()).value);
     await reader.cancel();
-    return report({ prefix, bodyUsed: response.bodyUsed });
+    // A cancel pulls the producer's cleanup and adopts its outcome: a
+    // rejecting finally or return() rejects cancel(), as workerd's does.
+    const asyncCleanup = new Response((async function* () {
+      try {
+        yield "a";
+      } finally {
+        throw new Error("async cleanup failed");
+      }
+    })());
+    const asyncCleanupReader = asyncCleanup.body.getReader();
+    await asyncCleanupReader.read();
+    const asyncCleanupCancel = await asyncCleanupReader.cancel()
+      .then(() => "resolved", errorInfo);
+    const rejectingReturn = {
+      [Symbol.iterator]() {
+        let first = true;
+        return {
+          next() {
+            if (!first) return { value: undefined, done: true };
+            first = false;
+            return { value: "a", done: false };
+          },
+          return() { return Promise.reject(new Error("return rejected")); },
+        };
+      },
+    };
+    const rejectingReturnReader = new Response(rejectingReturn).body.getReader();
+    await rejectingReturnReader.read();
+    const rejectingReturnCancel = await rejectingReturnReader.cancel()
+      .then(() => "resolved", errorInfo);
+    return report({
+      prefix, bodyUsed: response.bodyUsed,
+      asyncCleanupCancel, rejectingReturnCancel,
+    });
   },
 
   async "/sse"() {

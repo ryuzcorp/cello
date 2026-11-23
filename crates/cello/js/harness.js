@@ -156,8 +156,10 @@ function __chunkBodyStream(iterator) {
       controller.enqueue(result.value);
     },
     cancel(reason) {
+      // Returned, not dropped: a cleanup that rejects must reject cancel()
+      // with its reason, as workerd's does.
       if (typeof iterator.return === "function")
-        iterator.return(reason);
+        return iterator.return(reason);
     },
   }, { highWaterMark: 0 });
 }
@@ -597,7 +599,11 @@ globalThis.Request = class Request {
       ? (prior ? prior.redirect : "follow")
       : init.redirect);
     if (!__FETCH_REDIRECT_MODES.has(this.redirect)) {
-      throw new TypeError(`Invalid redirect mode: ${this.redirect}`);
+      // Workerd's text for an unsupported redirect value, verbatim.
+      throw new TypeError(
+        'Invalid redirect value, must be one of "follow" or "manual" ' +
+        '("error" won\'t be implemented since it does not make sense at ' +
+        'the edge; use "manual" and check the response status code).');
     }
     const cf = init.cf === undefined
       ? (prior ? prior.cf : undefined) : init.cf;
@@ -832,21 +838,23 @@ const __fetchAdoptsBody = (input, init) =>
   input instanceof Request && input._hasBody === true &&
   !(init !== null && typeof init === "object" &&
     Object.prototype.hasOwnProperty.call(init, "body"));
-// Run before the Request copy: the constructor marks a streaming prior as it
-// adopts its stream, so checking afterwards would refuse an unused input.
-const __fetchTakeBody = (input) => {
-  if (input.bodyUsed) throw new TypeError(__FETCH_USED);
+// `usedBefore` is snapshotted before the Request copy: constructing it marks a
+// streaming prior as it adopts its stream, and a copy that throws on an
+// invalid init must leave the input untouched, as workerd's does.
+const __fetchTakeBody = (input, usedBefore) => {
+  if (usedBefore) throw new TypeError(__FETCH_USED);
   __markBodyUsed(input);
 };
 globalThis.fetch = async (input, init) => {
   const rawUrl = typeof input === "string" ? input : input?.url;
   const adoptsBody = __fetchAdoptsBody(input, init);
+  const usedBefore = adoptsBody && input.bodyUsed;
   if (typeof rawUrl === "string" && rawUrl.startsWith("data:")) {
-    if (adoptsBody) __fetchTakeBody(input);
+    if (adoptsBody) __fetchTakeBody(input, usedBefore);
     return __dataUrlResponse(rawUrl);
   }
-  if (adoptsBody) __fetchTakeBody(input);
   const req = new Request(input, init);
+  if (adoptsBody) __fetchTakeBody(input, usedBefore);
   // `fetch(url, { headers: { Upgrade: "websocket" } })` is the other way
   // Cloudflare opens an outbound socket, and the one most examples use.
   if ((req.headers.get("upgrade") ?? "").toLowerCase() === "websocket") {
@@ -2433,8 +2441,9 @@ class DurableObjectFacets {
     target.fetch = async function(input, init) {
       return invoke(async ([loader, className, id, propsSc]) => {
         const adoptsBody = __fetchAdoptsBody(input, init);
-        if (adoptsBody) __fetchTakeBody(input);
+        const usedBefore = adoptsBody && input.bodyUsed;
         const req = new Request(input, init);
+        if (adoptsBody) __fetchTakeBody(input, usedBefore);
         const headers = JSON.stringify(req.headers.__celloHeaderList);
         const { body, streamId } = await __subrequestBody(req);
         const response = JSON.parse(await __facet_fetch(
@@ -2665,7 +2674,7 @@ class ContainerPort {
   }
   async fetch(input, init) {
     const adoptsBody = __fetchAdoptsBody(input, init);
-    if (adoptsBody) __fetchTakeBody(input);
+    const usedBefore = adoptsBody && input.bodyUsed;
     const request = new Request(input, init);
     const url = new URL(request.url);
     if (url.protocol === "https:")
@@ -2674,6 +2683,9 @@ class ContainerPort {
         "instead. TLS is unnecessary anyway, as the connection is already secure by default.",
       );
     if (url.protocol !== "http:") throw new TypeError(`Fetch API cannot load: ${url}`);
+    // The body is taken only once the request is actually sent: the protocol
+    // refusals above leave the input untouched.
+    if (adoptsBody) __fetchTakeBody(input, usedBefore);
     const authority = url.host;
     url.host = __container_address(this._scope, this._port);
     const forwarded = new Request(url.toString(), request);
@@ -3577,8 +3589,9 @@ __cello.__makeLoader = () => {
       async fetch(input, init) {
         const { id, tails } = await loadPromise;
         const adoptsBody = __fetchAdoptsBody(input, init);
-        if (adoptsBody) __fetchTakeBody(input);
+        const usedBefore = adoptsBody && input.bodyUsed;
         const req = new Request(input, init);
+        if (adoptsBody) __fetchTakeBody(input, usedBefore);
         // The caller's signal, never the incoming request's own, as for a
         // service binding.
         const signal = req._signalForSubrequests;
@@ -3871,8 +3884,9 @@ const __makeServiceBinding = __cello.__makeServiceBinding =
   const target = {
   async fetch(input, init) {
     const adoptsBody = __fetchAdoptsBody(input, init);
-    if (adoptsBody) __fetchTakeBody(input);
+    const usedBefore = adoptsBody && input.bodyUsed;
     const req = new Request(input, init);
+    if (adoptsBody) __fetchTakeBody(input, usedBefore);
     const signal = req._signalForSubrequests;
     if (signal?.aborted) throw signal.reason;
     // A stream body advertises its length the way the HTTP layer
@@ -5383,7 +5397,7 @@ const __stubLift = (value, allowCapabilities = true, originals, collector = null
       if (!allowAll && !host) return v;
       marker = { "__cello$req": v.url, m: v.method,
                  h: [...v.headers], r: v.redirect, c: v.cf,
-                 b: liftBody(v) };
+                 hb: v._hasBody === true, b: liftBody(v) };
     } else if (v instanceof Response) {
       if (!allowAll && !host) return v;
       marker = { "__cello$res": v.status,
@@ -5487,10 +5501,6 @@ const __reviveBlob = (marker, bytes) => {
 const __adoptBody = (target, bytes) => {
   target._bodyBytes = bytes;
   target._body = undefined; // decoded lazily on the first text()/json()
-  // A revived Request got its body as bytes adopted here (it was built
-  // without `init.body`), so record that it has one: the fetch surfaces
-  // consume only a real body (#127).
-  if (target instanceof Request) target._hasBody = true;
   const body = target.body;
   if (body !== null) {
     body._st.bytes = bytes;
@@ -5508,6 +5518,9 @@ const __reviveRequest = (marker, url, revive) => {
   const req = new Request(url, { method: marker.m,
     headers: marker.h, redirect: marker.r, cf: marker.c });
   __adoptBody(req, marker.b);
+  // The marker carries body presence: a bodyless GET or POST revives
+  // without one, so a fetch on it consumes nothing (#127).
+  req._hasBody = marker.hb === true;
   return req;
 };
 const __reviveResponse = (marker, revive) => {
@@ -6733,8 +6746,9 @@ class DurableObjectNamespace {
     };
     const doFetch = async (input, init) => {
         const adoptsBody = __fetchAdoptsBody(input, init);
-        if (adoptsBody) __fetchTakeBody(input);
+        const usedBefore = adoptsBody && input.bodyUsed;
         const req = new Request(input, init);
+        if (adoptsBody) __fetchTakeBody(input, usedBefore);
         const signal = req._signalForSubrequests;
         if (signal?.aborted) throw signal.reason;
         // A body already backed by a host stream forwards to the cell as its

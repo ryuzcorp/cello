@@ -1,0 +1,277 @@
+// Copyright 2026 Deno Land Inc. Apache-2.0 license.
+//
+// Modified by Ryuz Corp (Cello): cross-isolate revived-Request bodyUsed.
+// Apache-2.0.
+
+// A black-box runner, not node code: it boots the binary, copies fixtures,
+// and polls TCP with wall-clock deadlines, so the execution boundary's
+// injected clock/filesystem/async rules do not apply to it.
+#![allow(clippy::disallowed_methods)]
+
+//! Conformance for a Request that crossed an isolate boundary: the RPC lift
+//! carries body presence in the `__cello$req` marker, so a revived bodyless
+//! GET stays bodyless and a revived POST keeps its body (#127). A `fetch()`
+//! on either consumes exactly what workerd consumes, a refused `init` leaves
+//! the request untouched, and the bytes survive the crossing.
+//!
+//! One `cello dev` boots the app fixture; the controller fixture is
+//! pre-seeded into the dev bucket via the library (the same `build` + `write`
+//! `dev` itself runs), so the node loads both scripts and the service binding
+//! resolves cross-isolate. There are no fixed sleeps: every wait polls an
+//! observable condition with a deadline, and the server guard kills the child
+//! on every exit path.
+
+use serde_json::Value;
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Stdio};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+fn fixture_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/fetch-used-body")
+        .canonicalize()
+        .expect("fixture exists")
+}
+
+mod common;
+
+use common::{announced, cello_command, forward_announce};
+
+fn copy_dir(src: &Path, dst: &Path) {
+    std::fs::create_dir_all(dst).expect("create fixture dir");
+    for file in ["wrangler.json", "worker.js"] {
+        std::fs::copy(src.join(file), dst.join(file)).expect("copy fixture");
+    }
+}
+
+/// Tempdir for one fixture copy: `/dev/shm` when usable, else the
+/// default tempdir, as the other cross-isolate suites do.
+fn fixture_tempdir(prefix: &str) -> tempfile::TempDir {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(prefix);
+    match builder.tempdir_in("/dev/shm") {
+        Ok(dir) => dir,
+        Err(error) => {
+            eprintln!("fixture tempdir fell back to disk (/dev/shm unusable: {error})");
+            builder.tempdir().expect("fixture tempdir")
+        }
+    }
+}
+
+/// Deploy the controller into the app project's dev bucket before `dev`
+/// boots, so the node loads both scripts. `dev` deploys the app itself and
+/// becomes primary (last write wins `deploy/current.json`); the controller's
+/// named pointer stays for the service binding to resolve.
+fn preseed_controller(app_project: &Path, controller_src: &Path) {
+    let state = app_project.join(".cello/dev");
+    std::fs::create_dir_all(state.join("runtime")).expect("state dir");
+    let database = state.join("objects.sqlite3");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    cello::asyncrt::set_host_handle(rt.handle().clone());
+    rt.block_on(async {
+        let bucket = cello::dev::open_local_bucket(&database).expect("open dev bucket");
+        cello::fleet::validate_bucket(&bucket)
+            .await
+            .expect("validate bucket");
+        bucket.probe_cas().await.expect("probe cas");
+        let built = cello::deploy::build(&cello::deploy::Options {
+            config: Some(controller_src.to_path_buf()),
+            bucket: None,
+            endpoint: None,
+            region: None,
+            dry_run: false,
+            json: false,
+            vars: cello::deploy::VarOverrides::None,
+            local_images: true,
+            sourcemap: None,
+            no_activate: false,
+            read_roots: Vec::new(),
+        })
+        .expect("build controller");
+        cello::deploy::write(&bucket, &built)
+            .await
+            .expect("write controller");
+        cello::wake_format::ensure_ready(&bucket)
+            .await
+            .expect("ensure ready");
+    });
+}
+
+/// A booted `cello dev` and its address. Kills the child on drop, so a
+/// failing assertion cannot leak a server onto its port.
+struct TestNode {
+    child: Child,
+    public: String,
+}
+
+impl TestNode {
+    fn boot(app_project: &Path) -> Self {
+        let mut child = cello_command(app_project, [("NO_COLOR", "1")])
+            .arg("dev")
+            .arg(app_project)
+            .arg("--port")
+            .arg("0")
+            .arg("--no-watch")
+            .arg("--logs")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn cello dev");
+        let mut stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+        std::thread::spawn(move || {
+            let mut sink = Vec::new();
+            let _ = stdout.read_to_end(&mut sink);
+        });
+        let announced_lines: Arc<Mutex<Vec<String>>> = Arc::default();
+        forward_announce(stderr, Arc::clone(&announced_lines));
+        let mut node = Self {
+            child,
+            public: String::new(),
+        };
+        node.public = poll_until("boot", Duration::from_secs(120), || {
+            if let Some(status) = node.child.try_wait().expect("poll child") {
+                panic!("cello dev exited during boot: {status}");
+            }
+            let addr = announced(&announced_lines, "cello listening on ")?;
+            probe(&addr, "/health").then_some(addr)
+        });
+        node
+    }
+}
+
+impl Drop for TestNode {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn request_timeout(
+    addr: &str,
+    method: &str,
+    path: &str,
+    timeout: Duration,
+) -> Result<(u16, String), String> {
+    let mut stream = TcpStream::connect(addr).map_err(|error| format!("connect: {error}"))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|error| format!("timeout: {error}"))?;
+    let wire = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+    );
+    stream
+        .write_all(wire.as_bytes())
+        .map_err(|error| format!("write: {error}"))?;
+    let mut raw = Vec::new();
+    stream
+        .read_to_end(&mut raw)
+        .map_err(|error| format!("read: {error}"))?;
+    let raw = String::from_utf8(raw).map_err(|error| format!("utf8: {error}"))?;
+    let (head, body) = raw
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| format!("no header/body split in {raw:?}"))?;
+    let status: u16 = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .ok_or_else(|| format!("no status in {head:?}"))?;
+    Ok((status, body.to_string()))
+}
+
+fn get(addr: &str, path: &str) -> Result<(u16, String), String> {
+    request_timeout(addr, "GET", path, Duration::from_secs(60))
+}
+
+/// Readiness probe with a short timeout: a bound-but-not-ready node holds
+/// connections open, so a long read would eat the boot deadline.
+fn probe(addr: &str, path: &str) -> bool {
+    matches!(
+        request_timeout(addr, "GET", path, Duration::from_secs(2)),
+        Ok((200, _))
+    )
+}
+
+fn get_json(node: &TestNode, path: &str) -> Value {
+    let (status, body) = get(&node.public, path).expect("public GET");
+    assert_eq!(status, 200, "GET {path}: {body}");
+    serde_json::from_str(&body).expect("JSON body")
+}
+
+fn poll_until(
+    name: &str,
+    deadline: Duration,
+    mut condition: impl FnMut() -> Option<String>,
+) -> String {
+    let start = Instant::now();
+    loop {
+        if let Some(done) = condition() {
+            return done;
+        }
+        if start.elapsed() > deadline {
+            panic!("{name}: condition unmet within the deadline");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+#[test]
+fn fetch_used_body_conformance() {
+    let dir = fixture_tempdir("cello-fetch-used-body-");
+    let app_project = dir.path().join("app");
+    let controller_src = dir.path().join("controller");
+    copy_dir(&fixture_dir().join("app"), &app_project);
+    copy_dir(&fixture_dir().join("controller"), &controller_src);
+    preseed_controller(&app_project, &controller_src);
+    let node = TestNode::boot(&app_project);
+
+    // The body crossed the boundary and is readable.
+    let read = get_json(&node, "/revived-read");
+    assert_eq!(read["ok"], true, "{read}");
+    assert_eq!(read["result"]["text"], "abc", "{read}");
+    assert_eq!(read["result"]["after"], true, "{read}");
+
+    // A fetch consumes the revived POST once; a second fetch is refused with
+    // the Request reconstruction error, never a silent resend.
+    let post = get_json(&node, "/revived-post");
+    assert_eq!(post["ok"], true, "{post}");
+    let result = &post["result"];
+    assert_eq!(result["before"], false, "{post}");
+    assert_eq!(result["outcome"]["name"], "Error", "{post}");
+    assert_eq!(result["outcome"]["message"], "stop", "{post}");
+    assert_eq!(result["after"], true, "{post}");
+    assert_eq!(result["reread"]["name"], "TypeError", "{post}");
+    assert_eq!(
+        result["second"]["message"], "Cannot reconstruct a Request with a used body.",
+        "{post}"
+    );
+
+    // A revived bodyless GET stays bodyless: fetching it consumes nothing,
+    // so it can be fetched again.
+    let get_route = get_json(&node, "/revived-get");
+    assert_eq!(get_route["ok"], true, "{get_route}");
+    let result = &get_route["result"];
+    assert_eq!(result["bodyIsNull"], true, "{get_route}");
+    assert_eq!(result["outcome"]["message"], "stop", "{get_route}");
+    assert_eq!(result["after"], false, "{get_route}");
+    assert_eq!(result["second"]["message"], "stop", "{get_route}");
+
+    // A refused init leaves the revived request unused and readable.
+    let bad = get_json(&node, "/revived-bad-init");
+    assert_eq!(bad["ok"], true, "{bad}");
+    let result = &bad["result"];
+    assert_eq!(result["outcome"]["name"], "TypeError", "{bad}");
+    assert_eq!(
+        result["outcome"]["message"], "Invalid HTTP method string: BAD METHOD",
+        "{bad}"
+    );
+    assert_eq!(result["after"], false, "{bad}");
+    assert_eq!(result["text"], "abc", "{bad}");
+}
