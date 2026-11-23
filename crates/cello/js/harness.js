@@ -18,6 +18,7 @@ const __primDefineProp = Object.defineProperty;
 const __primMap = Map;
 const __primSet = Set;
 const __primWeakMap = WeakMap;
+const __primWeakSet = WeakSet;
 const __primMapGet = Map.prototype.get;
 const __primMapSet = Map.prototype.set;
 const __primSetHas = Set.prototype.has;
@@ -25,6 +26,9 @@ const __primSetAdd = Set.prototype.add;
 const __primWeakMapGet = WeakMap.prototype.get;
 const __primWeakMapHas = WeakMap.prototype.has;
 const __primWeakMapSet = WeakMap.prototype.set;
+const __primWeakSetHas = WeakSet.prototype.has;
+const __primWeakSetAdd = WeakSet.prototype.add;
+const __primInstanceOf = Function.prototype[Symbol.hasInstance];
 const __primArrPush = Array.prototype.push;
 const __primArrSlice = Array.prototype.slice;
 const __primArrConcat = Array.prototype.concat;
@@ -36,6 +40,10 @@ const __setAdd = (s, v) => __primReflectApply(__primSetAdd, s, [v]);
 const __weakGet = (m, k) => __primReflectApply(__primWeakMapGet, m, [k]);
 const __weakHas = (m, k) => __primReflectApply(__primWeakMapHas, m, [k]);
 const __weakSet = (m, k, v) => __primReflectApply(__primWeakMapSet, m, [k, v]);
+const __weakSetHas = (s, v) => __primReflectApply(__primWeakSetHas, s, [v]);
+const __weakSetAdd = (s, v) => __primReflectApply(__primWeakSetAdd, s, [v]);
+const __instanceOf = (value, constructor) =>
+  __primReflectApply(__primInstanceOf, constructor, [value]);
 const __arrPush = (a, ...items) => __primReflectApply(__primArrPush, a, items);
 const __arrSlice = (a, ...args) => __primReflectApply(__primArrSlice, a, args);
 const __arrConcat = (a, ...args) => __primReflectApply(__primArrConcat, a, args);
@@ -12221,8 +12229,15 @@ if (!globalThis.CloseEvent) {
   };
 }
 if (!globalThis.DOMException) {
+  const __domExceptionInstances = new __primWeakSet();
+  __cello.__isDOMExceptionInstance = (value) =>
+    __weakSetHas(__domExceptionInstances, value);
   globalThis.DOMException = class DOMException extends Error {
-    constructor(message = "", name = "Error") { super(message); this.name = name; }
+    constructor(message = "", name = "Error") {
+      super(message);
+      this.name = name;
+      __weakSetAdd(__domExceptionInstances, this);
+    }
   };
   // WebIDL legacy code constants, enumerable on both the interface
   // object and its prototype, in spec order.
@@ -12338,6 +12353,10 @@ if (!globalThis.Blob) {
   // function-valued property makes V8's structured clone throw, so
   // a Blob reaches the RPC lift instead of silently flattening.
   const __blobNoClone = () => {};
+  // A constructed Blob is the only thing the clone codec may treat as one;
+  // a guest can reach `Blob.prototype` but not this set.
+  const __blobInstances = new __primWeakSet();
+  __cello.__isBlobInstance = (value) => __weakSetHas(__blobInstances, value);
   globalThis.Blob = class Blob {
     constructor(parts = [], options = {}) {
       // size is assigned before type so both land in the order the
@@ -12352,6 +12371,7 @@ if (!globalThis.Blob) {
       this.type = /^[\u0020-\u007e]*$/.test(rawType)
         ? rawType.toLowerCase() : "";
       this.__celloHost = __blobNoClone;
+      __weakSetAdd(__blobInstances, this);
       // Two passes. First convert every part in order -- string
       // conversion runs user code (Symbol.toPrimitive), which may
       // resize a backing buffer. Buffers and views are carried through
@@ -12422,6 +12442,8 @@ if (!globalThis.Blob) {
   };
 }
 if (!globalThis.File) {
+  const __fileInstances = new __primWeakSet();
+  __cello.__isFileInstance = (value) => __weakSetHas(__fileInstances, value);
   // WebIDL-ish per Workerd: name is required, name/lastModified are
   // brand-checked prototype getters (enumerable, matching the
   // workers_api_getters_setters_on_prototype flag), and lastModified
@@ -12435,6 +12457,7 @@ if (!globalThis.File) {
           "Failed to construct 'File': 2 arguments required, but " +
           `only ${arguments.length} present.`);
       super(parts, options);
+      __weakSetAdd(__fileInstances, this);
       this.#name = String(name);
       const lm = options == null ? undefined : options.lastModified;
       if (lm === undefined) this.#lastModified = Date.now();
@@ -13206,52 +13229,103 @@ if (!globalThis.scheduler)
     wait: (ms) => new Promise((resolve) => setTimeout(resolve, Number(ms) || 0)),
   };
 if (!globalThis.structuredClone) {
-  const hostBrand = Symbol("Cells.structuredCloneHost");
+  // Module-private registry: prototype -> { serialize, brand }. There is no
+  // symbol on a prototype, so a guest can neither discover the serializer nor
+  // make an object look like a host object. `brand` is an internal-slot or
+  // constructor-brand check, so `Object.create(Blob.prototype)` is plain data
+  // and only a constructed instance is serialized as its host type.
+  const hostRegistry = new __primWeakMap();
+  const defineHostType = (prototype, serialize, brand) => {
+    if (!__weakHas(hostRegistry, prototype)) {
+      __weakSet(hostRegistry, prototype, { serialize, brand });
+    }
+  };
+  const hostEntryOf = (value) => {
+    if (value === null || typeof value !== "object") return undefined;
+    let prototype = __primGetProto(value);
+    while (prototype !== null) {
+      const entry = __weakGet(hostRegistry, prototype);
+      if (entry !== undefined) return entry;
+      prototype = __primGetProto(prototype);
+    }
+    return undefined;
+  };
+  const isHostObject = (value) => {
+    const entry = hostEntryOf(value);
+    if (entry === undefined) return false;
+    try {
+      return entry.brand(value) === true;
+    } catch {
+      return false;
+    }
+  };
+  const writeHostObject = (value) => {
+    const entry = hostEntryOf(value);
+    if (entry === undefined || entry.brand(value) !== true) {
+      throw new DOMException(
+        'Could not serialize object of type "Object". This type does not ' +
+          "support serialization.", "DataCloneError");
+    }
+    if (entry.serialize === null) {
+      throw new DOMException("Unsupported object type", "DataCloneError");
+    }
+    return entry.serialize(value);
+  };
   const deserializers = {
     Blob: (data) => new Blob([data.bytes], { type: data.mimeType }),
     File: (data) => new File([data.bytes], data.name, {
       type: data.mimeType,
       lastModified: data.lastModified,
     }),
-    CryptoKey: (data) => __cello.$$makeCryptoKey(
-      data.keyType, data.algorithm, data.extractable, data.usages, data.material),
     DOMException: (data) => {
       const exception = new DOMException(data.message, data.name);
       if (data.stack !== undefined)
-        Object.defineProperty(exception, "stack", {
+        __primDefineProp(exception, "stack", {
           value: data.stack, configurable: true, writable: true,
         });
       return exception;
     },
   };
-  const defineHostType = (prototype, serialize) => {
-    if (!Object.prototype.hasOwnProperty.call(prototype, hostBrand))
-      Object.defineProperty(prototype, hostBrand, { value: serialize });
+  const reviveHostObject = (data) => {
+    const type = data !== null && typeof data === "object"
+      ? data.type : undefined;
+    const revive = typeof type === "string" && __primHasOwn(deserializers, type)
+      ? deserializers[type] : undefined;
+    if (typeof revive !== "function") {
+      throw new DOMException(
+        `Could not serialize object of type "${String(type)}". This type ` +
+          "does not support serialization.", "DataCloneError");
+    }
+    return revive(data);
   };
-  const defineUnsupportedType = (constructor) => {
-    if (typeof constructor === "function")
-      defineHostType(constructor.prototype, null);
-  };
+  // A brand helper for a type whose constructor records membership in a
+  // module-private WeakSet. A runtime without that set falls back to the
+  // captured `instanceof`, which is still enough to refuse, never to serialize
+  // guest state.
+  const brandOf = (name, constructor) =>
+    typeof __cello[name] === "function"
+      ? __cello[name]
+      : (value) => __instanceOf(value, constructor);
 
   defineHostType(Blob.prototype, function() {
     return {
       type: "Blob", bytes: this._bytes,
       mimeType: this.type,
     };
-  });
+  }, brandOf("__isBlobInstance", Blob));
   defineHostType(File.prototype, function() {
     return {
       type: "File", bytes: this._bytes,
       mimeType: this.type, name: this.name,
       lastModified: this.lastModified,
     };
-  });
+  }, brandOf("__isFileInstance", File));
   defineHostType(DOMException.prototype, function() {
     return {
       type: "DOMException", message: this.message,
       name: this.name, stack: this.stack,
     };
-  });
+  }, brandOf("__isDOMExceptionInstance", DOMException));
 
   globalThis.structuredClone = function(value, options) {
     if (arguments.length < 1)
@@ -13275,26 +13349,41 @@ if (!globalThis.structuredClone) {
       seen.add(item);
     }
 
-    // Crypto loads after this harness, and MessagePort is also installed by a
-    // later bootstrap script. Register every late type before V8 traverses the
-    // graph. The delegate then sees host objects at any depth without a second
-    // JavaScript traversal, which follows Deno's structured-clone design.
-    if (typeof CryptoKey === "function")
+    // Crypto and MessagePort load after this harness, so register the late
+    // types on every call (registration is idempotent) before V8 traverses
+    // the graph.
+    if (typeof CryptoKey === "function") {
+      // Workerd refuses a CryptoKey outright: a clone of a key would be a
+      // second handle to the same material. The brand is the slot map, so a
+      // guest `Object.create(CryptoKey.prototype)` is not affected.
       defineHostType(CryptoKey.prototype, function() {
-        return {
-          type: "CryptoKey", keyType: this.type,
-          algorithm: this.algorithm, extractable: this.extractable,
-          usages: this.usages, material: __cello.$$cryptoKeyMaterial(this),
-        };
-      });
-    for (const constructor of [
-      URL, URLSearchParams, Headers, FormData, Request, Response,
-      typeof MessagePort === "function" ? MessagePort : undefined,
-    ]) defineUnsupportedType(constructor);
+        throw new DOMException(
+          'Could not serialize object of type "CryptoKey". This type does ' +
+            "not support serialization.", "DataCloneError");
+      }, (key) => __cello.$$isCryptoKey(key));
+    }
+    // Types the runtime refuses to clone. They carry a constructor brand, so
+    // a forged prototype clones as plain data as workerd does; a genuine
+    // instance keeps the runtime's "Unsupported object type" refusal.
+    const unsupported = [
+      [Request, (v) => __primHasOwn(v, "_bodyBytes")],
+      [Response, (v) => __primHasOwn(v, "_bodyBytes")],
+      [Headers, (v) => __primHasOwn(v, "__celloHost")],
+      [FormData, (v) => __primHasOwn(v, "_entries")],
+      [URL, brandOf("__isUrlInstance", URL)],
+      [URLSearchParams, brandOf("__isUrlSearchParamsInstance", URLSearchParams)],
+      [typeof MessagePort === "function" ? MessagePort : undefined,
+        (v) => __instanceOf(v, MessagePort) && __primHasOwn(v, "_portBuffer")],
+    ];
+    for (const [constructor, brand] of unsupported) {
+      if (typeof constructor !== "function") continue;
+      defineHostType(constructor.prototype, null, brand);
+    }
 
     let result;
     try {
-      result = __structured_clone(value, hostBrand, deserializers);
+      result = __structured_clone(
+        value, isHostObject, writeHostObject, reviveHostObject);
     } catch (error) {
       if (error instanceof TypeError)
         throw new DOMException(error.message, "DataCloneError");

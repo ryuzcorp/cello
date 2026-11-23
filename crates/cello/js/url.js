@@ -74,6 +74,14 @@
         #href = '';
         #searchParams = null;
 
+        static {
+            // Genuine-instance brand for the clone registry: a guest can
+            // reach `URL.prototype` but not a private field.
+            __cello.__isUrlInstance = (value) => {
+                try { return #protocol in value; } catch { return false; }
+            };
+        }
+
         constructor(input, base) {
             const p = _urlParse(
                 String(input),

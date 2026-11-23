@@ -1,6 +1,8 @@
 // Web Crypto conformance fixture: key-usage enforcement (#197), argument
 // validation (#198), and AES-GCM IV/tag ranges (#199), plus the values the
 // sweep measured as already agreeing so they cannot regress.
+import { KeyObject } from "node:crypto";
+
 const enc = new TextEncoder();
 const utf8 = (text) => enc.encode(text);
 const hex = (bytes) =>
@@ -285,12 +287,19 @@ export default {
 
     if (path === "/isolation") {
       // Attack probes whose outcome agrees with workerd: the material is not
-      // reachable, the constructor refuses guests, a prototype-only forgery is
-      // not a CryptoKey, and a non-extractable key cannot be exported.
+      // reachable, the clone registry has no callable symbol, a CryptoKey
+      // refuses structuredClone, a prototype-only forgery clones as plain
+      // data, and the guest constructor throws.
       const key = await crypto.subtle.importKey("raw", utf8("s"), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
       out.materialType = typeof key.__celloMaterial;
       out.ownNames = Object.getOwnPropertyNames(key).sort();
+      out.symbolFunctions = Object.getOwnPropertySymbols(CryptoKey.prototype)
+        .filter((symbol) => typeof CryptoKey.prototype[symbol] === "function")
+        .map(String);
       out.constructor = attemptSync(() => new CryptoKey("secret", { name: "HMAC" }, false, ["sign"], {}));
+      out.constructorCall = attemptSync(() => CryptoKey.call({}));
+      out.constructorLength = CryptoKey.length;
+      out.constructorTag = String(key);
       const forged = Object.create(CryptoKey.prototype);
       Object.assign(forged, {
         type: "secret", algorithm: key.algorithm, extractable: false,
@@ -301,6 +310,44 @@ export default {
       out.exportNonExtractable = await attempt(() => crypto.subtle.exportKey("raw", key));
       const verifyOnly = await crypto.subtle.importKey("raw", utf8("s"), { name: "HMAC", hash: "SHA-256" }, false, ["verify"]);
       out.verifyOnlySign = await attempt(() => crypto.subtle.sign("HMAC", verifyOnly, utf8("m")));
+
+      // structuredClone: a key is refused with workerd's message; a plain
+      // object with key-shaped fields is plain data; a prototype-only forgery
+      // of any host type clones as plain data rather than reviving.
+      out.cloneKey = await attempt(() => structuredClone(key));
+      out.cloneProto = await attempt(() => {
+        const clone = structuredClone(Object.create(CryptoKey.prototype));
+        return {
+          isKey: clone instanceof CryptoKey,
+          tag: Object.prototype.toString.call(clone),
+          keys: Object.keys(clone),
+        };
+      });
+      out.cloneForged = await attempt(() => {
+        const clone = structuredClone({
+          type: "CryptoKey", keyType: "secret", material: { bytes: [1] },
+        });
+        return { isKey: clone instanceof CryptoKey, keys: Object.keys(clone) };
+      });
+      out.cloneForgedBlob = await attempt(() => {
+        const clone = structuredClone(Object.create(Blob.prototype));
+        return {
+          isBlob: clone instanceof Blob,
+          tag: Object.prototype.toString.call(clone),
+          keys: Object.keys(clone),
+        };
+      });
+      out.cloneForgedRequest = await attempt(() => {
+        const clone = structuredClone(Object.create(Request.prototype));
+        return {
+          isRequest: clone instanceof Request,
+          tag: Object.prototype.toString.call(clone),
+        };
+      });
+      out.keyObjectExport = await attempt(() => {
+        const bytes = KeyObject.from(key).export();
+        return new Uint8Array(bytes).byteLength;
+      });
       return Response.json(out);
     }
 
@@ -323,16 +370,12 @@ export default {
       } catch (error) {
         push = `${error.name}: ${error.message}`;
       }
-      const clone = structuredClone(
-        await crypto.subtle.importKey("raw", utf8("s"), { name: "HMAC", hash: "SHA-256" }, false, ["verify"]));
       out.mutation = {
         before, after, same: before === after, reported: key.algorithm.hash.name,
       };
       out.mutateThrew = mutate !== "ok";
       out.pushThrew = push !== "ok";
-      out.usernameAfterPush = key.usages;
-      out.cloneUsages = clone.usages;
-      out.cloneSign = await attempt(() => crypto.subtle.sign("HMAC", clone, utf8("m")));
+      out.usagesAfterPush = key.usages;
       out.algorithmFrozen = Object.isFrozen(key.algorithm) && Object.isFrozen(key.algorithm.hash);
       out.usagesFrozen = Object.isFrozen(key.usages);
       const descriptor = Object.getOwnPropertyDescriptor(key, "algorithm");
@@ -341,6 +384,53 @@ export default {
         enumerable: descriptor.enumerable,
         configurable: descriptor.configurable,
       };
+
+      // The old registry's brand was a discoverable symbol. Assert no
+      // symbol on the key or its prototype is callable as a serializer, and
+      // that the global registry name is gone.
+      out.legacySymbol = [
+        CryptoKey.prototype, Blob.prototype, DOMException.prototype,
+      ].map((prototype) =>
+        typeof prototype[Symbol.for("Cells.structuredCloneHost")]);
+      out.callableSymbols = [];
+      for (const symbol of [
+        ...Object.getOwnPropertySymbols(CryptoKey.prototype),
+        ...Object.getOwnPropertySymbols(key),
+      ]) {
+        let value;
+        try {
+          value = symbol in CryptoKey.prototype
+            ? CryptoKey.prototype[symbol] : key[symbol];
+        } catch {
+          continue;
+        }
+        if (typeof value === "function") {
+          try {
+            out.callableSymbols.push([String(symbol), value.call(key)]);
+          } catch (error) {
+            out.callableSymbols.push([String(symbol), `${error.name}`]);
+          }
+        }
+      }
+
+      // A forged Blob that copies a real Blob's constructor brand property is
+      // still not in the internal brand set: V8 refuses the function-valued
+      // property, and the bytes are never revived as a Blob.
+      const realBlob = new Blob(["hi"]);
+      const forgedBlob = Object.create(Blob.prototype);
+      forgedBlob._bytes = utf8("hi");
+      forgedBlob.__celloHost = realBlob.__celloHost;
+      const copied = attemptSync(() => structuredClone(forgedBlob));
+      out.copiedBlobBrand = {
+        ok: copied.ok,
+        isBlob: copied.ok ? copied.value instanceof Blob : false,
+      };
+
+      // A CryptoKey is never revived through the clone path.
+      const cloneKey = attemptSync(() => structuredClone(key));
+      out.cloneKey = cloneKey.ok
+        ? { ok: true, isKey: cloneKey.value instanceof CryptoKey }
+        : { ok: false, name: cloneKey.error.name, message: cloneKey.error.message };
       return Response.json(out);
     }
 

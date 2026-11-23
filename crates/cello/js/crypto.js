@@ -358,35 +358,41 @@
     return value;
   }
 
-  class CryptoKey {
-    constructor(token, type, algorithm, extractable, usages, material) {
-      if (token !== _KEY_CONSTRUCTION) {
-        throw new TypeError("Illegal constructor");
-      }
-      _KEY_SLOTS.set(this, {
-        type,
-        algorithm,
-        extractable: Boolean(extractable),
-        usages: Object.freeze(Array.from(usages || [])),
-        material,
-      });
-      // Own enumerable accessors, so `Object.keys(key)` lists the four
-      // attributes as workerd's own properties do; each read answers from
-      // the slots, never from guest-writable state.
-      const getter = (read) => ({
-        get() { return read(_keySlots(this)); },
-        enumerable: true,
-        configurable: true,
-      });
-      Object.defineProperties(this, {
-        type: getter((slots) => slots.type),
-        algorithm: getter((slots) => _copyKeyAlgorithm(slots.algorithm)),
-        extractable: getter((slots) => slots.extractable),
-        usages: getter((slots) => Object.freeze(Array.from(slots.usages))),
-      });
+  // A plain function, not a class: workerd answers `CryptoKey.call()` with
+  // `TypeError: Illegal constructor`, and a class would answer "Class
+  // constructor cannot be invoked without 'new'". Only the private symbol
+  // performs construction.
+  function CryptoKey(token, type, algorithm, extractable, usages, material) {
+    if (token !== _KEY_CONSTRUCTION) {
+      throw new TypeError("Illegal constructor");
     }
-    get [Symbol.toStringTag]() { return "CryptoKey"; }
+    _KEY_SLOTS.set(this, {
+      type,
+      algorithm,
+      extractable: Boolean(extractable),
+      usages: Object.freeze(Array.from(usages || [])),
+      material,
+    });
+    // Own enumerable accessors, so `Object.keys(key)` lists the four
+    // attributes as workerd's own properties do; each read answers from
+    // the slots, never from guest-writable state.
+    const getter = (read) => ({
+      get() { return read(_keySlots(this)); },
+      enumerable: true,
+      configurable: true,
+    });
+    Object.defineProperties(this, {
+      type: getter((slots) => slots.type),
+      algorithm: getter((slots) => _copyKeyAlgorithm(slots.algorithm)),
+      extractable: getter((slots) => slots.extractable),
+      usages: getter((slots) => Object.freeze(Array.from(slots.usages))),
+    });
   }
+  Object.defineProperty(CryptoKey, "length", { value: 0 });
+  Object.defineProperty(CryptoKey.prototype, Symbol.toStringTag, {
+    configurable: true,
+    get() { return "CryptoKey"; },
+  });
 
   function _makeKey(type, algorithm, extractable, usages, material) {
     return new CryptoKey(
@@ -1510,4 +1516,5 @@
   // guest modules cannot reach `__cello`, and the slots never leave it.
   __cello.$$makeCryptoKey = _makeKey;
   __cello.$$cryptoKeyMaterial = (key) => _KEY_SLOTS.get(key)?.material;
+  __cello.$$isCryptoKey = (key) => _KEY_SLOTS.has(key);
 })();

@@ -567,6 +567,11 @@
     export(options = {}) {
       validateObject(options, "options");
       validateExportOptions(options, this.type);
+      // Workerd refuses to export a non-extractable key through node:crypto
+      // too (Node itself allows it, with the DEP0204 warning).
+      if (!this[kHandle].extractable) {
+        throw new TypeError("Unable to export non-extractable key");
+      }
       const bytes = keyMaterial(this[kHandle]);
       if (options.format === "jwk" && this.type === "secret") {
         return {
