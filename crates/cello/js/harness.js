@@ -497,6 +497,25 @@ const __blobOfType = (bytes, type) => {
   if (type !== "") blob.type = type;
   return blob;
 };
+// A response status that carries no body at all. Workerd's Response reports
+// `body === null` for one, and its Content-Type is whatever the init or the
+// peer headers said (nothing is inferred), so every path that turns a host
+// reply into a Response drops the payload rather than wrapping it (#165).
+const __nullBodyStatus = (status) =>
+  status === 101 || status === 204 || status === 205 || status === 304;
+// A Response body from a host reply: null for a null-body status (cancelling
+// a stream handle the host registered anyway), otherwise the stream, the
+// inline body or the bytes the reply carries.
+const __hostReplyBody = (status, reply) => {
+  if (__nullBodyStatus(status)) {
+    if (reply.streamId !== undefined) __http_stream_cancel(reply.streamId);
+    return null;
+  }
+  return reply.streamId !== undefined
+    ? new CelloHttpBodyStream(reply.streamId)
+    : reply.body !== undefined ? reply.body
+      : Uint8Array.from(reply.bodyBytes || []);
+};
 globalThis.Response = class Response {
   constructor(body, init = {}) {
     // Streaming/iterable detection runs only for object bodies, so
@@ -587,7 +606,7 @@ globalThis.Response = class Response {
     // buffered one (byte-array, string or Blob) and refuses a stream, whose
     // length it cannot know; the internal 101/204 constructors in this file
     // pass either null or an empty body, so they keep working (#165).
-    if ((status === 204 || status === 205 || status === 304 || status === 101) &&
+    if (__nullBodyStatus(status) &&
         body != null && (stream !== null || this._bodyBytes.length !== 0))
       throw new TypeError(
         "Response with null body status (101, 204, 205, or 304) cannot " +
@@ -718,6 +737,13 @@ const __HTTP_METHODS = new Set(
 // The host marks them at dispatch; operator-only cell branches demand
 // membership. Script never observes the set itself, only the refusals.
 const __operatorIngressRequests = new WeakSet();
+// Internal init markers as module-private Symbols, not string keys: tenant
+// script cannot spell them, so neither guard is bypassable. `__INCOMING` says
+// the host built this request (skip the script-facing URL parse and the
+// GET/HEAD body refusal); `__PRIOR_BODY` says the body is a clone's tee'd
+// branch or a revived one, not a body a script supplied with GET/HEAD.
+const __INCOMING = Symbol("celloIncoming");
+const __PRIOR_BODY = Symbol("celloPriorBody");
 globalThis.Request = class Request {
   #cache;
   constructor(input, init = {}) {
@@ -726,7 +752,7 @@ globalThis.Request = class Request {
     // target's view of a call) skip the script-facing URL and GET/HEAD body
     // checks: the host guarantees an absolute URL, and workerd hands an
     // incoming GET a body stream. Their headers are immutable.
-    const incoming = init.__celloIncoming === true;
+    const incoming = init[__INCOMING] === true;
     const suppliedSignal = init.signal !== undefined && init.signal !== null;
     if (suppliedSignal && !(init.signal instanceof globalThis.AbortSignal))
       throw new TypeError(
@@ -785,9 +811,9 @@ globalThis.Request = class Request {
     // property, and `new Request(url, request)` is the standard proxy shape
     // -- workerd accepts it for an incoming GET, whose body presence comes
     // from the wire, not from the init. A clone's tee'd branch
-    // (`__celloPriorBody`) is the same case.
+    // (`__PRIOR_BODY`) is the same case.
     if (hasBody && body != null && !(init instanceof Request) &&
-        init.__celloPriorBody !== true &&
+        init[__PRIOR_BODY] !== true &&
         (this.method === "GET" || this.method === "HEAD") && !incoming)
       throw new TypeError(
         "Request with a GET or HEAD method cannot have a body.");
@@ -938,9 +964,15 @@ globalThis.Request = class Request {
     }
     return this._headers;
   }
-  // No setter: `headers` is a readonly attribute in workerd and in the Fetch
-  // standard. A setter here was also the one way around an incoming
-  // request's immutable header list (#169).
+  // `headers` is a readonly attribute in workerd and in the Fetch standard. A
+  // setter here was also the one way around an incoming request's immutable
+  // header list (#169). Workerd reports V8's read-only-property message (its
+  // attribute is a read-only data property), not the getter-only accessor
+  // text, so the setter throws that instead of leaving V8 to say it.
+  set headers(_value) {
+    throw new TypeError(
+      "Cannot assign to read only property 'headers' of object '#<Request>'");
+  }
   async _consume() {
     // One consumption, as on Response: a buffered body is served once and a
     // disturbed stream rejects, with workerd's TypeError (#127).
@@ -984,7 +1016,7 @@ globalThis.Request = class Request {
       // body rule -- an incoming GET legitimately carries a body stream.
       const [left, right] = this.body.tee();
       this.body = left;
-      return new Request(this, { body: right, __celloPriorBody: true });
+      return new Request(this, { body: right, [__PRIOR_BODY]: true });
     }
     return new Request(this);
   }
@@ -1039,7 +1071,7 @@ const __makeRequest = __cello.__makeRequest = (
     // forwards it with `fetch(request)` must see the 3xx, not the target
     // (#161). A deployment config cannot change it.
     redirect: "manual",
-    __celloIncoming: true,
+    [__INCOMING]: true,
     __celloIncomingSignal: incomingSignal,
   });
   // Marked here, on the host-built server-side Request only: no
@@ -1230,10 +1262,9 @@ globalThis.fetch = async (input, init) => {
   const r = JSON.parse(raw);
   // Direct network responses always carry a stream id. A transferred
   // globalOutbound Fetcher can answer with an inline body, as service
-  // bindings do, so preserve both response representations.
-  const responseBody = r.streamId !== undefined
-    ? new CelloHttpBodyStream(r.streamId)
-    : r.body !== undefined ? r.body : Uint8Array.from(r.bodyBytes || []);
+  // bindings do, so preserve both response representations -- except for a
+  // null-body status, where workerd's response has no body at all (#165).
+  const responseBody = __hostReplyBody(r.status, r);
   const response = new Response(
     responseBody,
     { status: r.status, headers: r.headers },
@@ -1300,9 +1331,8 @@ __cello.__makeAssetsBinding = (script) => ({
       req.url,
       JSON.stringify(Array.from(req.headers)),
     ));
-    const responseBody = r.streamId !== undefined
-      ? new CelloHttpBodyStream(r.streamId)
-      : r.body !== undefined ? r.body : Uint8Array.from(r.bodyBytes || []);
+    // An asset 304 answers with no body, as workerd's does (#165).
+    const responseBody = __hostReplyBody(r.status, r);
     const response = new Response(
       responseBody,
       { status: r.status, headers: r.headers },
@@ -2914,10 +2944,7 @@ class DurableObjectFacets {
         const response = JSON.parse(await __facet_fetch(
           loader, className, manager._state._scope, record.owner, name, id,
           propsSc, req.url, req.method, body, headers, streamId));
-        const responseBody = response.streamId !== undefined
-          ? new CelloHttpBodyStream(response.streamId)
-          : response.body !== undefined ? response.body
-          : Uint8Array.from(response.bodyBytes || []);
+        const responseBody = __hostReplyBody(response.status, response);
         // The facet's socket lives in the facet's isolate. The target lets
         // the root return the upgrade, or accept the client end that the
         // wrapper binds to the facet's socket.
@@ -3894,8 +3921,12 @@ const __wrapServiceResponse = (res, url) => {
     : undefined;
   const wrapped = new Response(
     // Buffered bodies re-stream (an empty buffer still yields a
-    // stream, as over real HTTP); a streaming body passes through.
-    res._bodyBytes !== null ? res._bodyBytes : res.body,
+    // stream, as over real HTTP); a streaming body passes through. A
+    // null-body status keeps no body at all: the hop's `""` payload must not
+    // become an empty stream (or, with #159, a `content-type`).
+    __nullBodyStatus(res.status)
+      ? null
+      : res._bodyBytes !== null ? res._bodyBytes : res.body,
     {
       status: res.status,
       statusText:
@@ -4096,9 +4127,7 @@ __cello.__makeLoader = () => {
           __registerWaitUntil(delivery);
         }
         const r = JSON.parse(await response);
-        const responseBody = r.streamId !== undefined
-          ? new CelloHttpBodyStream(r.streamId)
-          : r.body !== undefined ? r.body : Uint8Array.from(r.bodyBytes || []);
+        const responseBody = __hostReplyBody(r.status, r);
         // A 101 from the loaded worker carries its socket as a join target;
         // `__wrapServiceResponse` binds the caller end to it, as for a
         // Durable Object upgrade.
@@ -4387,7 +4416,7 @@ const __makeServiceBinding = __cello.__makeServiceBinding =
           __celloIncomingSignal: true,
           // The target's view of a service-binding call is an incoming
           // request: its headers are immutable, as on HTTP ingress (#169).
-          __celloIncoming: true,
+          [__INCOMING]: true,
         }));
       const response = signal
         ? await __raceCallerAbort(dispatch, signal, () =>
@@ -4437,11 +4466,7 @@ const __makeServiceBinding = __cello.__makeServiceBinding =
       : __svc_call(
         script, req.url, req.method, body, headers, streamId, entrypoint,
         propsSc)));
-    const responseBody = r.streamId !== undefined
-      ? new CelloHttpBodyStream(r.streamId)
-      : r.body !== undefined
-        ? r.body
-        : Uint8Array.from(r.bodyBytes || []);
+    const responseBody = __hostReplyBody(r.status, r);
     return __finishServiceFetch(
       new Response(responseBody, {
         status: r.status, headers: r.headers, __wsTarget: r.wsTarget,
@@ -5994,7 +6019,7 @@ const __reviveRequest = (marker, url, revive) => {
   if (!(marker.b instanceof __primUint8Array))
     return new Request(url, { method: marker.m,
       headers: marker.h, redirect: marker.r, cf: marker.c,
-      __celloPriorBody: true,
+      [__PRIOR_BODY]: true,
       body: revive(marker.b) });
   const req = new Request(url, { method: marker.m,
     headers: marker.h, redirect: marker.r, cf: marker.c });
@@ -7326,11 +7351,7 @@ class DurableObjectNamespace {
         // error (name and message) rather than a host-formatted string.
         if (r.__celloCellError !== undefined)
           throw __cellHandlerThrow(r.__celloCellError);
-        const body = r.streamId !== undefined
-          ? new CelloHttpBodyStream(r.streamId)
-          : r.body !== undefined
-            ? r.body
-            : Uint8Array.from(r.bodyBytes || []);
+        const body = __hostReplyBody(r.status, r);
         // An upgrade the cell answered with. The pair straddles two isolates,
         // so the client end cannot be the peer object itself -- it is a new
         // socket the host joins to the cell's on `accept()`. A caller that

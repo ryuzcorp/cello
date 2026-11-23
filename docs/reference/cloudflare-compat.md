@@ -82,9 +82,15 @@ use. An unsupported feature that stays silent is a defect.
 - `Response.blob().type` is the parsed and re-serialized `content-type`;
   `Blob.type` on a user-built `Blob` is the raw lower-cased string, as in
   workerd.
+- A fetched `204`, `205` or `304` has `body === null` and an empty `text()`,
+  as in workerd; no body stream crosses from the host.
 - Header names are validated with workerd's rule rather than the spec's token
   production: an empty name and a non-ASCII name are accepted (workerd
-  accepts them), and the outgoing HTTP layer refuses to send them.
+  accepts them), and the outgoing HTTP layer refuses to send them. On the way
+  out, a name the writer cannot represent is dropped and the response still
+  goes out; a byte a field value may not carry is dropped from the value.
+  Workerd writes such a byte raw -- not a legal field value -- so that single
+  case is stricter here, and the response survives either way.
 - A `Blob` appended to `FormData` without a filename is named after the entry
   key, which is workerd's behaviour and not the WHATWG spec's `"blob"`.
 - `new Request(url, { method: "trace" })` normalizes to `TRACE`; `CONNECT`
@@ -93,7 +99,9 @@ use. An unsupported feature that stays silent is a defect.
   request names `accept-encoding` (then the body arrives raw, as the Fetch
   standard requires). `content-encoding` and the original `content-length`
   both stay on the response, as in workerd, even though neither describes the
-  decoded body.
+  decoded body. Sending a body drops a `content-length` or
+  `transfer-encoding` the init replayed (a forwarded response's headers), and
+  the host frames the request itself, as workerd does.
 - A followed redirect sets `response.url` to the URL that answered and
   `response.redirected` to `true`. A redirect chain that lands back on the
   exact request URL reports `redirected: false` (the hop count is not

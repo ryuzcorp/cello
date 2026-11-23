@@ -11514,17 +11514,20 @@ fn op_fetch(
         // here, which reqwest does not expose).
         let requested_url = reqwest::Url::parse(&url).ok();
         let mut rb = client.request(m, &url);
+        // The host frames every subrequest body itself, as workerd does: a
+        // Worker-supplied `content-length` or `transfer-encoding` describes a
+        // body it already has (a forwarded response's header list, #180) and
+        // would frame this one wrongly -- a strict origin 400s and a lenient
+        // one stalls on the short body. Both are dropped from the wire set
+        // only; the fetched Response still carries them.
+        //
         // reqwest omits Content-Length for an empty Vec, which collapses the
         // wire representation of `Some([])` into the representation of
-        // `None`. Install the zero length here unless the Worker supplied a
-        // framing header, so the body distinction survives the HTTP client.
+        // `None`. Install the zero length below so the body distinction
+        // survives the HTTP client.
         let empty_body_needs_length = body
             .as_ref()
-            .is_some_and(|body| matches!(body, RequestBody::Bytes(bytes) if bytes.is_empty()))
-            && !headers.iter().any(|(name, _)| {
-                name.eq_ignore_ascii_case("content-length")
-                    || name.eq_ignore_ascii_case("transfer-encoding")
-            });
+            .is_some_and(|body| matches!(body, RequestBody::Bytes(bytes) if bytes.is_empty()));
         // A worker-named `accept-encoding` takes the body raw, as the Fetch
         // standard requires; otherwise the runtime owns the coding and a
         // gzip/deflate body decodes (upstream #238).
@@ -11532,6 +11535,11 @@ fn op_fetch(
             .iter()
             .any(|(name, _)| name.eq_ignore_ascii_case("accept-encoding"));
         for (name, value) in headers {
+            if name.eq_ignore_ascii_case("content-length")
+                || name.eq_ignore_ascii_case("transfer-encoding")
+            {
+                continue;
+            }
             rb = rb.header(name, value);
         }
         if let Some(body) = body {
@@ -11598,6 +11606,24 @@ fn op_fetch(
                         )
                     })
                     .collect::<Vec<_>>();
+                // A null-body status carries no body: workerd's Response has
+                // `body === null`, and the dictionary guard refuses one
+                // anyway (#165). Register no stream -- the body is dropped
+                // here, which closes the response -- so the harness can hand
+                // the Worker a null body and cannot leak a handle nobody
+                // reads.
+                if matches!(status, 101 | 204 | 205 | 304) {
+                    drop(resp);
+                    finish(true, Some(status), None);
+                    return Ok(serde_json::json!({
+                        "status": status,
+                        "headers": headers,
+                        "url": final_url.as_str(),
+                        "redirected": redirected,
+                        "bodyBytes": [],
+                    })
+                    .to_string());
+                }
                 let source = match encoding {
                     crate::http_streams::FetchBodyEncoding::Identity => {
                         HttpStreamSource::Stream(crate::http_streams::response_body_stream(resp))

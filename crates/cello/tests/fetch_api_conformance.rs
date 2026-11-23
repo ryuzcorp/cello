@@ -212,23 +212,46 @@ fn serve_origin(listener: TcpListener) {
                     ],
                     &GZIP_BODY,
                 );
+            } else if target.starts_with("/no-content") {
+                respond(&mut stream, "204 No Content", &[("x-helper", "yes")], b"");
+            } else if target.starts_with("/reset-content") {
+                respond(
+                    &mut stream,
+                    "205 Reset Content",
+                    &[("Content-Length", "0")],
+                    b"",
+                );
+            } else if target.starts_with("/not-modified") {
+                respond(&mut stream, "304 Not Modified", &[("etag", "\"v1\"")], b"");
             } else if target.starts_with("/echo") {
-                // Reproduce the request head so the test can assert the
-                // subrequest carried a default content type (#159).
+                // Reproduce the request head and measure the body the host
+                // framed, so a replayed `content-length` shows up as a short
+                // read (#159, #180). The read is bounded: a wrong declared
+                // length must fail the assertion, not hang the test.
+                let declared = declared_length(&head);
+                let mut received = Vec::new();
+                let mut chunk = [0u8; 1024];
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                while received.len() < declared {
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => received.extend_from_slice(&chunk[..read]),
+                    }
+                }
                 let mut headers = serde_json::Map::new();
                 for header in line.lines().skip(1) {
                     if let Some((name, value)) = header.split_once(':') {
-                        if name.trim().eq_ignore_ascii_case("content-type") {
-                            headers.insert(
-                                "content-type".into(),
-                                Value::String(value.trim().to_string()),
-                            );
+                        let name = name.trim().to_ascii_lowercase();
+                        if name == "content-type" || name == "content-length" {
+                            headers.insert(name, Value::String(value.trim().to_string()));
                         }
                     }
                 }
                 let body = serde_json::json!({
                     "method": method,
                     "headers": Value::Object(headers),
+                    "declaredLength": declared,
+                    "bodyBytes": received.len(),
                 })
                 .to_string();
                 let length = body.len().to_string();
@@ -257,6 +280,19 @@ fn serve_origin(listener: TcpListener) {
     }
 }
 
+/// The request body length the head declares, or 0 when it names none.
+fn declared_length(head: &[u8]) -> usize {
+    String::from_utf8_lossy(head)
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())?
+        })
+        .unwrap_or(0)
+}
+
 fn query<'a>(target: &'a str, name: &str) -> Option<&'a str> {
     target
         .split('&')
@@ -274,7 +310,12 @@ fn respond(stream: &mut TcpStream, status: &str, headers: &[(&str, &str)], body:
     let _ = stream.write_all(body);
 }
 
-fn get(addr: &str, path: &str) -> Result<(u16, String), String> {
+/// A raw HTTP/1.1 reply: status, the header block's pairs as received, and the
+/// body.
+type RawReply = (u16, Vec<(String, String)>, String);
+
+/// One GET: status, the header block's pairs (names as received) and the body.
+fn get_full(addr: &str, path: &str) -> Result<RawReply, String> {
     let mut stream = TcpStream::connect(addr).map_err(|error| format!("connect: {error}"))?;
     stream
         .set_read_timeout(Some(Duration::from_secs(60)))
@@ -299,7 +340,17 @@ fn get(addr: &str, path: &str) -> Result<(u16, String), String> {
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|code| code.parse().ok())
         .ok_or_else(|| format!("no status in {head:?}"))?;
-    Ok((status, body.to_string()))
+    let headers = head
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.to_string(), value.trim().to_string()))
+        .collect();
+    Ok((status, headers, body.to_string()))
+}
+
+fn get(addr: &str, path: &str) -> Result<(u16, String), String> {
+    get_full(addr, path).map(|(status, _, body)| (status, body))
 }
 
 fn probe(addr: &str, path: &str) -> bool {
@@ -550,6 +601,12 @@ fn request_options_match_workerd() {
         "TypeError: Invalid HTTP method string: connect",
         "#190",
     );
+    // #169: `headers` is readonly, with workerd's assignment message.
+    assert_outcome(
+        &options["headersAssign"],
+        "TypeError: Cannot assign to read only property 'headers' of object '#<Request>'",
+        "#169 headers assignment",
+    );
 }
 
 // #172 the default abort reason; #184 AbortSignal.any and the URL messages.
@@ -757,4 +814,89 @@ fn fetch_semantics_match_workerd() {
         "TypeError: Invalid redirect value, must be one of \"follow\" or \"manual\" (\"error\" won't be implemented since it does not make sense at the edge; use \"manual\" and check the response status code).",
         "#184 fetch init",
     );
+}
+
+// #165: a fetched null-body status has no body at all. Before the host stopped
+// registering a stream for one, `fetch()` of a 204/205/304 threw the
+// constructor's null-body TypeError -- which broke every void RPC that answers
+// 204.
+#[test]
+fn fetch_null_body_statuses_match_workerd() {
+    let _serial = serial();
+    let booted = boot("cello-fetch-api-null-body-");
+    let out = route(&booted.node, "/fetch/null-body");
+    for (key, status) in [
+        ("noContent", 204),
+        ("resetContent", 205),
+        ("notModified", 304),
+    ] {
+        let case = &out[key];
+        assert_eq!(case["status"], status, "#165 {key}: {out}");
+        assert_eq!(
+            case["bodyIsNull"], true,
+            "#165 {key}: a fetched null-body status has no body: {out}"
+        );
+        assert_eq!(
+            case["contentType"],
+            Value::Null,
+            "#165 {key}: no content-type is inferred: {out}"
+        );
+        assert_eq!(case["text"], "", "#165 {key}");
+    }
+}
+
+// #182: an odd header name must not destroy the whole response. Workerd keeps
+// the response, drops the names its header layer cannot represent, and keeps
+// the bytes a field value may carry.
+#[test]
+fn odd_response_headers_keep_the_response() {
+    let _serial = serial();
+    let booted = boot("cello-fetch-api-odd-headers-");
+    let (status, headers, body) =
+        get_full(&booted.node.public, "/raw/odd-headers").expect("request");
+    assert_eq!(
+        status, 200,
+        "#182: the response survives an unrepresentable header name: {body}"
+    );
+    assert_eq!(body, "ok", "#182");
+    let value = |name: &str| {
+        headers
+            .iter()
+            .find(|(header, _)| header.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    };
+    assert_eq!(value("x-ok"), Some("1"), "#182: {headers:?}");
+    assert_eq!(
+        value("x-ctl"),
+        Some("ab"),
+        "#182: the byte a field value cannot carry is dropped, the value stays: {headers:?}"
+    );
+    assert!(
+        headers.iter().all(|(name, _)| !name.is_empty()),
+        "#182: an empty header name is not sent: {headers:?}"
+    );
+    assert!(
+        headers.iter().all(|(name, _)| name.is_ascii()),
+        "#182: a non-ASCII header name is not sent: {headers:?}"
+    );
+}
+
+// #180: a forwarded response's `content-length` is kept on the Response and
+// dropped from the wire, where the host frames the new body itself.
+#[test]
+fn subrequest_framing_is_the_hosts() {
+    let _serial = serial();
+    let booted = boot("cello-fetch-api-reframe-");
+    let out = route(&booted.node, "/fetch/reframe");
+    assert_eq!(out["responseEncoding"], "gzip", "#180");
+    assert_eq!(
+        out["responseLength"], "30",
+        "#180: the fetched Response keeps the origin's length: {out}"
+    );
+    assert_eq!(out["body"], "hello gzip", "#180");
+    assert_eq!(
+        out["sentLength"], "10",
+        "#180: the subrequest body is framed by the host, not by the replayed header: {out}"
+    );
+    assert_eq!(out["sentBytes"], 10, "#180: {out}");
 }

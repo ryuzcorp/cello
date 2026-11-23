@@ -105,11 +105,28 @@ function startHelper() {
       const body = gzipSync(Buffer.from("hello gzip"));
       res.writeHead(200, { "content-encoding": "gzip", "content-type": "text/plain", "content-length": String(body.length) });
       res.end(body);
+    } else if (url.pathname === "/no-content") {
+      // 204/205/304 carry no body and no Content-Length on the wire; a
+      // fetched Response for one has `body === null` in workerd (#165).
+      res.writeHead(204, { "x-helper": "yes" });
+      res.end();
+    } else if (url.pathname === "/reset-content") {
+      res.writeHead(205);
+      res.end();
+    } else if (url.pathname === "/not-modified") {
+      res.writeHead(304, { etag: '"v1"' });
+      res.end();
     } else if (url.pathname === "/echo") {
       const headers = {};
       for (let i = 0; i < req.rawHeaders.length; i += 2) headers[req.rawHeaders[i].toLowerCase()] = req.rawHeaders[i + 1];
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ method: req.method, url: req.url, headers }));
+      // The body is measured, not just ignored: a replayed Content-Length
+      // would frame it wrongly and a strict client would stall (#180).
+      let bodyBytes = 0;
+      req.on("data", (chunk) => { bodyBytes += chunk.length; });
+      req.on("end", () => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ method: req.method, url: req.url, headers, bodyBytes }));
+      });
     } else {
       res.writeHead(418);
       res.end();

@@ -404,6 +404,27 @@ calls).
   "trace" })` normalizes to `"TRACE"` instead of throwing. `CONNECT` and
   `TRACK` are still refused. (The filed issue expected workerd to refuse
   `"TRACE"`; workerd 1.20261121.1 accepts it, and the gate pins that.)
+- **A fetched `204`/`205`/`304` has no body** (#165). The host registers no
+  body stream for a null-body status and the harness hands the Worker `null`,
+  so the response reports `body === null` and `text()` is `""`, as workerd's
+  does. Before this, the new null-body guard refused the empty stream the host
+  always registered and `fetch()` of a void response threw -- every runner RPC
+  that answers 204 with it.
+- **An unrepresentable response header no longer destroys the response**
+  (#182). A name the HTTP layer cannot represent (empty, non-ASCII, a
+  separator) is dropped and the response still goes out, and a byte a field
+  value may not carry is dropped from the value, instead of the whole
+  response becoming `500 invalid Worker headers`. Workerd writes such a byte
+  raw, which is not a legal field value and hyper refuses, so that one case
+  deviates deliberately in cello's favour.
+- **The host frames subrequest bodies** (#180). A Worker-supplied
+  `content-length` or `transfer-encoding` describes the body it already has --
+  a forwarded response's header list -- so it is dropped when sending, while
+  the fetched `Response` keeps both. Before this, forwarding a decompressed
+  gzip body replayed the compressed length and left the origin waiting.
+- **`request.headers = …` reports workerd's message** (#169):
+  `TypeError: Cannot assign to read only property 'headers' of object
+  '#<Request>'`.
 
 Still divergent and left for the slices that own them: the internal-own-key and
 `[object Object]` tag differences (#170, #171) and the incoming GET body stream

@@ -211,6 +211,12 @@ const routes = {
       "invalid-url": () => new Request("not a url").url,
       "relative-url": () => new Request("/x").url,
       integrity: () => new Request("https://e.com/", { integrity: "sha256-x" }).integrity,
+      // #169: `headers` is a readonly attribute.
+      headersAssign: () => {
+        const request = new Request("https://e.com/");
+        request.headers = new Headers({ x: "1" });
+        return "assigned";
+      },
       referrer: () => new Request("https://e.com/", { referrer: "https://r.com/" }).referrer,
       "referrer-empty": () => new Request("https://e.com/", { referrer: "" }).referrer,
       "referrer-junk": () => new Request("https://e.com/", { referrer: "junk" }).referrer,
@@ -769,8 +775,66 @@ const routes = {
       ),
       contentLength: headers["content-length"],
       contentType: headers["content-type"],
+      bodyBytes: echoed.bodyBytes,
     };
   },
+
+  // #165: a fetched 204/205/304 has no body at all (workerd's `body` is
+  // null), so the dictionary guard must not see one.
+  "/fetch/null-body": async (_request, _url, env) => {
+    const base = env.HELPER;
+    const one = async (path) => {
+      const response = await fetch(`${base}${path}`);
+      return {
+        status: response.status,
+        bodyIsNull: response.body === null,
+        contentType: response.headers.get("content-type"),
+        text: await response.text(),
+        ok: response.ok,
+      };
+    };
+    return {
+      noContent: await one("/no-content"),
+      resetContent: await one("/reset-content"),
+      notModified: await one("/not-modified"),
+    };
+  },
+
+  // #180: a forwarded response's `content-length` must not frame the new
+  // subrequest body. The origin reports what it actually received.
+  "/fetch/reframe": async (_request, _url, env) => {
+    const base = env.HELPER;
+    const compressed = await fetch(`${base}/gzip`);
+    const text = await compressed.text();
+    const echoed = await fetch(`${base}/echo`, {
+      method: "POST",
+      headers: compressed.headers,
+      body: text,
+    }).then((response) => response.json());
+    return {
+      // The response object keeps both headers (#180).
+      responseEncoding: compressed.headers.get("content-encoding"),
+      responseLength: compressed.headers.get("content-length"),
+      // The origin frames the body the host sent, not the replayed length.
+      sentLength: echoed.headers["content-length"],
+      sentBytes: echoed.bodyBytes,
+      body: text,
+    };
+  },
+
+  // #182: a Worker may replay an odd header name; workerd drops what its
+  // header layer cannot represent and keeps the response. A control byte in a
+  // value is not compared here: workerd writes it raw, which is not a legal
+  // field value and hyper refuses it, so cello drops the byte (pinned by
+  // `fetch_api_conformance` instead).
+  "/raw/odd-headers": () =>
+    new Response("ok", {
+      headers: {
+        "": "v",
+        "x-ok": "1",
+        "\u2713": "v",
+      },
+    }),
 
   // -------------------------------------------------------------- incoming
   "/incoming/request": (request) => {
