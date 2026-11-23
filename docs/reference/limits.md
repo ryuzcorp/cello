@@ -53,7 +53,12 @@ services, APIs, and Wrangler configuration.
   answers, but never a body the client is still reading. The body runs while
   the client stays connected and the body keeps producing. While a body
   streams, the budget ends the `waitUntil` claim; timers that work already
-  started stop one budget window after the body ends.
+  started stop one budget window after the body ends. A `fetch()` body read
+  only by `waitUntil` work is background work: it ends at the budget even
+  though every received byte refreshes the idle deadline, and the read
+  rejects with an `Error` while the upstream request is cancelled. Cloudflare
+  cancels the unfinished `waitUntil` promises about 30 seconds after the
+  response instead of rejecting them.
 - An open response still ends: when the body completes or errors, when the
   client disconnects (which cancels the producer), after `CELLO_HANDLER_BUDGET_S`
   if the handler has not answered, when the node shuts down, and after

@@ -4388,6 +4388,21 @@ impl InFlight {
         let since = *self
             .background_since
             .get_or_insert_with(crate::asyncrt::mono_now);
+        // Publish the absolute end of the phase to the context, so a fetch
+        // body read issued from `waitUntil` work binds its source to it
+        // (#141). The first observation anchors it; later passes do not
+        // slide it forward, and `set_background_deadline_ms` keeps the first
+        // value anyway.
+        //
+        // Only an outstanding `waitUntil` claim makes this background work.
+        // A completed cell event keeps its pending I/O without `waitUntil`,
+        // as workerd does, and this budget must not start bounding it just
+        // because the entry has no response stream either.
+        if self.background.is_some() && self.context.background_deadline_ms().is_none() {
+            let deadline_ms = crate::asyncrt::mono_ms()
+                .saturating_add(u64::try_from(budget.as_millis()).unwrap_or(u64::MAX));
+            self.context.set_background_deadline_ms(deadline_ms);
+        }
         since.elapsed() >= budget
     }
 
@@ -4613,6 +4628,7 @@ impl InFlight {
         // Nothing will drive a live pump once this entry is gone, so its
         // promise must not stay rooted in the isolate (upstream #275).
         self.response_streams.clear();
+        self.context.set_active_response_streams(0);
         // An op a foreign turn handed this event after its driver's last pass
         // never reached `ops`, so the drain below cannot reach its resolver.
         // Closing the mailbox both yields those ops and refuses every later
@@ -4736,6 +4752,7 @@ impl InFlight {
         // and the draining isolate — waiting for a client that is about to
         // be cut off.
         self.response_streams.clear();
+        self.context.set_active_response_streams(0);
         self.context.seal_wait_until();
         self.context.close_sockets();
     }
@@ -6897,6 +6914,11 @@ fn settle(tc: &mut v8::PinScope, entry: &mut InFlight) {
             entry.response_streams.swap_remove(stream);
         }
     }
+    // Publish the count so a fetch body read issued from here on tells
+    // response work (client-bound) from background work (budget-bound).
+    entry
+        .context
+        .set_active_response_streams(entry.response_streams.len());
 }
 
 fn wait_until_aggregate<'s>(
@@ -11535,7 +11557,13 @@ fn op_http_stream_read(
 ) {
     let stream_id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
     let service = http_stream_service();
-    let read = http_stream_read(service, stream_id);
+    // A read issued from post-response `waitUntil` work is background work:
+    // bind its source to the event's background deadline so a drip that
+    // keeps refreshing the idle window cannot hold the event (#141). Handler
+    // reads and reads inside a still-streaming response body carry none.
+    let background_deadline_ms =
+        event_context(scope).and_then(|context| context.fetch_body_read_deadline_ms());
+    let read = http_stream_read(service, stream_id, background_deadline_ms);
     let id = asyncrt::enqueue(async move {
         match read.await? {
             Some(bytes) => Ok(asyncrt::OpOut::Bytes(bytes)),
@@ -13507,6 +13535,25 @@ pub struct IoContext {
     /// it. Taken by the owning entry in `settle`, which retires each promise
     /// once it settles.
     response_streams: Mutex<Vec<v8::Global<v8::Promise>>>,
+    /// How many response body pumps the owning entry currently holds, so a
+    /// fetch body read can tell response work from background work without
+    /// reaching into that entry.
+    ///
+    /// A body the client is still reading is response work and must outlive
+    /// the background budget (#139); a body read only by `waitUntil` work is
+    /// background and must not (#141). The count is maintained by the entry
+    /// as it takes, retires and clears its pump promises. The vector above
+    /// covers the window before the entry takes them.
+    active_response_streams: AtomicUsize,
+    /// Absolute end of this event's post-response background phase in the
+    /// domain clock's milliseconds, once the driver has observed it. Zero
+    /// until then.
+    ///
+    /// A fetch body read issued while this is set is background work: the
+    /// HTTP stream registry ends its source at this instant, so an upstream
+    /// that drips one byte per idle window cannot refresh its way past the
+    /// budget (#141).
+    background_deadline_ms: AtomicU64,
     /// The tee skew budget shared by every tee branch this request creates.
     /// Lazily created on the first tee, so a request that never tees pays
     /// nothing; per-request, so one request's tees can never amplify node
@@ -13765,6 +13812,8 @@ impl IoContext {
             cross_entry_gates: CrossEntryGateClaims::default(),
             body_streams: Mutex::new(HashMap::new()),
             response_streams: Mutex::new(Vec::new()),
+            active_response_streams: AtomicUsize::new(0),
+            background_deadline_ms: AtomicU64::new(0),
             tee_skew: OnceLock::new(),
             ws_capture: Mutex::new(Vec::new()),
             egress: Mutex::new(Vec::new()),
@@ -13799,6 +13848,8 @@ impl IoContext {
             cross_entry_gates: CrossEntryGateClaims::default(),
             body_streams: Mutex::new(HashMap::new()),
             response_streams: Mutex::new(Vec::new()),
+            active_response_streams: AtomicUsize::new(0),
+            background_deadline_ms: AtomicU64::new(0),
             tee_skew: OnceLock::new(),
             ws_capture: Mutex::new(Vec::new()),
             egress: Mutex::new(Vec::new()),
@@ -13854,6 +13905,8 @@ impl IoContext {
             cross_entry_gates: CrossEntryGateClaims::default(),
             body_streams: Mutex::new(HashMap::new()),
             response_streams: Mutex::new(Vec::new()),
+            active_response_streams: AtomicUsize::new(0),
+            background_deadline_ms: AtomicU64::new(0),
             tee_skew: OnceLock::new(),
             ws_capture: Mutex::new(Vec::new()),
             egress: Mutex::new(Vec::new()),
@@ -14052,6 +14105,54 @@ impl IoContext {
     /// owning entry can hold them and retire each one as it settles.
     fn take_response_streams(&self) -> Vec<v8::Global<v8::Promise>> {
         std::mem::take(&mut *self.response_streams.lock().unwrap())
+    }
+
+    /// Record how many response body pumps the owning entry holds.
+    fn set_active_response_streams(&self, streams: usize) {
+        self.active_response_streams
+            .store(streams, Ordering::Release);
+    }
+
+    /// Whether this event still streams a response body.
+    ///
+    /// A body the client is reading is response work, not background work:
+    /// its reads stay client-bound even when the event has also entered its
+    /// post-response `waitUntil` phase (#139).
+    fn response_work_active(&self) -> bool {
+        self.active_response_streams.load(Ordering::Acquire) != 0
+            || !self.response_streams.lock().unwrap().is_empty()
+    }
+
+    /// Publish the absolute end of this event's post-response background
+    /// phase. The first value wins, so a later observation cannot slide the
+    /// deadline forward.
+    fn set_background_deadline_ms(&self, deadline_ms: u64) {
+        let _ = self.background_deadline_ms.compare_exchange(
+            0,
+            deadline_ms,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn background_deadline_ms(&self) -> Option<u64> {
+        match self.background_deadline_ms.load(Ordering::Acquire) {
+            0 => None,
+            deadline_ms => Some(deadline_ms),
+        }
+    }
+
+    /// The background deadline a fetch body read issued now must carry.
+    ///
+    /// `None` before the handler answers and while the event still streams a
+    /// response body: those reads are handler or response work, and the
+    /// background budget must not reach them.
+    fn fetch_body_read_deadline_ms(&self) -> Option<u64> {
+        if self.response_work_active() {
+            None
+        } else {
+            self.background_deadline_ms()
+        }
     }
 
     /// Take registrations made while the current background aggregate ran.
