@@ -124,4 +124,5 @@ export const cases = [
   { name: "crypto-aes-gcm", fixture: "crypto", path: "/gcm" },
   { name: "crypto-values", fixture: "crypto", path: "/values" },
   { name: "crypto-key-isolation", fixture: "crypto", path: "/isolation" },
+  { name: "clone-genuine-host-objects", fixture: "crypto", path: "/clone-genuine" },
 ];
