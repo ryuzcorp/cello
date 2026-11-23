@@ -320,7 +320,11 @@ pub fn worker_compat(metadata: &serde_json::Value) -> js::Compat {
             "2024-03-26",
         ),
         sqlite_vec: has_flag("sqlite_vec"),
-        websocket_standard_binary_type: has_flag("websocket_standard_binary_type"),
+        websocket_standard_binary_type: switch(
+            "websocket_standard_binary_type",
+            "no_websocket_standard_binary_type",
+            "2026-03-17",
+        ),
         queue_json_messages: switch("queue_json_messages", "queue_v8_messages", "2024-03-18"),
         // The opt-out wins over both the implicit `nodejs_compat`
         // population and the explicit populate flag, matching Cloudflare's

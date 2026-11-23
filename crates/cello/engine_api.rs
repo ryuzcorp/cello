@@ -408,6 +408,10 @@ pub struct WorkerConfigOptions {
 pub struct FailedInTurn {
     pub(crate) write_position: Option<u64>,
     pub(crate) observed_position: Option<u64>,
+    /// The Durable Object handler exception this failure carried, when the
+    /// failing event was a cell's and `settle` could read its name. It rides
+    /// here because `source()` deliberately hides the wrapped error's type.
+    handler: Option<CellHandlerError>,
     source: anyhow::Error,
 }
 
@@ -423,12 +427,40 @@ impl std::error::Error for FailedInTurn {
         // chain continues below it rather than repeating it. The wrapped
         // error's own type is therefore not in the chain: a `downcast_ref`
         // for it, or a `chain()` walk that looks for it, sees this wrapper
-        // instead. Every error that reaches `fail_in_turn_error` today is a
-        // plain message, so nothing looks; a typed handler failure would have
-        // to be matched through `failed_write_position` and its text.
+        // instead. A typed handler failure rides in `handler` above and is
+        // read through `cell_handler_error`.
         let source: &(dyn std::error::Error + 'static) = self.source.as_ref();
         source.source()
     }
+}
+
+/// A Durable Object handler's uncaught exception, carried across the cell
+/// boundary with the class name the handler threw. Workerd hands the caller
+/// the original error object (name, message and a caller-side stack), not a
+/// re-stringified host message; a cell event's failure keeps the two parts
+/// apart so the stub call can rebuild exactly that.
+#[derive(Clone, Debug)]
+pub struct CellHandlerError {
+    pub name: String,
+    pub message: String,
+}
+
+impl std::fmt::Display for CellHandlerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for CellHandlerError {}
+
+/// The cell handler exception an error carries, when it has one.
+pub fn cell_handler_error(error: &anyhow::Error) -> Option<&CellHandlerError> {
+    if let Some(handler) = error.downcast_ref::<CellHandlerError>() {
+        return Some(handler);
+    }
+    error
+        .downcast_ref::<FailedInTurn>()
+        .and_then(|failed| failed.handler.as_ref())
 }
 
 /// Attach the positions a failing handler's turn sampled, when it has either.
@@ -442,9 +474,11 @@ pub(crate) fn fail_in_turn_error(
     if write_position.is_none() && observed_position.is_none() {
         return error;
     }
+    let handler = error.downcast_ref::<CellHandlerError>().cloned();
     anyhow::Error::new(FailedInTurn {
         write_position,
         observed_position,
+        handler,
         source: error,
     })
 }

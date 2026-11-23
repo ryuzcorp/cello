@@ -1620,7 +1620,10 @@ pub(crate) fn json_to_sql(v: &serde_json::Value) -> rusqlite::types::Value {
     use rusqlite::types::Value;
     match v {
         serde_json::Value::Null => Value::Null,
-        serde_json::Value::Bool(b) => Value::Integer(*b as i64),
+        // Workerd's DO SQL binds a boolean as the text 'true'/'false'
+        // (sql.h BindingValue: a boolean converts through the String arm),
+        // so a column written from `true` reads back as text, not 1.
+        serde_json::Value::Bool(b) => Value::Text(if *b { "true" } else { "false" }.to_string()),
         serde_json::Value::Number(n) if n.is_i64() => Value::Integer(n.as_i64().unwrap()),
         serde_json::Value::Number(n) => Value::Real(n.as_f64().unwrap_or(0.0)),
         serde_json::Value::String(s) => Value::Text(s.clone()),
