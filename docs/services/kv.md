@@ -57,13 +57,15 @@ curl "http://127.0.0.1:9876/greet"   # hello-kv
 - `getWithMetadata(key, type)` also returns the metadata of the write.
 - `put(key, value, options)` takes a string, an `ArrayBuffer`, a typed array, or a `ReadableStream`. The options are `expiration` (absolute time in seconds), `expirationTtl` (seconds from now), and `metadata`.
 - `delete(key)` removes a key.
-- `list({ prefix, cursor })` returns a page of key names and a cursor for the next page.
+- `list({ prefix, cursor })` returns a page of key names and a cursor for the next page. A `limit` above 1000 is refused.
 
 A `kv_namespaces` entry gives a `binding` and an `id`. The `id` is the namespace identity, and it can be any string, such as a Cloudflare hexadecimal id or `sessions`. Two Workers that name one `id` reach one namespace. Cello ignores `preview_id`.
 
 `put()` reads a `ReadableStream` to its end before the write, so `put(key, request.body)` works. `list()` returns at most 1000 keys in byte order, and a concurrent write cannot make the cursor skip a key.
 
-Cello enforces the [Cloudflare KV limits](https://developers.cloudflare.com/kv/platform/limits/): a key of at most 512 bytes, a value of at most 25 MiB, metadata of at most 1024 bytes, and at most 100 keys in one bulk `get()`. A call that crosses a limit fails, and Cello never truncates data. The minimum expiration is 60 seconds. An expired key becomes invisible the moment it expires.
+Cello enforces the [Cloudflare KV limits](https://developers.cloudflare.com/kv/platform/limits/): a key of at most 512 bytes, a value of at most 25 MiB, metadata of at most 1024 bytes, and at most 100 keys in one bulk `get()`. A call that crosses a limit fails, and Cello never truncates data. Both `expiration` and `expirationTtl` must be at least 60 seconds away. An expired key becomes invisible the moment it expires.
+
+A key name may be any non-empty string up to 512 bytes except `.` and `..`, which are refused. A rejected input carries the error the Cloudflare API answers with: a local check throws a `TypeError` (`Key name cannot be empty.`, `"." is not allowed as a key name.`), and a request-level refusal reads `KV <OP> failed: <status> <text>`, such as `KV PUT failed: 400 Invalid expiration of … Expiration times must be at least 60 seconds in the future.` A bulk `getWithMetadata()` maps a missing key to `null`, so a caller can tell an absent key from a stored value.
 
 Every call goes to the node that owns the namespace cell, so a read costs one cell dispatch. Hold a value in a local variable when one request reads it many times. Writes to one namespace run one at a time, so use a Durable Object for a write-hot value such as a counter.
 

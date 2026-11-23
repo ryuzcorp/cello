@@ -8,8 +8,10 @@ Two more `WritableStream` divergences from workerd are fixed, and the
 tee-skew conformance test no longer assumes which of a tee's copies the skew
 budget ends. A third change is breaking: a Worker can no longer generate code
 at run time (#194), described below. The differential gate gained six cases
-from those fixes and fourteen Request/body cases from the changes below, 62 in
-total. No configuration, data, or bucket-format changes. The `eval`,
+from those fixes and fourteen Request/body cases from the changes below,
+plus 25 binding cases (see below), 87 in total. No configuration or
+bucket-format changes; the development store gains two nullable
+columns, which is backward compatible (see below). The `eval`,
 `Function` and wasm runtime-compilation changes are listed after the stream
 fixes because they break bundles that relied on them.
 
@@ -113,6 +115,71 @@ harness:
   `chunk-shadow-response`, `chunk-shadow-response-tight`,
   `chunk-shadow-response-dataview`, `blob-part-shadow`, `kv-string-chunk`,
   `kv-view-shadow` and `websocket-send-copy`.
+
+The KV, R2, D1 and Cache bindings now answer the way workerd's local
+implementation does on the paths a differential sweep compared. R2 reports an
+object's content ETag — the MD5 of its bytes, or `md5(md5s)-N` for a multipart
+upload — and a unique per-write `version`, so identical content answers one
+ETag. R2 and KV refuse `.`/`..` object and key names. Range, metadata-size,
+list-limit, expiration and D1 statement failures carry R2's error codes, KV's
+`KV <OP> failed: <status> <text>` shape, and D1's SQLite detail instead of
+Cello-specific text. Every fixed divergence has a case in the
+`scripts/workerd-diff` gate, which now also runs the KV, R2, D1 and Cache
+bindings (workerd gets `--experimental` for its binding config).
+
+KV:
+
+- `.` and `..` are refused as key names, on reads and writes, with
+  workerd's `TypeError` (#147).
+- `expiration` must be at least 60 seconds ahead, like `expirationTtl`
+  (#146).
+- A `list()` limit above 1000 is refused (#155).
+- Input validation uses workerd's error class and message: a local check
+  throws `TypeError`, and a request-level refusal reads
+  `KV <OP> failed: <status> <text>` (#156).
+- A bulk `getWithMetadata()` answers `null` for an absent key instead of an
+  object whose value is null, so a caller can tell "absent" from "stored".
+
+R2:
+
+- `R2Object.etag` and `httpEtag` are the object's content ETag, not the
+  development store's sequence number (#144). A single-request write is the
+  hex MD5 of its bytes; a multipart object is `md5(md5s)-N`. `version`
+  remains a unique id, one per write.
+- A range that starts past the end of the object fails with
+  `get: The requested range is not satisfiable (10039)` instead of the
+  store's internal path (#145).
+- `.` and `..` key segments are refused with `InvalidObjectName (10020)`
+  before any write, on every method (#148).
+- `customMetadata` is capped at 8 KiB of names plus values, which fails a
+  put with `MetadataTooLarge (10012)` (#162).
+- `list()` refuses a `limit` outside 1..1000 with `(10022)` (#164; the
+  invalid-cursor behavior is unchanged).
+- `onlyIf.etagMatches`/`etagDoesNotMatch` refuse the quoted `httpEtag`
+  spelling with workerd's `TypeError` (#189).
+
+D1:
+
+- `batch([])`, `exec("")`, a comment-only `exec`, and a `prepare()` that
+  holds no statement fail with `No SQL statements detected.` (#152).
+- `exec()` reports SQLite's syntax error, including the token offset and the
+  result code, instead of Cello's "incomplete statement" diagnosis (#153).
+- `meta` carries `total_attempts`, always 1 (#157).
+
+Cache:
+
+- `ignoreSearch` and `ignoreVary` are refused with the error workerd
+  throws rather than silently ignored (#166).
+- A cached response keeps its `statusText`, including an empty one (#168).
+
+Development store migration: the dev-store SQLite file gains two nullable
+columns, `etag_md5` and `version`. The change is additive and backward
+compatible. A row written by an older Cello keeps its old sequence number as
+its ETag — so a conditional write that names it still matches — and takes
+that number as its `version`; it earns a content MD5 only when it is
+rewritten. No object data is rewritten, and `cello dev` opens an existing
+store in place.
+
 
 ## v0.2.8
 

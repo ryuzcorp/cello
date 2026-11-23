@@ -51,6 +51,18 @@
   // retained view would then hold the later bytes. Workerd writes each chunk
   // out host-side as it reads it, so a reused 3-byte buffer stores "alpbra";
   // deferring the copy stored "brabra".
+  // `CacheQueryOptions` fields Cloudflare's runtime does not implement.
+  // Silently ignoring one answers a different question than the caller
+  // asked, which is exactly the failure mode a request cache must not have.
+  const refuseUnimplemented = (options, name) => {
+    if (options === null || options === undefined) return;
+    if (name in Object(options)) {
+      throw new Error(
+        `The '${name}' field on 'CacheQueryOptions' is not implemented.`,
+      );
+    }
+  };
+
   const encoder = new TextEncoder();
   // Captured at install time: the harness declares these in its own script
   // scope, so they reach this script only through `__cello`.
@@ -159,10 +171,13 @@
         response.status,
         JSON.stringify(headerPairs(response.headers)),
         body,
+        response.statusText,
       );
     }
 
     async match(request, options = undefined) {
+      refuseUnimplemented(options, "ignoreSearch");
+      refuseUnimplemented(options, "ignoreVary");
       const key = asKey(request);
       const ignoreMethod = options?.ignoreMethod === true;
       const found = __cache_match(
@@ -173,15 +188,23 @@
         JSON.stringify(headerPairs(key.headers)),
       );
       if (found === null || found === undefined) return undefined;
-      const [status, headersJson, body] = found;
+      const [status, headersJson, body, statusText] = found;
       const headers = new Headers(JSON.parse(headersJson));
+      // A stored reason phrase is passed through verbatim, including an
+      // empty one. A synthesised answer (304, 416, 206) has none, so
+      // `Response` supplies its status's default phrase, as workerd does.
+      const init = statusText === null
+        ? { status, headers }
+        : { status, statusText, headers };
       // A null body is a 304, a 416, or a stored null-body status: those
       // construct with null, never with an empty byte string.
-      if (body === null) return new Response(null, { status, headers });
-      return new Response(body, { status, headers });
+      if (body === null) return new Response(null, init);
+      return new Response(body, init);
     }
 
     async delete(request, options = undefined) {
+      refuseUnimplemented(options, "ignoreSearch");
+      refuseUnimplemented(options, "ignoreVary");
       const key = asKey(request);
       const ignoreMethod = options?.ignoreMethod === true;
       return __cache_delete(

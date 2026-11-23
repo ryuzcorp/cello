@@ -1082,10 +1082,22 @@ const __r2Reject = (bucket, method, detail) => {
       (detail ? `: ${detail}` : ""),
   );
 };
+// R2's own error shape: `<method>: <text> (<code>)`. A Worker matches the
+// code and the text, so an error R2 defines is rendered exactly, not in
+// Cello's own words.
+const __r2Failure = (method, text, code) =>
+  new Error(`${method}: ${text} (${code})`);
 // R2's key rules, checked here so a key the real thing refuses is refused
 // here too rather than quietly written.
 const __r2Key = (binding, method, key) => {
   const text = String(key);
+  // A `.` or `..` segment is not an object name to R2: the key is mapped
+  // into the store as `r2/<bucket>/<key>`, so a segment the store would
+  // resolve is refused here, before any write. Checked before the length,
+  // because R2 reports a long key holding one as an invalid name too.
+  if (text.split("/").some((segment) => segment === "." || segment === "..")) {
+    throw __r2Failure(method, "The specified object name is not valid.", 10020);
+  }
   const length = new TextEncoder().encode(text).length;
   if (length === 0 || length > 1024) {
     throw new Error(
@@ -1178,7 +1190,19 @@ const __r2OnlyIf = (value) => {
   for (const [name, entry] of Object.entries(only)) {
     if (entry === undefined || entry === null || Number.isNaN(entry)) {
       delete only[name];
-    } else if (name.startsWith("etag")) only[name] = String(entry);
+    } else if (name.startsWith("etag")) {
+      const etag = String(entry);
+      // `R2Object.etag` is unquoted; `httpEtag` is the quoted spelling for
+      // HTTP headers, which a conditional takes unquoted. R2 refuses the
+      // quoted form rather than quietly accepting a value a deployed node
+      // rejects.
+      if (etag.length >= 2 && etag.startsWith('"') && etag.endsWith('"')) {
+        throw new TypeError(
+          `Conditional ETag should not be wrapped in quotes (${etag}).`,
+        );
+      }
+      only[name] = etag;
+    }
   }
   return Object.keys(only).length ? only : undefined;
 };
@@ -1292,8 +1316,22 @@ const __r2WriteOptions = (binding, method, options) => {
     );
   }
   const custom = {};
+  let customBytes = 0;
+  const encoder = new TextEncoder();
   for (const [name, value] of Object.entries(o.customMetadata ?? {})) {
     custom[name] = String(value);
+    customBytes += encoder.encode(name).length +
+      encoder.encode(custom[name]).length;
+  }
+  // R2 caps the user metadata headers; past the cap a real bucket refuses
+  // the write, so the local store must too rather than answer a put that
+  // only ever worked in development.
+  if (customBytes > 8192) {
+    throw __r2Failure(
+      method,
+      "Your metadata headers exceed the maximum allowed metadata size.",
+      10012,
+    );
   }
   const verify = {};
   for (const name of ["md5", "sha1", "sha256", "sha384", "sha512"]) {
@@ -1445,6 +1483,16 @@ __cello.__makeR2Bucket = (binding, bucketName) => ({
   },
   async list(options) {
     const o = options ?? {};
+    if (o.limit !== undefined && o.limit !== null) {
+      const limit = Number(o.limit);
+      if (!Number.isInteger(limit) || limit < 1 || limit > 1000) {
+        throw __r2Failure(
+          "list",
+          "MaxKeys params must be positive integer <= 1000.",
+          10022,
+        );
+      }
+    }
     const include = Array.isArray(o.include) ? o.include : [];
     for (const entry of include) {
       if (!["httpMetadata", "customMetadata"].includes(entry)) {
@@ -10183,6 +10231,10 @@ class D1Database {
     }
   }
   async _batch(statements) {
+    // An empty statement set ran nothing, and upstream says so rather than
+    // answering an empty result a caller reads as "every statement
+    // succeeded".
+    if (statements.length === 0) throw __d1Error("No SQL statements detected.");
     try {
       const encoded = statements.map((statement) => ({
         sql: statement._sql,

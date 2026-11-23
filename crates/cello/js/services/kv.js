@@ -56,7 +56,13 @@ function kvService(host) {
   // Upstream's four content types. The wire form is what `get` returns for
   // `type: "text"`; the binding converts from there, so the cell stores bytes
   // and a tag and never a parsed value.
+  // A KV request that a real namespace answers with an HTTP failure carries
+  // upstream's exact shape (`KV <OP> failed: <status> <text>`), because a
+  // Worker matches on it; the operator route below keeps `KV_ERROR` for its
+  // own refusals, which have no Cloudflare counterpart.
   const __kvError = (message) => new Error("KV_ERROR: " + String(message));
+  const __kvFailure = (op, status, text) =>
+    new Error(`KV ${op} failed: ${status} ${text}`);
 
   // The authenticated operator route still uses JSON for its control envelope.
   // A byte array is acceptable for an inline value, but a 25 MiB array creates
@@ -744,7 +750,7 @@ function kvService(host) {
             // put the same bound in two processes -- and they disagreed the first
             // time a test shortened one of them.
             const key = String(body.key);
-            __kvCheckKey(key);
+            __kvCheckKey(key, "PUT");
             const value = body.op === "put-base64"
               ? host.atob(String(body.value))
               : new Uint8Array(body.value);
@@ -767,7 +773,7 @@ function kvService(host) {
             break;
           }
           case "delete":
-            for (const key of body.keys) __kvCheckKey(String(key));
+            for (const key of body.keys) __kvCheckKey(String(key), "DELETE");
             await this.__kvDelete({ keys: body.keys.map(String) });
             result = { ok: true };
             break;
@@ -824,12 +830,22 @@ function kvService(host) {
   // and none is duplicated here.
   const __kvLimits = host.limits;
 
-  const __kvCheckKey = (key) => {
-    if (key.length === 0) throw __kvError("a key must not be empty");
+  // `op` is the operation spelled the way upstream's refusal names it
+  // (`PUT`, `GET`, `DELETE`, `GET_BULK`). The empty and dot checks are
+  // local, so they are `TypeError`s with no status line, exactly as a
+  // WebIDL-style argument check throws in workerd.
+  const __kvCheckKey = (key, op) => {
+    if (key.length === 0) throw new TypeError("Key name cannot be empty.");
+    if (key === "." || key === "..") {
+      throw new TypeError(`${JSON.stringify(key)} is not allowed as a key name.`);
+    }
     const bytes = __kvEncoder.encode(key).byteLength;
     if (bytes > __kvLimits().maxKeyBytes) {
-      throw __kvError(
-        `a key is at most ${__kvLimits().maxKeyBytes} bytes, got ${bytes}`,
+      throw __kvFailure(
+        op,
+        414,
+        `UTF-8 encoded length of ${bytes} exceeds key length limit of ` +
+          `${__kvLimits().maxKeyBytes}.`,
       );
     }
   };
@@ -844,35 +860,64 @@ function kvService(host) {
     // Cloudflare's own KV rearchitecture made and for the same reason -- a cell
     // replicates every write as LTX, so an inline value is paid for twice.
     if (size > __kvLimits().maxValueBytes) {
-      throw __kvError(`a value is at most ${__kvLimits().maxValueBytes} bytes, got ${size}`);
+      throw __kvFailure(
+        "PUT",
+        413,
+        `Value length of ${size} exceeds limit of ${__kvLimits().maxValueBytes}.`,
+      );
     }
   };
 
   const __kvCheckMetadata = (metadata) => {
     const bytes = __kvEncoder.encode(metadata).byteLength;
     if (bytes > __kvLimits().maxMetadataBytes) {
-      throw __kvError(
-        `metadata is at most ${__kvLimits().maxMetadataBytes} bytes, got ${bytes}`,
+      throw __kvFailure(
+        "PUT",
+        413,
+        `Metadata length of ${bytes} exceeds limit of ${__kvLimits().maxMetadataBytes}.`,
       );
     }
   };
 
+  // Upstream compares whole seconds: an `expiration` is accepted at
+  // exactly `now + 60` and refused at `now + 59` (and at any past time),
+  // and `expirationTtl` has the same 60-second floor. Both of those
+  // messages are the ones a real namespace answers with, so a Worker that
+  // matches the text sees the same failure locally and deployed.
   const __kvExpiryAt = (now, expiration, expirationTtl) => {
+    const minSeconds = Math.floor(__kvLimits().minExpirationTtlMs / 1000);
     if (expirationTtl !== undefined && expirationTtl !== null) {
       const ms = Math.floor(Number(expirationTtl) * 1000);
       if (!Number.isFinite(ms) || ms < __kvLimits().minExpirationTtlMs) {
-        throw __kvError(
-          `expirationTtl is at least ${__kvLimits().minExpirationTtlMs / 1000} seconds`,
+        throw __kvFailure(
+          "PUT",
+          400,
+          `Invalid expiration_ttl of ${expirationTtl}. Expiration TTL must be at ` +
+            `least ${minSeconds}.`,
         );
       }
       return now + ms;
     }
     if (expiration !== undefined && expiration !== null) {
-      const at = Math.floor(Number(expiration) * 1000);
-      if (!Number.isFinite(at) || at <= now) {
-        throw __kvError(`expiration ${expiration} is in the past`);
+      const atSeconds = Math.floor(Number(expiration));
+      const nowSeconds = Math.floor(now / 1000);
+      if (!Number.isFinite(atSeconds) || atSeconds <= nowSeconds) {
+        throw __kvFailure(
+          "PUT",
+          400,
+          `Invalid expiration of ${expiration}. Please specify integer greater ` +
+            "than the current number of seconds since the UNIX epoch.",
+        );
       }
-      return at;
+      if (atSeconds < nowSeconds + minSeconds) {
+        throw __kvFailure(
+          "PUT",
+          400,
+          `Invalid expiration of ${expiration}. Expiration times must be at ` +
+            `least ${minSeconds} seconds in the future.`,
+        );
+      }
+      return atSeconds * 1000;
     }
     return null;
   };
@@ -890,7 +935,7 @@ function kvService(host) {
       // beginning": that would hand a paginating caller its first page a second
       // time and call it progress.
       if (cursor.length % 2 !== 0 || /[^0-9a-f]/.test(cursor)) {
-        throw __kvError("the list cursor is malformed");
+        throw __kvFailure("GET", 400, "Invalid cursor.");
       }
       const bytes = new Uint8Array(cursor.length / 2);
       for (let at = 0; at < bytes.length; at += 1) {
@@ -906,7 +951,15 @@ function kvService(host) {
     const limit = Math.floor(Number(requested));
     // Zero would be a page that never ends.
     if (!Number.isFinite(limit) || limit <= 0) return max;
-    return Math.min(limit, max);
+    if (limit > max) {
+      throw __kvFailure(
+        "GET",
+        400,
+        `Invalid key_count_limit of ${requested}. Please specify an integer ` +
+          `less than ${max}.`,
+      );
+    }
+    return limit;
   };
 
   // Upstream's four content types, and what each one means on the way in and out.
@@ -935,8 +988,9 @@ function kvService(host) {
     if (bytes !== null) {
       return { value: new Uint8Array(bytes), tag: __KV_TAG_BYTES };
     }
-    throw __kvError(
-      "a KV value must be a string, an ArrayBuffer, a typed array, or a ReadableStream",
+    throw new TypeError(
+      "KV put() accepts only strings, ArrayBuffers, ArrayBufferViews, and " +
+        "ReadableStreams as values.",
     );
   };
 
@@ -1035,18 +1089,21 @@ function kvService(host) {
       return this._namespace().getByName(this._cellName);
     }
 
-    async _read(keys, options, withMetadata) {
+    async _read(keys, options, withMetadata, op) {
       const { type } = __kvReadOptions(options);
-      for (const key of keys) __kvCheckKey(key);
+      for (const key of keys) __kvCheckKey(key, op);
       const rows = await this._stub.__kvGet({
         keys,
         withMetadata,
         now: Date.now(),
       });
       return rows.map((row) => {
-        if (!row.found) return { key: row.key, value: null, metadata: null };
+        if (!row.found) {
+          return { key: row.key, found: false, value: null, metadata: null };
+        }
         return {
           key: row.key,
+          found: true,
           value: __kvDecodeValue(row.value, row.tag, type),
           metadata: row.metadata === null || row.metadata === undefined
             ? null
@@ -1061,21 +1118,28 @@ function kvService(host) {
     // with the prototype chain.
     async get(key, options) {
       if (Array.isArray(key)) {
-        const rows = await this._read(__kvBulkKeys(key), options, false);
+        const rows = await this._read(__kvBulkKeys(key), options, false, "GET_BULK");
         return new Map(rows.map((row) => [row.key, row.value]));
       }
-      const [row] = await this._read([String(key)], options, false);
+      const [row] = await this._read([String(key)], options, false, "GET");
       return row.value;
     }
 
     async getWithMetadata(key, options) {
       if (Array.isArray(key)) {
-        const rows = await this._read(__kvBulkKeys(key), options, true);
+        const rows = await this._read(__kvBulkKeys(key), options, true, "GET_BULK");
+        // Upstream answers a missing key with `null`, not an object whose
+        // value is null: a caller tells "absent" from "stored null" that
+        // way, and a Map entry of `{value: null, metadata: null}` would
+        // read as a present key.
         return new Map(
-          rows.map((row) => [row.key, { value: row.value, metadata: row.metadata }]),
+          rows.map((row) => [
+            row.key,
+            row.found ? { value: row.value, metadata: row.metadata } : null,
+          ]),
         );
       }
-      const [row] = await this._read([String(key)], options, true);
+      const [row] = await this._read([String(key)], options, true, "GET");
       return {
         value: row.value,
         metadata: row.metadata,
@@ -1088,7 +1152,7 @@ function kvService(host) {
 
     async put(key, value, options) {
       const name = String(key);
-      __kvCheckKey(name);
+      __kvCheckKey(name, "PUT");
       let encoded;
       if (typeof ReadableStream !== "undefined" && value instanceof ReadableStream) {
         encoded = { value: await __kvDrainStream(value), tag: __KV_TAG_BYTES };
@@ -1112,7 +1176,7 @@ function kvService(host) {
 
     async delete(key) {
       const name = String(key);
-      __kvCheckKey(name);
+      __kvCheckKey(name, "DELETE");
       await this._stub.__kvDelete({ keys: [name] });
     }
 
@@ -1120,7 +1184,7 @@ function kvService(host) {
     // bulk get takes.
     async deleteBulk(keys) {
       const names = Array.isArray(keys) ? __kvBulkKeys(keys) : [String(keys)];
-      for (const name of names) __kvCheckKey(name);
+      for (const name of names) __kvCheckKey(name, "DELETE");
       await this._stub.__kvDelete({ keys: names });
     }
 
@@ -1150,10 +1214,14 @@ function kvService(host) {
   // than inheriting it. An empty array is refused because upstream refuses it:
   // answering an empty Map would look like "none of these keys exist".
   const __kvBulkKeys = (keys) => {
-    if (keys.length === 0) throw __kvError("a bulk get needs at least one key");
+    if (keys.length === 0) {
+      throw __kvFailure("GET_BULK", 400, "You must request a minimum of 1 key");
+    }
     if (keys.length > __kvLimits().maxBulkKeys) {
-      throw __kvError(
-        `a bulk get takes at most ${__kvLimits().maxBulkKeys} keys, got ${keys.length}`,
+      throw __kvFailure(
+        "GET_BULK",
+        400,
+        `You can request a maximum of ${__kvLimits().maxBulkKeys} keys`,
       );
     }
     return keys.map(String);

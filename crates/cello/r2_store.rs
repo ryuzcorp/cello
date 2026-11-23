@@ -446,7 +446,15 @@ pub(crate) async fn read(
     store()?
         .get_blob(&blob_key(bucket_name, key), range, conditions)
         .await
-        .map_err(|error| error.to_string())
+        .map_err(
+            |error| match crate::bucket::is_range_not_satisfiable(&error) {
+                // R2's own answer for a range past the end of the object. The
+                // store's context string names the node's state path and says
+                // nothing a Worker can act on.
+                true => "get: The requested range is not satisfiable (10039)".to_string(),
+                false => error.to_string(),
+            },
+        )
 }
 
 /// Remove every named key. Shared with `cello r2 delete`.
