@@ -13,7 +13,7 @@ export class Hib {
     return new Response(null, { status: 101, webSocket: pair[0] });
   }
   async webSocketMessage(ws, message) {
-    ws.send(JSON.stringify({
+    const reply = JSON.stringify({
       binaryType: ws.binaryType,
       tag: Object.prototype.toString.call(message),
       isBlob: message instanceof Blob,
@@ -21,7 +21,10 @@ export class Hib {
       byteLength: message?.byteLength ?? null,
       text: typeof message === "string" ? message : null,
       bytes: message instanceof ArrayBuffer ? [...new Uint8Array(message)] : null,
-    }));
+    });
+    // The broadcast shape real code uses: every socket `getWebSockets()`
+    // hands out is accepted, so sending on it must not throw.
+    for (const peer of this.state.getWebSockets()) peer.send(reply);
   }
 }
 

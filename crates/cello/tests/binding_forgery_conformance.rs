@@ -945,6 +945,7 @@ fn binding_forgery_conformance() {
     let mut held = hold_upgrade(&node, "/ws-pass-upgrade");
     let spray = get_json(&node, "/ws-spray");
     assert_eq!(spray["ok"], true, "{spray}");
+    assert_eq!(spray["refused"], 512, "{spray}");
     match read_ws_frame(&mut held, Duration::from_secs(5)) {
         WsRead::Timeout => {}
         WsRead::Frame(opcode, payload) => {
@@ -972,6 +973,7 @@ fn binding_forgery_conformance() {
     let mut held = hold_upgrade(&node, "/ws-victim-proxy-upgrade");
     let spray = get_json(&node, "/ws-spray");
     assert_eq!(spray["ok"], true, "{spray}");
+    assert_eq!(spray["refused"], 512, "{spray}");
     match read_ws_frame(&mut held, Duration::from_secs(5)) {
         WsRead::Timeout => {}
         WsRead::Frame(opcode, payload) => {

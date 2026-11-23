@@ -1422,8 +1422,14 @@ export default {
           return { echo };
         }
         case 'ws-spray': {
-          for (let i = 1; i <= 512; i++) new WebSocket(i).send('pwned');
-          return { sprayed: 512 };
+          // A forged id is not an accepted socket, so send() now throws
+          // before the ownership check; either refusal is a refusal, and
+          // nothing may reach the victim.
+          let refused = 0;
+          for (let i = 1; i <= 512; i++) {
+            try { new WebSocket(i).send('pwned'); } catch { refused++; }
+          }
+          return { sprayed: 512, refused };
         }
         case 'ws-spray-close': {
           for (let i = 1; i <= 512; i++) new WebSocket(i).close(4000, 'sprayed');

@@ -109,6 +109,7 @@ Stubs kept in storage (`ctx.storage.put()` of a Durable Object stub) use a versi
 | Limits | A transaction and `blockConcurrencyWhile()` have a 30-second limit. A timeout resets the object and rolls back an open transaction. |
 | Failed handlers | Still wait for the durability of any exposed value or write. A Cello-generated failure that exposes no object value returns immediately. |
 | SQL cursors | Outside a transaction, a SQL write cursor must finish before a response, an outbound effect, or `storage.sync()`. An unfinished `RETURNING` cursor holds uncommitted writes, so Cello rejects that output. A read cursor can stay open. |
+| SQL cursor counters | `rowsRead`/`rowsWritten` count Cello's rows read by the cursor and rows changed by DML. Workerd counts libsql's b-tree rows, so a DDL statement reports 1 read and 2 writes there and 0/0 here. A cursor exposes no own enumerable fields. |
 
 The [Cloudflare compatibility](../reference/cloudflare-compat.md#services) page lists the runtime APIs and the unsupported services.
 
