@@ -2457,7 +2457,9 @@ pub(crate) async fn handle_websocket(mut request: Request<Incoming>, app: AppHan
     };
     let runtime = app.runtime.as_ref().expect("WebSocket runtime checked");
     let body_started = Instant::now();
-    let (url, method, body, headers) = match request_payload(
+    // The shared ingress parser, so a bodyless upgrade GET reaches the Worker
+    // with `body === null` exactly as an ordinary HTTP GET does (#142).
+    let (url, method, body, headers) = match ingress_payload(
         request,
         app.trust_forwarded_headers,
         app.max_request_body_bytes,
@@ -2470,7 +2472,7 @@ pub(crate) async fn handle_websocket(mut request: Request<Incoming>, app: AppHan
     let body_read_us = body_started.elapsed().as_micros() as u64;
     let worker_started = Instant::now();
     let mut worker_response = match runtime
-        .fetch_worker_pool(url, method, body.into(), headers, cancellation)
+        .fetch_worker_pool(url, method, body, headers, cancellation)
         .await
     {
         Ok(response) => response,

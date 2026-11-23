@@ -220,7 +220,7 @@ async function bootCello(dir) {
  * chunk; an empty array sends no body at all.
  */
 function exchange(addr, spec) {
-  const { method = "GET", path = "/", headers = {}, body = [] } = spec;
+  const { method = "GET", path = "/", headers = {}, body = [], noFraming = false } = spec;
   const chunks = typeof body === "string" ? [body] : body;
   return new Promise((resolve, reject) => {
     const socket = createConnection(hostPort(addr));
@@ -250,7 +250,10 @@ function exchange(addr, spec) {
         ...Object.entries(headers).map(([name, value]) => `${name}: ${value}`),
       ];
       if (chunks.length === 0) {
-        lines.push("Content-Length: 0");
+        // A request with no body at all carries no framing header. Sending
+        // `Content-Length: 0` instead frames an empty body, which workerd
+        // reports as a present body stream rather than `null` (#142).
+        if (!noFraming) lines.push("Content-Length: 0");
         socket.write(lines.join("\r\n") + "\r\n\r\n");
         return;
       }

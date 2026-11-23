@@ -42,12 +42,15 @@ const __arrConcat = (a, ...args) => __primReflectApply(__primArrConcat, a, args)
 const __startsWith = (s, prefix) =>
   __primReflectApply(__primStartsWith, s, [prefix]);
 function __bodyBytes(body) {
-  if (body == null) return new Uint8Array();
-  if (body && body.__celloBodyBytes instanceof Uint8Array)
+  if (body == null) return new __primUint8Array();
+  if (body && body.__celloBodyBytes instanceof __primUint8Array)
     return body.__celloBodyBytes.slice();
-  if (body instanceof ArrayBuffer) return new Uint8Array(body.slice(0));
-  if (ArrayBuffer.isView(body))
-    return new Uint8Array(body.buffer, body.byteOffset, body.byteLength).slice();
+  // A view or buffer takes its window from internal slots only (#130): its
+  // own `buffer`/`byteOffset`/`byteLength` are guest-writable, and a forged
+  // prototype passes an `instanceof` check. `__bodyChunk` reads through the
+  // captured getters and maps a forged receiver to the bytes TypeError.
+  if (typeof body === "object" && __bodyChunkKind(body) !== 0)
+    return __bodyChunk(body).slice();
   return new TextEncoder().encode(String(body));
 }
 // Bodies that carry their own Content-Type. A Blob's is its `type`, a
@@ -201,6 +204,11 @@ const __primTypedArrayByteLength =
 const __primDataViewBuffer = __primAccess(__primDataViewProto, "buffer");
 const __primDataViewByteOffset = __primAccess(__primDataViewProto, "byteOffset");
 const __primDataViewByteLength = __primAccess(__primDataViewProto, "byteLength");
+// ArrayBuffer's `byteLength` is brand-checked, so it both reads the length and
+// proves the receiver is a real buffer: `Object.create(ArrayBuffer.prototype)`
+// passes the prototype walk but has no internal slot.
+const __primArrayBufferByteLength =
+  __primAccess(__primArrayBufferProto, "byteLength");
 const __BODY_CHUNK_TYPED = 1;
 const __BODY_CHUNK_DATA_VIEW = 2;
 const __BODY_CHUNK_BUFFER = 3;
@@ -214,26 +222,57 @@ const __bodyChunkKind = (chunk) => {
   }
   return 0;
 };
-const __bodyChunk = (chunk) => {
-  switch (__bodyChunkKind(chunk)) {
-    case __BODY_CHUNK_TYPED:
-      return new __primUint8Array(
-        __primTypedArrayBuffer.call(chunk),
-        __primTypedArrayByteOffset.call(chunk),
-        __primTypedArrayByteLength.call(chunk),
-      );
-    case __BODY_CHUNK_DATA_VIEW:
-      return new __primUint8Array(
-        __primDataViewBuffer.call(chunk),
-        __primDataViewByteOffset.call(chunk),
-        __primDataViewByteLength.call(chunk),
-      );
-    case __BODY_CHUNK_BUFFER:
-      return new __primUint8Array(chunk);
-    default:
-      throw new TypeError(__BODY_NOT_BYTES);
+// A guest-supplied BufferSource as a Uint8Array over its real window, read
+// through the internal slots. Every host-facing API that takes bytes -- a Body
+// chunk, an R2 or Queue value, a socket frame, a file write -- goes through
+// this: an own `buffer`/`byteOffset`/`byteLength` is guest-writable and would
+// otherwise widen the value into neighbouring memory or throw inside the host
+// operation. A forged prototype (`Object.create(Uint8Array.prototype)` or
+// `Object.create(ArrayBuffer.prototype)`) passes the prototype walk but has no
+// internal slot; the brand-checked getter throws, and that maps to the API's
+// own TypeError. `message` is the caller's, because "did not return bytes" is
+// the Body-stream wording, not R2's or WebSocket's. Returns null for a value
+// that is not a buffer or view, so the caller keeps its own fallback.
+const __hostChunk = (value, message) => {
+  try {
+    switch (__bodyChunkKind(value)) {
+      case __BODY_CHUNK_TYPED:
+        return new __primUint8Array(
+          __primTypedArrayBuffer.call(value),
+          __primTypedArrayByteOffset.call(value),
+          __primTypedArrayByteLength.call(value),
+        );
+      case __BODY_CHUNK_DATA_VIEW:
+        return new __primUint8Array(
+          __primDataViewBuffer.call(value),
+          __primDataViewByteOffset.call(value),
+          __primDataViewByteLength.call(value),
+        );
+      case __BODY_CHUNK_BUFFER:
+        // Read the slot first: `new Uint8Array(forged)` would otherwise
+        // succeed with zero bytes.
+        __primArrayBufferByteLength.call(value);
+        return new __primUint8Array(value);
+      default:
+        return null;
+    }
+  } catch {
+    throw new TypeError(message);
   }
 };
+const __bodyChunk = (chunk) => {
+  const bytes = __hostChunk(chunk, __BODY_NOT_BYTES);
+  if (bytes === null) throw new TypeError(__BODY_NOT_BYTES);
+  return bytes;
+};
+// The host response pump's chunk reader. A string chunk is UTF-8, as workerd
+// writes it; every other chunk must be bytes, read through the internal slots.
+// `__bodyBytes` is not used here: its String() fallback would turn a number or
+// plain object chunk into text where workerd fails the body, and #130 fixed
+// the slot reads so a guest's own `byteLength` cannot widen or break the write.
+const __bodyPumpChunk = (chunk) => typeof chunk === "string"
+  ? new TextEncoder().encode(chunk)
+  : __bodyChunk(chunk);
 // Drain a Request/Response body stream, caching the result on the
 // instance so later consumers see the materialized bytes.
 async function __drainBody(target) {
@@ -536,6 +575,16 @@ globalThis.Request = class Request {
       else if ((typed = __typedBody(body)) !== null) { /* bytes and type */ }
       else stream = __iterableBody(body);
     }
+    // Workerd's copy steals the input's body, so a Request whose buffered
+    // body a consumer took, or whose stream a reader disturbed, cannot be
+    // handed to a second Request (#140). The check sits after `hasBody` so an
+    // explicit `init.body` still replaces the prior's, and before the adopt
+    // below, which itself disturbs the prior; `clone()` tees a live stream
+    // and copies an unused buffered body, so it never reaches here disturbed.
+    // A bodyless prior -- `body === null` -- has nothing to steal and copies
+    // normally.
+    if (!hasBody && prior && prior.bodyUsed)
+      throw new TypeError(__FETCH_USED);
     if (!hasBody && prior && prior._bodyBytes === null) {
       // Adopt the prior request's stream; per spec the prior body
       // is disturbed by the new request.
@@ -580,9 +629,10 @@ globalThis.Request = class Request {
     // own field here so every Request has one hidden class.
     this._bodyUsed = false;
     // Whether the request carries a body at all. Workerd's `body` is null
-    // when none was supplied (a bodyless POST, or a GET), while cello still
-    // hands out an empty stream for a bodyless POST; the fetch surfaces read
-    // this to consume only a real body (#127).
+    // when none was supplied: a bodyless POST and a GET both report null, a
+    // Content-Length: 0 request reports an empty body stream, and
+    // `new Request(request)` copies the distinction. The constructor, the
+    // revive path and the fetch surfaces all key off this one flag (#142).
     this._hasBody = stream !== null ||
       (hasBody ? body !== null : prior ? prior._hasBody : false);
     // The body stream and the signal stay eager, own properties: the RPC and
@@ -591,10 +641,9 @@ globalThis.Request = class Request {
     // body stream (or AbortSignal) is what triggers that. Making them lazy
     // getters let `__sc_encode` clone the Request into a broken plain object
     // and skip the lift -- the serializeHttpTypes conformance failure.
-    this.body = stream !== null
-      ? stream
-      : ["GET", "HEAD"].includes(this.method)
-        ? null : new CelloBodyStream(this);
+    this.body = this._hasBody
+      ? stream !== null ? stream : new CelloBodyStream(this)
+      : null;
     this.redirect = String(init.redirect === undefined
       ? (prior ? prior.redirect : "follow")
       : init.redirect);
@@ -688,22 +737,30 @@ globalThis.Request = class Request {
 // getter turns true as soon as the stream is disturbed -- a read or a cancel
 // through any reader, including a Worker's own half-read of a live request
 // body -- which is the flag a guard re-checks mid-stream and what workerd
-// reports. `_bodyUsed` is the explicit half for consumers that take the body
-// without reading the stream (a buffered body, a host-stream transfer);
-// only runtime code marks it, through `__markBodyUsed`. The accessor is
-// getter-only, as workerd's readonly property is: a Worker assigning
-// `bodyUsed` must not be able to un-use a body.
-const __markBodyUsed = (target) => { target._bodyUsed = true; };
+// reports. The explicit half -- for consumers that take the body without
+// reading the stream (a buffered body, a host-stream transfer) -- is host
+// state in a WeakMap, not the `_bodyUsed` own field: the field stays a plain
+// writable property for the hidden-class shape, and a guest that assigns
+// `resp._bodyUsed = false` (or an accessor that throws) cannot un-use a body
+// (#130). Only runtime code marks it, through `__markBodyUsed`. The accessor
+// is getter-only, as workerd's readonly property is.
+const __bodyUsedTargets = new __primWeakMap();
+const __bodyUsedFlag = (target) => __weakGet(__bodyUsedTargets, target) === true;
+const __markBodyUsed = (target) => {
+  target._bodyUsed = true;
+  __weakSet(__bodyUsedTargets, target, true);
+};
 __cello.__markBodyUsed = __markBodyUsed;
 // The isolated scripts after the harness (cache.js) run in their own scope,
 // so the byte-window helper is reachable only through `__cello`. cache.js
 // captures it when it installs, before any Worker code runs.
 __cello.__bodyChunk = __bodyChunk;
+__cello.__hostChunk = __hostChunk;
 const __defineBodyUsed = (ctor) => {
   Object.defineProperty(ctor.prototype, "bodyUsed", {
     configurable: true,
     get() {
-      return this._bodyUsed === true ||
+      return __bodyUsedFlag(this) ||
         (this.body != null && this.body._disturbed === true);
     },
   });
@@ -768,7 +825,11 @@ globalThis.console = {
 // names a host stream keeps that stream incremental. An ordinary JavaScript
 // stream has no host owner, so it uses the existing byte fallback.
 const __subrequestBody = async (req, absent = false) => {
-  if (absent) return { body: undefined, streamId: undefined };
+  // `body === null` is the Request's own statement that none was supplied
+  // (#142): a bodyless POST must cross as an absent body, not as the empty
+  // stream it used to carry, or the target sees a present zero-length body.
+  if (absent || req.body === null)
+    return { body: undefined, streamId: undefined };
   if (req._bodyBytes !== null)
     return { body: req._bodyBytes, streamId: undefined };
   const streamId = req.body?.__celloStreamId;
@@ -1025,11 +1086,8 @@ const __r2Key = (binding, method, key) => {
 };
 const __r2Hex = (value) => {
   if (typeof value === "string") return value.trim().toLowerCase();
-  const bytes = value instanceof ArrayBuffer
-    ? new Uint8Array(value)
-    : ArrayBuffer.isView(value)
-    ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
-    : null;
+  const bytes = __hostChunk(
+    value, "an R2 checksum is an ArrayBuffer or a typed array");
   if (!bytes) return null;
   let out = "";
   for (const byte of bytes) out += byte.toString(16).padStart(2, "0");
@@ -1265,11 +1323,9 @@ const __r2WriteOptions = (binding, method, options) => {
 const __r2Value = async (binding, value) => {
   if (value === undefined || value === null) return new Uint8Array(0);
   if (typeof value === "string") return new TextEncoder().encode(value);
-  if (value instanceof Uint8Array) return value;
-  if (ArrayBuffer.isView(value)) {
-    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
-  }
-  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  const bytes = __hostChunk(
+    value, "an R2 body is an ArrayBuffer or a typed array");
+  if (bytes !== null) return bytes;
   if (typeof Blob !== "undefined" && value instanceof Blob) {
     return new Uint8Array(await value.arrayBuffer());
   }
@@ -1291,13 +1347,12 @@ const __r2PutStream = async (bucketName, key, stream, options) => {
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
-      if (!value || value.length === 0) continue;
-      await __r2_put_chunk(
-        id,
-        value instanceof Uint8Array
-          ? value
-          : new Uint8Array(value.buffer, value.byteOffset, value.byteLength),
-      );
+      const bytes = __hostChunk(
+        value, "an R2 body stream must yield bytes");
+      if (bytes === null)
+        throw new TypeError("an R2 body stream must yield bytes");
+      if (bytes.byteLength === 0) continue;
+      await __r2_put_chunk(id, bytes);
     }
   } catch (error) {
     await __r2_put_end(id, true);
@@ -1642,15 +1697,9 @@ class SqlStorage {
     const byteBinds = [];
     for (let index = 0; index < binds.length; index++) {
       const value = binds[index];
-      let bytes;
-      if (value instanceof ArrayBuffer) {
-        bytes = new Uint8Array(value);
-      } else if (ArrayBuffer.isView(value)) {
-        bytes = new Uint8Array(
-          value.buffer, value.byteOffset, value.byteLength,
-        );
-      }
-      if (bytes === undefined) {
+      const bytes = __hostChunk(
+        value, "a SQL bind is an ArrayBuffer or a typed array");
+      if (bytes === null) {
         jsonBinds.push(value);
       } else {
         // Copy every buffer before JSON.stringify can call a later value's
@@ -2659,11 +2708,9 @@ class ContainerExecProcess {
   }
 }
 const __bytesOf = (chunk) => {
-  if (chunk instanceof Uint8Array) return chunk;
-  if (chunk instanceof ArrayBuffer) return new Uint8Array(chunk);
-  if (ArrayBuffer.isView(chunk))
-    return new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
-  throw new TypeError("stdin accepts bytes");
+  const bytes = __hostChunk(chunk, "stdin accepts bytes");
+  if (bytes === null) throw new TypeError("stdin accepts bytes");
+  return bytes;
 };
 // The Fetcher `getTcpPort()` returns: `fetch()` speaks HTTP to the port over
 // the node's route to the container, and `connect()` is the raw socket.
@@ -3709,9 +3756,8 @@ __cello.__makeLoader = () => {
   // first. JavaScript modules become plain strings, and wasm moves into a
   // side-band `[name, Uint8Array]` list so multi-MB blobs never take a
   // base64/JSON round-trip.
-  const toBytes = (v) => v instanceof ArrayBuffer ? new Uint8Array(v)
-    : ArrayBuffer.isView(v)
-      ? new Uint8Array(v.buffer, v.byteOffset, v.byteLength) : null;
+  const toBytes = (v) => __hostChunk(
+    v, "a module's wasm bytes must be an ArrayBuffer or a typed array");
   const moduleKinds = [
     "js", "cjs", "py", "text", "data", "json", "wasm",
   ];
@@ -4886,12 +4932,14 @@ const __exportUpload = (v) => {
           return;
         }
         const value = next.value;
-        if (!(value instanceof Uint8Array) && !ArrayBuffer.isView(value)) {
+        const kind = __bodyChunkKind(value);
+        if (kind !== __BODY_CHUNK_TYPED && kind !== __BODY_CHUNK_DATA_VIEW) {
           __upload_fail(id);
           return;
         }
-        const bytes = new Uint8Array(
-          value.buffer, value.byteOffset, value.byteLength);
+        // Throws on a forged view; the catch below fails the upload rather
+        // than pushing a window the guest only claimed.
+        const bytes = __hostChunk(value, "an upload body must yield bytes");
         for (let offset = 0; offset < bytes.byteLength; offset += 64 * 1024) {
           await __upload_push(id, bytes.subarray(offset, offset + 64 * 1024));
         }
@@ -5501,6 +5549,11 @@ const __reviveBlob = (marker, bytes) => {
 const __adoptBody = (target, bytes) => {
   target._bodyBytes = bytes;
   target._body = undefined; // decoded lazily on the first text()/json()
+  // A revived Request is built with no `init.body`, so its constructor left
+  // `body === null`; presence arrives separately in the marker. Install the
+  // coupled stream here when the marker says the body exists (#142).
+  if (target.body === null && target._hasBody === true)
+    target.body = new CelloBodyStream(target);
   const body = target.body;
   if (body !== null) {
     body._st.bytes = bytes;
@@ -5511,20 +5564,22 @@ const __adoptBody = (target, bytes) => {
 // A non-bytes `b` is a live-stream body marker: revive it and
 // let the constructor adopt it as a streaming body.
 const __reviveRequest = (marker, url, revive) => {
-  if (!(marker.b instanceof Uint8Array))
+  if (!(marker.b instanceof __primUint8Array))
     return new Request(url, { method: marker.m,
       headers: marker.h, redirect: marker.r, cf: marker.c,
       body: revive(marker.b) });
   const req = new Request(url, { method: marker.m,
     headers: marker.h, redirect: marker.r, cf: marker.c });
-  __adoptBody(req, marker.b);
-  // The marker carries body presence: a bodyless GET or POST revives
-  // without one, so a fetch on it consumes nothing (#127).
+  // The marker carries body presence: an unframed bodyless GET or POST
+  // revives with `body === null`, and a Content-Length: 0 request revives
+  // with an empty stream. A fetch on the former consumes nothing (#127,
+  // #142).
   req._hasBody = marker.hb === true;
+  if (req._hasBody) __adoptBody(req, marker.b);
   return req;
 };
 const __reviveResponse = (marker, revive) => {
-  const bytes = marker.b instanceof Uint8Array;
+  const bytes = marker.b instanceof __primUint8Array;
   const res = new Response(
     marker.b === null ? null : bytes ? "" : revive(marker.b), {
       status: marker["__cello$res"], statusText: marker.t,
@@ -6760,11 +6815,15 @@ class DurableObjectNamespace {
           req._bodyBytes === null && req.body && req.body.__celloStreamId !== undefined
             ? req.body.__celloStreamId
             : undefined;
-        const body_ = bodyStreamId !== undefined
-          ? new Uint8Array()
-          : req._bodyBytes === null
-            ? await req._consume()
-            : req._bodyBytes;
+        // A null body forwards as absent, not as an empty typed array: the
+        // cell's revived request must also report `body === null` (#142).
+        const body_ = req.body === null
+          ? undefined
+          : bodyStreamId !== undefined
+            ? new Uint8Array()
+            : req._bodyBytes === null
+              ? await req._consume()
+              : req._bodyBytes;
         if (bodyStreamId !== undefined) {
           // The cell reads this upload through the same host stream id, so the
           // Worker's wrapper must not also read it: lock it (a late read throws
@@ -7712,13 +7771,10 @@ __cello.__dispatchEntrypointRpc =
 const __wsStub = __cello.__wsStub = (wsId) => ({
   _hibernatable: true,
   send: (data) => {
-    if (data instanceof ArrayBuffer)
-      __ws_send_binary(wsId, new Uint8Array(data));
-    else if (ArrayBuffer.isView(data))
-      __ws_send_binary(wsId,
-        new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
-    else
-      __ws_send(wsId, String(data));
+    const bytes = __hostChunk(
+      data, "WebSocket.send accepts a string, ArrayBuffer, or view");
+    if (bytes !== null) __ws_send_binary(wsId, bytes);
+    else __ws_send(wsId, String(data));
   },
   close: (code = 1000, reason = "") => __ws_close(wsId, code, reason),
 });
@@ -8077,15 +8133,13 @@ const __queueDelay = (value, fallback = 0) => {
 };
 
 const __queueBytes = (value) => {
-  if (value instanceof ArrayBuffer) {
-    return new Uint8Array(value.slice(0));
-  }
-  if (ArrayBuffer.isView(value)) {
-    return new Uint8Array(
-      value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength),
-    );
-  }
-  throw __queueError("a bytes message must be an ArrayBuffer or a typed array");
+  const view = __hostChunk(
+    value, "a bytes message must be an ArrayBuffer or a typed array");
+  if (view === null)
+    throw __queueError("a bytes message must be an ArrayBuffer or a typed array");
+  // Copy: a caller must not be able to resize or reuse the backing buffer
+  // while the durable write awaits.
+  return new Uint8Array(view);
 };
 
 // Encode before entering the cell. The copy makes `sendBatch()` immune to a
@@ -8142,13 +8196,11 @@ const __queueEncode = (body, requestedType) => {
 const __QUEUE_CONTENT_TYPES = new Set(["text", "bytes", "json", "v8"]);
 
 const __queueEntryBody = (body) => {
-  if (body instanceof ArrayBuffer) return new Uint8Array(body.slice(0));
-  if (ArrayBuffer.isView(body)) {
-    return new Uint8Array(
-      body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength),
-    );
-  }
-  throw __queueError("a message body must be an ArrayBuffer or a typed array");
+  const view = __hostChunk(
+    body, "a message body must be an ArrayBuffer or a typed array");
+  if (view === null)
+    throw __queueError("a message body must be an ArrayBuffer or a typed array");
+  return new Uint8Array(view);
 };
 
 const __queueCheckContentType = (contentType) => {
@@ -12255,10 +12307,10 @@ if (!globalThis.Blob) {
         else sources.push(new TextEncoder().encode(String(part)));
       }
       const chunks = sources.map((source) =>
-        source instanceof Uint8Array ? source
-          : source instanceof ArrayBuffer ? new Uint8Array(source)
-            : new Uint8Array(
-              source.buffer, source.byteOffset, source.byteLength));
+        source instanceof __primUint8Array
+          ? source
+          : __hostChunk(source, "Blob parts must be bytes") ??
+            new TextEncoder().encode(String(source)));
       let total = 0;
       for (const chunk of chunks) total += chunk.byteLength;
       const LIMIT = 134217728;
@@ -12846,13 +12898,14 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
   send(data) {
     if (this.readyState !== WebSocket.READY_STATE_OPEN)
       throw new DOMException("WebSocket is not open", "InvalidStateError");
-    const binary = data instanceof ArrayBuffer || ArrayBuffer.isView(data);
+    // Bytes come from the internal slots (#130); anything else is text.
+    const bytes = __hostChunk(
+      data, "WebSocket.send accepts a string, ArrayBuffer, or view");
+    const binary = bytes !== null;
     const text = binary ? null : String(data);
     if (this._loopback) {
       const peer = this._loopback;
-      const message = binary
-        ? (data instanceof ArrayBuffer ? data.slice(0) : data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength))
-        : text;
+      const message = binary ? bytes.slice() : text;
       queueMicrotask(() => peer._dispatchMessage(message));
       return;
     }
@@ -12860,17 +12913,11 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
     // accepted but not yet bound to a host transport. An outbound socket is
     // already bound -- queueing here would silently swallow its frames.
     if (!this._outbound && this._accepted && !this._target) {
-      this._pending.push([binary ? "send-binary" : "send", binary ? data : text]);
+      this._pending.push([binary ? "send-binary" : "send", binary ? bytes : text]);
       return;
     }
-    if (binary) {
-      const bytes = data instanceof ArrayBuffer
-        ? new Uint8Array(data)
-        : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-      __ws_send_binary(this._id, bytes);
-    } else {
-      __ws_send(this._id, text);
-    }
+    if (binary) __ws_send_binary(this._id, bytes);
+    else __ws_send(this._id, text);
   }
   close(code = 1000, reason = "") {
     // workerd parity, not the WHATWG-only 1000/3000-4999 rule: an endpoint
@@ -12930,11 +12977,9 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
     for (const frame of pending) {
       if (frame[0] === "send") __ws_send(this._id, frame[1]);
       else if (frame[0] === "send-binary") {
-        const data = frame[1];
-        const bytes = data instanceof ArrayBuffer
-          ? new Uint8Array(data)
-          : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-        __ws_send_binary(this._id, bytes);
+        // `_pending` holds an internal view: WebSocket.send read the guest's
+        // bytes from the internal slots when it queued the frame (#130).
+        __ws_send_binary(this._id, frame[1]);
       }
       else __ws_close(this._id, frame[1], frame[2]);
     }
@@ -13453,10 +13498,9 @@ const __fsReadFileSync = (value, options) => {
 // else is an argument error, thrown synchronously by every form.
 const __fsWriteData = (data, encoding) => {
   if (typeof data === "string") return Buffer.from(data, encoding);
-  if (data instanceof ArrayBuffer) return new Uint8Array(data);
-  if (ArrayBuffer.isView(data)) {
-    return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-  }
+  const bytes = __hostChunk(
+    data, "The \"data\" argument must be a string or bytes");
+  if (bytes !== null) return bytes;
   const error = new TypeError(
     "The \"data\" argument must be of type string or an instance of " +
     "Buffer, TypedArray, or DataView",
@@ -13980,7 +14024,7 @@ const __bridgeResponseStream = (body, requestControllers, onSettle) => {
             await __response_stream_close(streamId, "");
             return;
           }
-          const bytes = __bodyBytes(result.read.value);
+          const bytes = __bodyPumpChunk(result.read.value);
           for (let offset = 0; offset < bytes.byteLength; offset += 64 * 1024) {
             await __response_stream_write(
               streamId,

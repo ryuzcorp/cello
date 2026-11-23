@@ -48,6 +48,12 @@ pub(crate) const NAME_HEADER: &str = "x-cells-do-name";
 pub(crate) const REQUEST_ID_HEADER: &str = "x-cells-request-id";
 pub(crate) const HANDOFF_HEADER: &str = "x-cells-capacity-handoff";
 pub(crate) const OPERATOR_HEADER: &str = "x-cells-operator";
+/// Whether the tunneled request carries a body at all. Hyper adds
+/// `Content-Length: 0` for an empty body, which would turn an absent body
+/// into a present empty one at node B; this explicit flag keeps the
+/// distinction workerd reports (#142). An older peer sends no flag, and B
+/// treats the body as present, which is what it did before.
+pub(crate) const BODY_HEADER: &str = "x-cells-rpc-body";
 /// A peer that sends this header on establishment forwards only host-set
 /// markers: it strips the marker headers from application input (fetch) or
 /// never takes them from it (RPC). Older peers on the same tunnel version
@@ -61,13 +67,14 @@ pub(crate) const MARKERS_HEADER: &str = "x-cells-tunnel-markers";
 /// is dropped rather than obeyed. Nothing on the fetch path reads the
 /// trusted marker, but the name is reserved anyway, so a future reader
 /// cannot be smuggled one.
-const CONTROL_HEADERS: [&str; 6] = [
+const CONTROL_HEADERS: [&str; 7] = [
     SCOPE_HEADER,
     NAME_HEADER,
     REQUEST_ID_HEADER,
     HANDOFF_HEADER,
     OPERATOR_HEADER,
     TRUSTED_HEADER,
+    BODY_HEADER,
 ];
 
 enum TunnelKind {
@@ -266,26 +273,37 @@ async fn serve_do(upgraded: hyper::upgrade::Upgraded, app: AppHandle, marker_awa
                         .map(|value| (name.as_str().to_string(), value.to_string()))
                 })
                 .collect();
+            // An absent body crosses as absence, not as the empty stream its
+            // `Content-Length: 0` framing would suggest (#142). An older peer
+            // sends no flag, and its body was present, as before.
+            let has_body = parts
+                .headers
+                .get(BODY_HEADER)
+                .is_none_or(|value| value.as_bytes() != b"0");
             // Streaming by construction: the inner body is handed to the
             // isolate as a stream whatever its size, bounded the way the
             // enveloped path bounded its frame.
-            let limited = http_body_util::Limited::new(body, MAX_PEER_FORWARD_BODY_BYTES);
-            let chunks: HttpChunkStream = Box::pin(
-                http_body_util::BodyStream::new(limited)
-                    .try_filter_map(|frame| async move { Ok(frame.into_data().ok()) })
-                    .map_ok(|data: Bytes| data.to_vec())
-                    .map_err(|error| error.to_string()),
-            );
-            let stream_id = match cello::js::register_body_stream(chunks) {
-                Ok(stream_id) => stream_id,
-                Err(error) => {
-                    return Ok(peer_response(response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        format!("request body stream: {error}"),
-                    )));
-                }
+            let body = if has_body {
+                let limited = http_body_util::Limited::new(body, MAX_PEER_FORWARD_BODY_BYTES);
+                let chunks: HttpChunkStream = Box::pin(
+                    http_body_util::BodyStream::new(limited)
+                        .try_filter_map(|frame| async move { Ok(frame.into_data().ok()) })
+                        .map_ok(|data: Bytes| data.to_vec())
+                        .map_err(|error| error.to_string()),
+                );
+                let stream_id = match cello::js::register_body_stream(chunks) {
+                    Ok(stream_id) => stream_id,
+                    Err(error) => {
+                        return Ok(peer_response(response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            format!("request body stream: {error}"),
+                        )));
+                    }
+                };
+                cello::js::RequestBody::Stream(stream_id)
+            } else {
+                cello::js::RequestBody::Absent
             };
-            let body = cello::js::RequestBody::Stream(stream_id);
             let fetch = ForwardedFetch {
                 name: control.name,
                 url: parts.uri.to_string(),
@@ -456,8 +474,12 @@ fn inner_request(
     method: &str,
     headers: &[(String, String)],
     body: TunnelBody,
+    has_body: bool,
 ) -> anyhow::Result<Request<TunnelBody>> {
     let mut inner = Request::builder().method(method).uri(url);
+    // Explicit presence: hyper frames the empty body we send for an absent
+    // one with `Content-Length: 0`, which B must not mistake for a body.
+    inner = inner.header(BODY_HEADER, if has_body { "1" } else { "0" });
     for (name, value) in headers {
         if CONTROL_HEADERS
             .iter()
@@ -496,10 +518,15 @@ async fn send_inner(
 ) -> anyhow::Result<Response<PooledResponseBody>> {
     let key = format!("{}#{kind}", peer.addr);
     let replay = match &body {
+        cello::js::RequestBody::Absent => Some(bytes::Bytes::new()),
         cello::js::RequestBody::Bytes(bytes) => Some(bytes.clone()),
         cello::js::RequestBody::Stream(_) => None,
     };
     let body = match body {
+        // The flag above tells B this is absence, not an empty body; hyper
+        // still frames the empty tunnel body, so the wire needs no special
+        // body kind.
+        cello::js::RequestBody::Absent => full_body(bytes::Bytes::new()),
         cello::js::RequestBody::Bytes(bytes) => full_body(bytes),
         cello::js::RequestBody::Stream(stream_id) => {
             let payload = cello::js::take_body_stream(stream_id)
@@ -588,10 +615,11 @@ pub(crate) async fn fetch(
     headers: Vec<(String, String)>,
     body: cello::js::RequestBody,
 ) -> anyhow::Result<Response<PooledResponseBody>> {
+    let has_body = !matches!(body, cello::js::RequestBody::Absent);
     send_inner(
         peer,
         "do",
-        |body| inner_request(control, &url, &method, &headers, body),
+        |body| inner_request(control, &url, &method, &headers, body, has_body),
         body,
     )
     .await
@@ -881,6 +909,7 @@ mod operator_tests {
             "POST",
             &[],
             full_body(Bytes::new()),
+            true,
         )
         .expect("inner request");
         assert_eq!(
@@ -901,6 +930,7 @@ mod operator_tests {
             "POST",
             &smuggled,
             full_body(Bytes::new()),
+            true,
         )
         .expect("inner request");
         assert!(!plain.headers().contains_key(OPERATOR_HEADER));
@@ -936,6 +966,65 @@ mod operator_tests {
     }
 
     #[test]
+    fn body_presence_is_a_control_header() {
+        // The flag is node A's to set: hyper frames the empty body it sends
+        // for an absent one with `Content-Length: 0`, so without the flag B
+        // would revive a present empty body (#142).
+        let present = inner_request(
+            &control(false),
+            "http://cell/",
+            "POST",
+            &[],
+            full_body(Bytes::new()),
+            true,
+        )
+        .expect("inner request");
+        assert_eq!(
+            present
+                .headers()
+                .get(BODY_HEADER)
+                .map(|value| value.as_bytes()),
+            Some(b"1".as_slice()),
+        );
+        let absent = inner_request(
+            &control(false),
+            "http://cell/",
+            "POST",
+            &[],
+            full_body(Bytes::new()),
+            false,
+        )
+        .expect("inner request");
+        assert_eq!(
+            absent
+                .headers()
+                .get(BODY_HEADER)
+                .map(|value| value.as_bytes()),
+            Some(b"0".as_slice()),
+        );
+        // An application header with the reserved name is dropped, and the
+        // control value stands.
+        let smuggled = vec![(BODY_HEADER.to_string(), "1".to_string())];
+        let plain = inner_request(
+            &control(false),
+            "http://cell/",
+            "POST",
+            &smuggled,
+            full_body(Bytes::new()),
+            false,
+        )
+        .expect("inner request");
+        assert_eq!(
+            plain
+                .headers()
+                .get(BODY_HEADER)
+                .map(|value| value.as_bytes()),
+            Some(b"0".as_slice()),
+        );
+        assert!(CONTROL_HEADERS.contains(&BODY_HEADER));
+    }
+
+    #[test]
     fn trusted_marker_is_a_control_header_on_the_fetch_tunnel() {
         // Nothing on the fetch path reads the trusted marker today, but the
         // name is reserved anyway: a smuggled application header with it is
@@ -948,6 +1037,7 @@ mod operator_tests {
             "POST",
             &smuggled,
             full_body(Bytes::new()),
+            true,
         )
         .expect("inner request");
         assert!(!plain.headers().contains_key(TRUSTED_HEADER));

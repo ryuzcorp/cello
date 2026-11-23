@@ -6388,8 +6388,11 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
                     let f = internal_function(tc, "__dispatchTo")?;
                     // A held body crosses as its bytes; a streamed body crosses as
                     // its host stream id, so the handler reads it in parts instead
-                    // of the routing seam collecting it first.
+                    // of the routing seam collecting it first. An absent body
+                    // crosses as null, so the revived request reports
+                    // `body === null` (#142).
                     let (body_value, stream_id) = match body {
+                        RequestBody::Absent => (v8::null(tc).into(), v8::null(tc).into()),
                         RequestBody::Bytes(bytes) => {
                             // Refused bytes fail the event before the handler
                             // is handed a request with no body in it.
@@ -8518,6 +8521,10 @@ fn op_svc_call_impl(
         });
     let body = if stream_arg.is_number() {
         RequestBody::Stream(stream_arg.number_value(scope).unwrap_or(0.0) as u64)
+    } else if args.get(3).is_null_or_undefined() {
+        // `request.body === null` crossed as no argument (#142); the target
+        // must revive a bodyless request, not an empty one.
+        RequestBody::Absent
     } else {
         let Some(bytes) = view_bytes(args.get(3)) else {
             return loader_throw(
@@ -9134,6 +9141,9 @@ fn op_loader_fetch(
     let stream_arg = args.get(5);
     let body = if stream_arg.is_number() {
         RequestBody::Stream(stream_arg.number_value(scope).unwrap_or(0.0) as u64)
+    } else if args.get(3).is_null_or_undefined() {
+        // An absent request body crosses as undefined (#142).
+        RequestBody::Absent
     } else {
         let Some(bytes) = view_bytes(args.get(3)) else {
             return loader_throw(
@@ -9884,6 +9894,9 @@ fn op_facet_fetch(
     let stream_arg = args.get(11);
     let body = if stream_arg.is_number() {
         RequestBody::Stream(stream_arg.number_value(scope).unwrap_or(0.0) as u64)
+    } else if args.get(9).is_null_or_undefined() {
+        // An absent request body crosses as undefined (#142).
+        RequestBody::Absent
     } else {
         let Some(bytes) = view_bytes(args.get(9)) else {
             return loader_throw(scope, "facet: the request body is not a typed array");
@@ -10152,6 +10165,10 @@ fn op_do_call_impl(
     let stream_arg = args.get(6);
     let body = if stream_arg.is_number() {
         RequestBody::Stream(stream_arg.number_value(scope).unwrap_or(0.0) as u64)
+    } else if args.get(4).is_null_or_undefined() {
+        // A bodyless Request forwarded to a cell crosses as no argument, so
+        // the cell's request reports `body === null` (#142).
+        RequestBody::Absent
     } else {
         let Some(bytes) = view_bytes(args.get(4)) else {
             return loader_throw(
@@ -11209,7 +11226,9 @@ fn op_fetch(
             entrypoint: broker.entrypoint,
             url,
             method,
-            body: body.unwrap_or_else(|| RequestBody::Bytes(Vec::new().into())),
+            // An absent body stays absent across the binding: the target
+            // Worker revives `request.body === null` (#142).
+            body: body.unwrap_or(RequestBody::Absent),
             body_guard,
             headers,
             reply: tx,
@@ -11400,6 +11419,7 @@ fn op_fetch(
         }
         if let Some(body) = body {
             rb = match body {
+                RequestBody::Absent => rb,
                 RequestBody::Bytes(bytes) => rb.body(bytes),
                 RequestBody::Stream(stream_id) => match body_guard.take_stream(stream_id) {
                     Ok(stream) => rb.body(reqwest::Body::wrap_stream(stream)),
@@ -15404,15 +15424,14 @@ fn make_incoming_request<'s>(
         &serde_json::to_string(headers).unwrap_or_else(|_| "[]".into()),
     )
     .unwrap();
-    // A streamed body passes its id, and the harness builds the body
-    // stream around that id. A held body passes the bytes.
-    let stream_id = body.stream_id();
-    let (body, stream_id) = match stream_id {
-        None => (
-            bytes_value(tc, body.into_held_bytes().unwrap())?,
-            v8::undefined(tc).into(),
-        ),
-        Some(id) => (
+    // A streamed body passes its id, and the harness builds the body stream
+    // around that id. A held body passes the bytes. An absent body passes
+    // null, which keeps `request.body === null` (#142); an empty body stays a
+    // real zero-length typed array.
+    let (body, stream_id): (v8::Local<v8::Value>, v8::Local<v8::Value>) = match body {
+        RequestBody::Absent => (v8::null(tc).into(), v8::undefined(tc).into()),
+        RequestBody::Bytes(bytes) => (bytes_value(tc, bytes.into())?, v8::undefined(tc).into()),
+        RequestBody::Stream(id) => (
             v8::undefined(tc).into(),
             v8::Number::new(tc, id as f64).into(),
         ),
@@ -15459,8 +15478,14 @@ fn make_request<'s>(
     let f = internal_function(tc, "__makeRequest")?;
     let u = v8::String::new(tc, url).unwrap();
     let m = v8::String::new(tc, method).unwrap();
-    let bytes = body.into_held_bytes().unwrap_or_default();
-    let b = bytes_value(tc, bytes)?;
+    // `__makeRequest` has no stream slot, so a streamed body reaches it as an
+    // empty body (unchanged). An absent body is null: the harness then leaves
+    // `request.body === null` (#142).
+    let b: v8::Local<v8::Value> = match body {
+        RequestBody::Absent => v8::null(tc).into(),
+        RequestBody::Bytes(bytes) => bytes_value(tc, bytes.into())?,
+        RequestBody::Stream(_) => bytes_value(tc, Vec::new())?,
+    };
     let h = v8::String::new(tc, &serde_json::to_string(headers)?).unwrap();
     let recv = v8::undefined(tc).into();
     f.call(tc, recv, &[u.into(), m.into(), b, h.into()])

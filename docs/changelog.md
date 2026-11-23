@@ -8,7 +8,8 @@ Two more `WritableStream` divergences from workerd are fixed, and the
 tee-skew conformance test no longer assumes which of a tee's copies the skew
 budget ends. A third change is breaking: a Worker can no longer generate code
 at run time (#194), described below. The differential gate gained six cases
-(48 in total). No configuration, data, or bucket-format changes. The `eval`,
+from those fixes and nine Request/body cases from the changes below, 57 in
+total. No configuration, data, or bucket-format changes. The `eval`,
 `Function` and wasm runtime-compilation changes are listed after the stream
 fixes because they break bundles that relied on them.
 
@@ -76,6 +77,37 @@ evaluated strings on Cello must ship the code it generated. A `.wasm` import
 still gives a compiled `WebAssembly.Module`, and
 `WebAssembly.instantiate()` of an already-compiled module still works;
 `WebAssembly.validate()` is unchanged.
+
+Three Request/body divergences from workerd, all found by the differential
+harness:
+
+- **`new Request(usedRequest)` throws** (#140). The `Request` constructor
+  rebuilt a used body -- a buffered body a consumer had taken, or a stream a
+  reader had disturbed -- into a fresh, usable Request, so a Worker that
+  accidentally rebuilt an already-read request silently re-sent the payload.
+  It now throws workerd's `TypeError: Cannot reconstruct a Request with a
+  used body.`; `clone()` still copies an unused body and tees a live stream.
+  The gate gained the `request-copy-used` case.
+- **A bodyless `Request` has `body === null`** (#142). A POST built without a
+  body used to get an empty body stream: `request.body` was readable where
+  workerd's is `null`, and `text()` marked it used so a second read threw.
+  Construction, `clone()`, the cross-isolate revive marker and both ingress
+  paths now keep "no body supplied" distinct from an empty body. The ingress
+  rule is the HTTP framing rule, for every method: an unframed request is
+  `null`, while `Content-Length: 0` frames a present empty body whose single
+  read marks it used, as workerd reports (#174). A bodyless Request forwarded
+  to a cell or a service binding crosses as an absent body, not an empty one.
+  The gate gained `request-bodyless-post`, `incoming-bodyless`,
+  `incoming-empty`, `incoming-get-framed` and `incoming-get-bodyless`.
+- **Body bytes come from internal slots on the response pump** (#130). The
+  pump read `buffer`/`byteOffset`/`byteLength` off a guest-supplied view, so
+  a chunk with its own `byteLength` sent eight bytes where workerd sends
+  three, and a tight backing buffer made the reply empty. It now reads the
+  captured `%TypedArray.prototype`/`DataView` getters and maps a forged
+  prototype to workerd's `TypeError: This ReadableStream did not return
+  bytes.` The same slot reads back the constructors' body path. The gate
+  gained `chunk-shadow-response`, `chunk-shadow-response-tight` and
+  `chunk-shadow-response-dataview`.
 
 ## v0.2.8
 

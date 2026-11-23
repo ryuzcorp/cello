@@ -775,6 +775,134 @@ const routes = {
     return report({ typed, dataView, small, wide });
   },
 
+  async "/chunk-shadow-response"() {
+    // #130: the host response pump must read a chunk's window from its
+    // internal slots too. Workerd writes the view's real three bytes; a pump
+    // that reads the guest's own `byteLength` writes eight.
+    const backing = new ArrayBuffer(8192);
+    const view = new Uint8Array(backing, 0, 3);
+    view.set(encoder.encode("abc"));
+    Object.defineProperty(view, "byteLength", { value: 8 });
+    return new Response(new ReadableStream({
+      start: (c) => (c.enqueue(view), c.close()),
+    }));
+  },
+
+  async "/chunk-shadow-response-tight"() {
+    // The same forgery with a backing buffer no larger than the real window:
+    // reading the own properties throws inside the pump, and the client sees
+    // an empty reply instead of workerd's "abc".
+    const view = new Uint8Array(encoder.encode("abc"));
+    Object.defineProperty(view, "buffer", { value: new ArrayBuffer(2) });
+    Object.defineProperty(view, "byteOffset", { value: 1 });
+    Object.defineProperty(view, "byteLength", { value: 8 });
+    return new Response(new ReadableStream({
+      start: (c) => (c.enqueue(view), c.close()),
+    }));
+  },
+
+  async "/chunk-shadow-response-dataview"() {
+    // A DataView takes the DataView getters; the same shadowing must not
+    // change the window.
+    const data = new DataView(encoder.encode("xyz").buffer);
+    Object.defineProperty(data, "buffer", { value: new ArrayBuffer(1) });
+    Object.defineProperty(data, "byteOffset", { value: 1 });
+    Object.defineProperty(data, "byteLength", { value: 4096 });
+    return new Response(new ReadableStream({
+      start: (c) => (c.enqueue(data), c.close()),
+    }));
+  },
+
+  async "/request-copy-used"() {
+    // #140: `new Request(usedRequest)` refuses, exactly as `fetch(used)` does;
+    // `clone()` of an unused body still works in both shapes.
+    const settle = (fn) => Promise.resolve().then(fn).then((value) => value, errorInfo);
+    const buffered = new Request("https://diff.test/z", { method: "POST", body: "abc" });
+    await buffered.text();
+    const bufferedCopy = await settle(() => new Request(buffered));
+
+    const streamOf = (chunk) => new ReadableStream({
+      start: (c) => (c.enqueue(chunk), c.close()),
+    });
+    const disturbed = new Request("https://diff.test/s", {
+      method: "POST", body: streamOf(encoder.encode("a")),
+    });
+    const reader = disturbed.body.getReader();
+    await reader.read();
+    reader.releaseLock();
+    const disturbedCopy = await settle(() => new Request(disturbed));
+
+    const cloneSource = new Request("https://diff.test/c", { method: "POST", body: "clone" });
+    const bufferedClone = cloneSource.clone();
+    const bufferedCloneText = await bufferedClone.text();
+    const bufferedSourceText = await cloneSource.text();
+
+    const streamedSource = new Request("https://diff.test/t", {
+      method: "POST", body: streamOf(encoder.encode("tee")),
+    });
+    const streamedClone = streamedSource.clone();
+    const streamedBoth = await Promise.all([
+      streamedSource.text(), streamedClone.text(),
+    ]);
+    return report({
+      bufferedCopy, disturbedCopy,
+      bufferedCloneText, bufferedSourceText, streamedBoth,
+    });
+  },
+
+  async "/request-bodyless-post"() {
+    // #142: no body supplied is `body === null`, not an empty stream, and
+    // reading it leaves `bodyUsed` false. `new Request(request)` copies that.
+    const request = new Request("https://diff.test/", { method: "POST" });
+    const bodyIsNull = request.body === null;
+    const usedBefore = request.bodyUsed;
+    const value = await request.text();
+    const usedAfter = request.bodyUsed;
+    const copy = new Request(request);
+    const explicitNull = new Request("https://diff.test/null", {
+      method: "POST", body: null,
+    });
+    const empty = new Request("https://diff.test/empty", {
+      method: "POST", body: new Uint8Array(0),
+    });
+    const emptyText = await empty.text();
+    const get = new Request("https://diff.test/get");
+    return report({
+      bodyIsNull, usedBefore, value, usedAfter,
+      copyBodyIsNull: copy.body === null,
+      explicitNullBodyIsNull: explicitNull.body === null,
+      emptyBodyIsNull: empty.body === null,
+      emptyText, emptyUsedAfter: empty.bodyUsed,
+      getBodyIsNull: get.body === null,
+      getCopyBodyIsNull: new Request(get).body === null,
+    });
+  },
+
+  async "/incoming-bodyless"(request) {
+    // #142: the ingress request with no body framing. A POST without
+    // Content-Length/Transfer-Encoding reports `body === null`, and text()
+    // does not mark it used.
+    const bodyIsNull = request.body === null;
+    const usedBefore = request.bodyUsed;
+    const value = await request.text();
+    return report({
+      method: request.method, bodyIsNull, usedBefore, value,
+      usedAfter: request.bodyUsed,
+    });
+  },
+
+  async "/incoming-empty"(request) {
+    // #142: `Content-Length: 0` frames a body, so workerd reports an empty
+    // stream that text() consumes; only an unframed request is null.
+    const bodyIsNull = request.body === null;
+    const usedBefore = request.bodyUsed;
+    const value = await request.text();
+    return report({
+      method: request.method, bodyIsNull, usedBefore, value,
+      usedAfter: request.bodyUsed,
+    });
+  },
+
   async "/string-chunks-response"() {
     // The response/host path takes the same stream: both runtimes write a
     // string chunk out as its UTF-8 bytes.

@@ -462,7 +462,13 @@ pub fn failed_write_position(error: &anyhow::Error) -> Option<u64> {
 /// operations, so a common request pays nothing for a stream that it does
 /// not need. A large body, or a body of unknown length, crosses as a
 /// stream id. The peak cost of that body is one chunk, not its length.
+///
+/// [`RequestBody::Absent`] is distinct from an empty [`RequestBody::Bytes`]:
+/// workerd's `request.body` is `null` when the HTTP request carried no body
+/// framing, and an empty stream when it carried `Content-Length: 0`. Both
+/// reach a Worker, so the host must not collapse them (#142).
 pub enum RequestBody {
+    Absent,
     Bytes(bytes::Bytes),
     Stream(u64),
 }
@@ -471,22 +477,15 @@ impl RequestBody {
     /// The bytes already in hand, for the paths that hold a whole body.
     pub fn bytes(&self) -> &[u8] {
         match self {
+            Self::Absent | Self::Stream(_) => &[],
             Self::Bytes(bytes) => bytes,
-            Self::Stream(_) => &[],
         }
     }
 
     pub fn stream_id(&self) -> Option<u64> {
         match self {
-            Self::Bytes(_) => None,
+            Self::Absent | Self::Bytes(_) => None,
             Self::Stream(id) => Some(*id),
-        }
-    }
-
-    pub(crate) fn into_held_bytes(self) -> Option<Vec<u8>> {
-        match self {
-            Self::Bytes(bytes) => Some(bytes.into()),
-            Self::Stream(_) => None,
         }
     }
 }
