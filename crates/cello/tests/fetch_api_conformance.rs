@@ -192,8 +192,8 @@ fn serve_origin(listener: TcpListener) {
             let method = parts.next().unwrap_or_default();
             let target = parts.next().unwrap_or_default();
             if target.starts_with("/redirect") {
-                let code = query(&target, "code").unwrap_or("302");
-                let to = query(&target, "to").unwrap_or("/target");
+                let code = query(target, "code").unwrap_or("302");
+                let to = query(target, "to").unwrap_or("/target");
                 respond(
                     &mut stream,
                     &format!("{code} Found"),
