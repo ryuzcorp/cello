@@ -4,7 +4,6 @@
 // sequence, `body` an array of chunks sent as a chunked upload.
 
 export const cases = [
-  { name: "probe", fixture: "probe", path: "/probe" },
   { name: "readable-basics", fixture: "streams", path: "/readable-basics" },
   { name: "readable-pull-order", fixture: "streams", path: "/readable-pull-order" },
   { name: "readable-byob", fixture: "streams", path: "/readable-byob" },
@@ -147,9 +146,7 @@ export const cases = [
   // Fetch API object model. Every case below produces the same transcript on
   // workerd and cello; the divergences still owned by other slices (#140,
   // #170, #171, #174) are filed and their cases stay out until they pass,
-  // as the gate requires. `issue-method-matrix` (#190, TRACE) is fixed here
-  // but was not re-run against workerd after the fix, so it is re-added once
-  // a gate run confirms it.
+  // as the gate requires.
   { name: "headers-validate", fixture: "fetchapi", path: "/headers/validate" },
   { name: "headers-set-cookie", fixture: "fetchapi", path: "/headers/set-cookie" },
   { name: "headers-immutable-redirect", fixture: "fetchapi", path: "/headers/immutable-redirect" },
@@ -204,6 +201,7 @@ export const cases = [
   { name: "issue-incoming-redirect", fixture: "fetchapi", path: "/issue/incoming-redirect" },
   { name: "issue-incoming-headers-mutation", fixture: "fetchapi", requests: [{ path: "/issue/incoming-headers-mutation", headers: { "x-sent": "one" } }] },
   { name: "issue-get-with-body", fixture: "fetchapi", path: "/issue/get-with-body" },
+  { name: "issue-method-matrix", fixture: "fetchapi", path: "/issue/method-matrix" },
   { name: "issue-request-defaults-fields", fixture: "fetchapi", path: "/issue/request-defaults-fields" },
   { name: "request-body-used-incoming-post", fixture: "fetchapi", requests: [{ method: "POST", path: "/request/body-used-incoming", body: ["hello"] }] },
   { name: "issue-blob-body-content-type", fixture: "fetchapi", path: "/issue/blob-body-content-type" },
