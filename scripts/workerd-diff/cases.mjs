@@ -11,6 +11,7 @@ export const cases = [
   { name: "identity-read-order", fixture: "streams", path: "/identity-read-order" },
   { name: "writable-order", fixture: "streams", path: "/writable-order" },
   { name: "transform-error", fixture: "streams", path: "/transform-error" },
+  { name: "transform-close-after-cancel", fixture: "streams", path: "/transform-close-after-cancel" },
   { name: "gzip-large", fixture: "streams", path: "/gzip-large" },
   { name: "writable-backpressure", fixture: "streams", path: "/writable-backpressure" },
   { name: "tee-basic", fixture: "streams", path: "/tee-basic" },

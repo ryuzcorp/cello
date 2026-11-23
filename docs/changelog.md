@@ -2,6 +2,25 @@
 title: Changelog
 description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.7.
 ---
+## Unreleased
+
+One stream divergence from workerd is fixed, found by the workerd
+differential harness: `writer.close()` after the readable side of a
+`TransformStream` was cancelled now rejects with the cancel reason instead of
+a generic `TypeError`. No configuration, data, or bucket-format changes.
+
+- **`writer.close()` after a readable cancel rejects with the cancel
+  reason** (#129). Cancelling a `TransformStream`'s readable errors its
+  writable with the cancel reason, and `writer.closed` already reported it,
+  but `close()` took the errored early path and rejected with
+  `TypeError: Stream already closed/errored`, so a producer's teardown could
+  not tell a consumer abort from a real close failure. It now rejects with
+  the stream's stored error, which is workerd's behaviour (the WHATWG text
+  says a fresh `TypeError`). An `IdentityTransformStream` or
+  `FixedLengthStream` cancel reaches the same path with workerd's converted
+  `Error`. The differential gate gained the `transform-close-after-cancel`
+  case.
+
 ## v0.2.7
 
 Five stream and body divergences from workerd are fixed, all found by the
