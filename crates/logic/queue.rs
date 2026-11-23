@@ -252,6 +252,27 @@ pub fn refuse_batch(
     unfittable: bool,
     prior: Option<RefusalStreak>,
 ) -> Refusal {
+    refuse_batch_with(
+        now,
+        kind,
+        unfittable,
+        prior,
+        REFUSAL_FREE_LIMIT,
+        REFUSAL_FREE_WINDOW_MS,
+    )
+}
+
+/// [`refuse_batch`] with the free-release bounds given, for an operator that
+/// tuned them (`CELLO_QUEUE_REFUSAL_FREE_LIMIT`,
+/// `CELLO_QUEUE_REFUSAL_FREE_WINDOW_S`) and for tests.
+pub fn refuse_batch_with(
+    now: Ms,
+    kind: RefusalKind,
+    unfittable: bool,
+    prior: Option<RefusalStreak>,
+    free_limit: u16,
+    free_window_ms: Ms,
+) -> Refusal {
     // A streak younger than the free window continues however slowly the
     // ladder climbs: the delay between two refusals grows to minutes, so a gap
     // test alone would restart the ladder before it ever reaches the bound and
@@ -262,7 +283,7 @@ pub fn refuse_batch(
         Some(prior)
             if prior.kind == kind
                 && prior.count > 0
-                && (now.saturating_sub(prior.started_at) < REFUSAL_FREE_WINDOW_MS
+                && (now.saturating_sub(prior.started_at) < free_window_ms.max(1)
                     || now.saturating_sub(prior.at) < REFUSAL_RESET_MS)
     );
     let (count, started_at) = match prior {
@@ -277,14 +298,12 @@ pub fn refuse_batch(
     let delay_ms = base
         .saturating_mul(1i64 << doublings)
         .min(REFUSAL_MAX_DELAY_MS);
-    let action = if unfittable
-        || count > REFUSAL_FREE_LIMIT
-        || now.saturating_sub(started_at) >= REFUSAL_FREE_WINDOW_MS
-    {
-        RefusalAction::ChargeFailure
-    } else {
-        RefusalAction::Release
-    };
+    let action =
+        if unfittable || count > free_limit || now.saturating_sub(started_at) >= free_window_ms {
+            RefusalAction::ChargeFailure
+        } else {
+            RefusalAction::Release
+        };
     Refusal {
         streak: RefusalStreak {
             count,

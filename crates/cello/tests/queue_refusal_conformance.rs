@@ -90,6 +90,14 @@ struct TestNode {
 
 impl TestNode {
     fn boot(app_project: &Path, data_dir: &Path) -> Self {
+        Self::boot_with(app_project, data_dir, [])
+    }
+
+    fn boot_with<const N: usize>(
+        app_project: &Path,
+        data_dir: &Path,
+        extra: [(&str, &str); N],
+    ) -> Self {
         let mut child = cello_command(
             app_project,
             [
@@ -99,7 +107,9 @@ impl TestNode {
                 ),
                 ("CELLO_V8_HEAP_LIMIT_MB", "64"),
                 ("CELLO_V8_EXTERNAL_LIMIT_MB", "64"),
-            ],
+            ]
+            .into_iter()
+            .chain(extra),
         )
         .arg("dev")
         .arg(app_project)
@@ -377,11 +387,11 @@ fn a_refused_batch_is_delivered_after_the_isolate_frees_memory() {
     }
 
     // A consumer ran, so the streak is cleared: the next refusal is free
-    // again rather than resuming the sustained ladder.
-    assert!(
-        !refusal_streak_present(&db),
-        "a successful delivery must reset the refusal streak"
-    );
+    // again rather than resuming the sustained ladder. Settlement is its own
+    // host-to-cell trip, so poll rather than read once.
+    poll_until("streak reset", Duration::from_secs(30), || {
+        (!refusal_streak_present(&db)).then(|| "reset".to_string())
+    });
 
     // Nothing was dead-lettered and the source drained.
     let current = get_json(&node, "/metrics");

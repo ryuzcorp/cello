@@ -108,6 +108,15 @@ pub(crate) fn dispatch_request(
     })
 }
 
+/// A positive integer from the node's environment, or `None` when unset or
+/// unparsable.
+fn positive_or<T: std::str::FromStr>(name: &str) -> Option<T> {
+    crate::env_vars::value(name)
+        .ok()
+        .flatten()
+        .and_then(|value| value.trim().parse::<T>().ok())
+}
+
 /// One policy request from the cell, by its `op`, answered from
 /// `cello_logic::queue`.
 pub(crate) fn run(request: &serde_json::Value) -> Result<serde_json::Value> {
@@ -255,7 +264,15 @@ pub(crate) fn run(request: &serde_json::Value) -> Result<serde_json::Value> {
                 }
                 _ => None,
             };
-            let refusal = cello_logic::queue::refuse_batch(now, kind, unfittable, prior);
+            // An operator can widen or narrow the free-release bound; the
+            // defaults are the shipped values.
+            let limit = positive_or::<u16>("CELLO_QUEUE_REFUSAL_FREE_LIMIT")
+                .unwrap_or(cello_logic::queue::REFUSAL_FREE_LIMIT);
+            let window = positive_or::<u64>("CELLO_QUEUE_REFUSAL_FREE_WINDOW_S")
+                .map(|seconds| i64::try_from(seconds.saturating_mul(1000)).unwrap_or(i64::MAX))
+                .unwrap_or(cello_logic::queue::REFUSAL_FREE_WINDOW_MS);
+            let refusal =
+                cello_logic::queue::refuse_batch_with(now, kind, unfittable, prior, limit, window);
             let action = match refusal.action {
                 cello_logic::queue::RefusalAction::Release => "release",
                 cello_logic::queue::RefusalAction::ChargeFailure => "charge",

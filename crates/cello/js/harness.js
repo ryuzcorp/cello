@@ -8909,7 +8909,9 @@ class __QueueCell {
                     leased_until = NULL
               WHERE seq = ? AND leased_until <= ?`,
             expiry.attempt,
-            expiry.action.at,
+            // Never move a row's visibility backwards: a lease the host
+            // charged early carries its own retry floor.
+            Math.max(expiry.action.at, rowBySeq.get(lease.seq).visible_at),
             lease.seq,
             now,
           );
@@ -9264,12 +9266,18 @@ class __QueueCell {
     const sql = this._open();
     this.ctx.storage.transactionSync(() => {
       if (refusal.action === "charge") {
+        // Expire the lease now and floor the row's next visibility at the
+        // ladder delay: the ordinary expiry transition then spends the
+        // attempt after that delay, so a high `max_retries` cannot burst up
+        // to a hundred re-encoded dispatches.
+        const retryAt = now + refusal.delayMs;
         for (const row of rows) {
           sql.exec(
             `UPDATE ${__QUEUE_MESSAGES}
-                SET leased_until = ?
+                SET leased_until = ?, visible_at = ?
               WHERE seq = ? AND lease_id = ? AND lease_generation = ?`,
             now,
+            Math.max(row.visible_at, retryAt),
             row.seq,
             body.leaseId,
             row.lease_generation,

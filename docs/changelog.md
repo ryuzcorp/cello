@@ -64,9 +64,11 @@ changes: the refusal streak lives in the queue cell's existing metadata table.
   still spend an attempt. If the release itself is lost, the lease expires
   and spends the attempt exactly as before, so no message is lost. The free
   release is bounded -- six consecutive refusals, or about a minute after the
-  streak began, and a batch whose bodies exceed the whole budget is charged at
-  once -- so a batch that can never fit reaches `max_retries` and its
-  dead-letter queue instead of cycling until retention deletes it. A node that
+  streak began -- so a batch that keeps being refused reaches `max_retries`
+  and its dead-letter queue instead of cycling until retention deletes it. A
+  batch whose bodies exceed the whole budget cannot be dispatched at all: the
+  queue cell materializes the same bodies under the same cap, so the
+  producer's `send` fails instead. A node that
   is out of capacity, rather than one isolate at its budget, waits from five
   seconds and on the same ladder, which now grows to five minutes instead of
   five seconds.

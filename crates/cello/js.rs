@@ -5988,12 +5988,13 @@ fn begin_queue(
     batch: QueueBatch,
     reply: tokio::sync::oneshot::Sender<Result<QueueDispatchResult>>,
 ) -> Begun {
-    // A batch whose bodies cannot fit the whole budget can never be
-    // materialized, however long it waits, so refuse it here instead of
-    // charging the isolate message by message. The error is the same
-    // `HostStoreRefusal` a mid-batch refusal returns, with `requested` past
-    // `cap`, which is what makes the host charge the attempt rather than
-    // release the lease.
+    // Defence in depth, not a reachable production case: the queue cell
+    // materializes the same bodies under the same cap before it dispatches,
+    // so a batch over the cap fails at `send` (or at the cell's own budget)
+    // first. Should that ever change, a batch that cannot fit an empty
+    // isolate must not be released attempt-free forever: refuse it here, with
+    // the same `HostStoreRefusal` a mid-batch refusal returns and `requested`
+    // past `cap`, which makes the host charge the attempt.
     if let Some(budget) = backing_store_budget(tc) {
         let bytes = batch
             .messages
