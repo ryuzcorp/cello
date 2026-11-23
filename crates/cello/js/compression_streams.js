@@ -29,13 +29,15 @@ function bytes(chunk) {
 // no-op. Created with the first stream, not when this file compiles.
 let registry;
 
-function make(format, decompress, name) {
-  // Workerd validates the format at construction (the stream is never
-  // created for an unknown one), and requires the argument to be a string.
-  if (format === undefined || typeof format !== 'string')
+function make(format, decompress, name, missing) {
+  // Workerd stringifies a present argument and rejects only a missing one
+  // (measured: `new CompressionStream(5)` and a `toString` object both reach
+  // the format message, an explicit undefined does too).
+  if (missing)
     throw new TypeError(
       `Failed to construct '${name}': constructor parameter 1 is not ` +
       'of type \'string\'.');
+  format = String(format);
   if (format !== 'gzip' && format !== 'deflate' &&
       format !== 'deflate-raw' && format !== 'brotli')
     throw new TypeError(
@@ -82,7 +84,7 @@ function make(format, decompress, name) {
 
 class CompressionStream {
   constructor(format) {
-    const ts = make(format, false, 'CompressionStream');
+    const ts = make(format, false, 'CompressionStream', arguments.length === 0);
     this.readable = ts.readable;
     this.writable = ts.writable;
   }
@@ -90,7 +92,7 @@ class CompressionStream {
 
 class DecompressionStream {
   constructor(format) {
-    const ts = make(format, true, 'DecompressionStream');
+    const ts = make(format, true, 'DecompressionStream', arguments.length === 0);
     this.readable = ts.readable;
     this.writable = ts.writable;
   }
