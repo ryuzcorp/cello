@@ -396,6 +396,11 @@ for (const bodyStream of [CelloBodyStream, CelloHttpBodyStream]) {
 // sides empty bytes, dropping the payload already read.
 const __BODY_LOCKED =
   "This ReadableStream is currently locked to a reader,";
+// A reader that holds a body but has read nothing leaves it unused, yet the
+// stream cannot be stolen into a second Request. Workerd reports that state
+// separately from the used-body error (#140).
+const __BODY_LOCKED_REQUEST =
+  "The ReadableStream has been locked to a reader.";
 const __bodyDisturbed = (message) => message.bodyUsed ||
   (message.body != null &&
     (message.body.locked || message.body._disturbed === true));
@@ -583,8 +588,13 @@ globalThis.Request = class Request {
     // and copies an unused buffered body, so it never reaches here disturbed.
     // A bodyless prior -- `body === null` -- has nothing to steal and copies
     // normally.
-    if (!hasBody && prior && prior.bodyUsed)
-      throw new TypeError(__FETCH_USED);
+    if (!hasBody && prior) {
+      if (prior.bodyUsed) throw new TypeError(__FETCH_USED);
+      // Locked but unread: a reader holds the stream, so the copy cannot
+      // steal it, with workerd's own message.
+      if (prior.body != null && prior.body.locked)
+        throw new TypeError(__BODY_LOCKED_REQUEST);
+    }
     if (!hasBody && prior && prior._bodyBytes === null) {
       // Adopt the prior request's stream; per spec the prior body
       // is disturbed by the new request.
@@ -12306,11 +12316,13 @@ if (!globalThis.Blob) {
                  ArrayBuffer.isView(part)) sources.push(part);
         else sources.push(new TextEncoder().encode(String(part)));
       }
+      // Every part goes through the slot reader, including a real
+      // `Uint8Array`: returning the guest's object let the size and copy
+      // below read its own `byteLength` (#130). A part that is not bytes
+      // keeps its string form, as before.
       const chunks = sources.map((source) =>
-        source instanceof __primUint8Array
-          ? source
-          : __hostChunk(source, "Blob parts must be bytes") ??
-            new TextEncoder().encode(String(source)));
+        __hostChunk(source, "Blob parts must be bytes") ??
+          new TextEncoder().encode(String(source)));
       let total = 0;
       for (const chunk of chunks) total += chunk.byteLength;
       const LIMIT = 134217728;
@@ -12915,7 +12927,11 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
     // accepted but not yet bound to a host transport. An outbound socket is
     // already bound -- queueing here would silently swallow its frames.
     if (!this._outbound && this._accepted && !this._target) {
-      this._pending.push([binary ? "send-binary" : "send", binary ? bytes : text]);
+      // Copy at send: the frame waits in the queue, and workerd snapshots the
+      // bytes the caller passed rather than aliasing its buffer (#130).
+      this._pending.push([
+        binary ? "send-binary" : "send", binary ? bytes.slice() : text,
+      ]);
       return;
     }
     if (binary) __ws_send_binary(this._id, bytes);

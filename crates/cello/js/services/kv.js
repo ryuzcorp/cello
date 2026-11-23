@@ -923,20 +923,17 @@ function kvService(host) {
     if (typeof value === "string") {
       return { value: __kvEncoder.encode(value), tag: __KV_TAG_TEXT };
     }
-    if (value instanceof ArrayBuffer) {
-      return { value: new Uint8Array(value.slice(0)), tag: __KV_TAG_BYTES };
-    }
-    if (ArrayBuffer.isView(value)) {
-      // Copied, not referenced. `sendBatch`'s resizable-ArrayBuffer regression
-      // upstream is the same hazard: a caller may resize or reuse the buffer
-      // between this call and the write, and a shallow view would then read
-      // decommitted pages.
-      return {
-        value: new Uint8Array(
-          value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength),
-        ),
-        tag: __KV_TAG_BYTES,
-      };
+    // The internal slots, not the guest's `buffer`/`byteOffset`/`byteLength`
+    // (#130). Copied, not referenced. `sendBatch`'s resizable-ArrayBuffer
+    // regression upstream is the same hazard: a caller may resize or reuse the
+    // buffer between this call and the write, and a shallow view would then
+    // read decommitted pages.
+    const bytes = __hostChunk(
+      value,
+      "a KV value must be a string, an ArrayBuffer, a typed array, or a ReadableStream",
+    );
+    if (bytes !== null) {
+      return { value: new Uint8Array(bytes), tag: __KV_TAG_BYTES };
     }
     throw __kvError(
       "a KV value must be a string, an ArrayBuffer, a typed array, or a ReadableStream",
@@ -961,9 +958,21 @@ function kvService(host) {
       for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
-        const chunk = ArrayBuffer.isView(value)
-          ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
-          : new Uint8Array(value);
+        // A string chunk is its UTF-8 bytes, as the response pump and
+        // `cache.put` treat one (#128, #130); a bytes chunk is read through
+        // its slots and copied now, because a producer may reuse the buffer
+        // it enqueued once the next pull runs.
+        let chunk;
+        if (typeof value === "string") {
+          chunk = __kvEncoder.encode(value);
+        } else {
+          const bytes = __hostChunk(
+            value, "a KV value stream must yield bytes or strings");
+          if (bytes === null) {
+            throw __kvError("a KV value stream must yield bytes or strings");
+          }
+          chunk = bytes.slice();
+        }
         size += chunk.byteLength;
         if (size > limit) {
           throw __kvError(`a value is at most ${limit} bytes, and the stream is larger`);

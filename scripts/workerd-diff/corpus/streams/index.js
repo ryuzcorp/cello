@@ -903,6 +903,60 @@ const routes = {
     });
   },
 
+  async "/blob-part-shadow"() {
+    // #130: a Blob part's window comes from the view's internal slots, so an
+    // own `byteLength` cannot pad the Blob.
+    const view = new Uint8Array([97, 98, 99]);
+    Object.defineProperty(view, "byteLength", { value: 5 });
+    const blob = new Blob([view]);
+    return report({ size: blob.size, text: await blob.text() });
+  },
+
+  async "/request-copy-locked"() {
+    // #140: a body locked by a reader that has read nothing is unused but
+    // still cannot be stolen into a second Request; clone() keeps its own
+    // locked message.
+    const settle = (fn) => Promise.resolve().then(fn).then((value) => value, errorInfo);
+    const request = new Request("https://diff.test/locked", {
+      method: "POST", body: "abc",
+    });
+    request.body.getReader();
+    return report({
+      used: request.bodyUsed,
+      locked: request.body.locked,
+      copy: await settle(() => new Request(request)),
+      clone: await settle(() => request.clone()),
+    });
+  },
+
+  async "/websocket-send-copy"() {
+    // #130: send snapshots the bytes, as workerd does; a mutation after
+    // `send()` must not change the delivered frame.
+    const pair = new WebSocketPair();
+    const sender = pair[0];
+    const receiver = pair[1];
+    // Accept only the sender: the frame waits in its queue, exactly the path
+    // where a retained view would later read the caller's mutated buffer.
+    sender.accept();
+    receiver.binaryType = "arraybuffer";
+    const received = new Promise((resolve) => {
+      receiver.addEventListener("message", (event) => {
+        const data = event.data;
+        resolve({
+          tag: Object.prototype.toString.call(data),
+          bytes: data instanceof ArrayBuffer
+            ? Array.from(new Uint8Array(data))
+            : Array.from(new Uint8Array(data.buffer ?? data)),
+        });
+      });
+    });
+    const view = new Uint8Array([97, 98, 99]);
+    sender.send(view);
+    view[0] = 122;
+    receiver.accept();
+    return report({ received: await received });
+  },
+
   async "/string-chunks-response"() {
     // The response/host path takes the same stream: both runtimes write a
     // string chunk out as its UTF-8 bytes.
