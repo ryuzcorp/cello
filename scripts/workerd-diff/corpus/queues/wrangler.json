@@ -1,0 +1,11 @@
+{
+  "name": "queues",
+  "main": "index.js",
+  "compatibility_date": "2026-11-01",
+  "no_bundle": true,
+  "kv_namespaces": [{ "binding": "LOG", "id": "queue-log" }],
+  "queues": {
+    "producers": [{ "binding": "Q", "queue": "probe-queue" }],
+    "consumers": [{ "queue": "probe-queue", "max_batch_size": 10, "max_batch_timeout": 1 }]
+  }
+}

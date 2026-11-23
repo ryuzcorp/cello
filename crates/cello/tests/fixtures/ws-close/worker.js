@@ -18,9 +18,11 @@ export default {
     if (url.pathname === "/big-echo") {
       // Echo one message of any size back: a single 16-32 MiB message must
       // pass an idle tenant pump intact instead of ending the socket loudly
-      // with 1011.
+      // with 1011. binaryType is opt-in since the standard default (a Blob)
+      // took effect; sending a Blob would stringify it, as workerd does.
       const [client, server] = Object.values(new WebSocketPair());
       server.accept();
+      server.binaryType = "arraybuffer";
       server.addEventListener("message", (e) => server.send(e.data));
       return new Response(null, { status: 101, webSocket: client });
     }

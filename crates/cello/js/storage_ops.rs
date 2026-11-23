@@ -1137,8 +1137,7 @@ struct StorageValueDelegate;
 
 impl v8::ValueSerializerImpl for StorageValueDelegate {
     fn throw_data_clone_error(&self, scope: &mut v8::PinScope, message: v8::Local<v8::String>) {
-        let exception = v8::Exception::type_error(scope, message);
-        scope.throw_exception(exception);
+        throw_storage_data_clone_error(scope, message);
     }
 }
 

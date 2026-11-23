@@ -1,0 +1,10 @@
+{
+  "name": "ws-hib",
+  "main": "index.js",
+  "compatibility_date": "2026-11-01",
+  "no_bundle": true,
+  "durable_objects": {
+    "bindings": [{ "name": "HIB", "class_name": "Hib" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Hib"] }]
+}

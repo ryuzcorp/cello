@@ -1,0 +1,37 @@
+{
+  "name": "do",
+  "main": "index.js",
+  "compatibility_date": "2026-11-01",
+  "no_bundle": true,
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "OBJ",
+        "class_name": "Probe"
+      },
+      {
+        "name": "TIMER",
+        "class_name": "Timer"
+      },
+      {
+        "name": "THROWER",
+        "class_name": "Thrower"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "Probe"
+      ]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": [
+        "Timer",
+        "Thrower"
+      ]
+    }
+  ]
+}

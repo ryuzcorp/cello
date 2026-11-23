@@ -1893,6 +1893,24 @@ class SyncKvStorage {
     );
   }
 }
+// Workerd's DurableObjectStorage.setAlarm argument conversion (actor-state.c++
+// setAlarm, jsg::Date): a Date or a number, finite and strictly after the Unix
+// epoch. Every other value is the WebIDL argument refusal workerd raises.
+const __alarmTime = (value) => {
+  let ms;
+  if (value instanceof Date) ms = value.getTime();
+  else if (typeof value === "number") ms = value;
+  else
+    throw new TypeError(
+      "Failed to execute 'setAlarm' on 'DurableObjectStorage': " +
+      "parameter 1 is not of type 'date'.");
+  if (!Number.isFinite(ms))
+    throw new TypeError(
+      "The value cannot be converted because it is not a valid Date.");
+  if (ms <= 0)
+    throw new TypeError("setAlarm() cannot be called with an alarm time <= 0");
+  return ms;
+};
 class DurableObjectStorage {
   constructor(
     scope,
@@ -1965,6 +1983,11 @@ class DurableObjectStorage {
   async put(k, val) {
     this._assertTransactionActive("put");
     if (typeof k === "string") {
+      // Workerd (actor-state.c++ putOne) refuses an undefined value on a
+      // single put: it would store nothing and leave any earlier value in
+      // place. A batch put may carry undefined values, as workerd's does.
+      if (val === undefined)
+        throw new TypeError("put() called with undefined value.");
       try {
         __storage_queue_put(this._scope, k, val);
       } catch (error) {
@@ -2049,7 +2072,18 @@ class DurableObjectStorage {
     if (!this._flushPendingPuts()) return;
     if (this._state?._facetDepth > 0)
       throw new Error("Facets currently cannot set alarms.");
-    __alarm_set(this._scope, t instanceof Date ? t.getTime() : Number(t));
+    // Workerd validates the argument, then the instant, then whether the
+    // class can ever receive the wake (worker.c++ assertCanSetAlarm). The
+    // handler check runs against the initialized instance only: a setAlarm
+    // in the constructor is allowed, exactly like workerd's Initializing
+    // state, because the class may add the handler after the ctor.
+    const at = __alarmTime(t);
+    const instance = __cell.instances[this._scope];
+    if (instance !== undefined && typeof instance.alarm !== "function")
+      throw new TypeError(
+        "Your Durable Object class must have an alarm() handler in order " +
+        "to call setAlarm()");
+    __alarm_set(this._scope, at);
   }
   async getAlarm() {
     this._assertTransactionActive("getAlarm");
@@ -2397,6 +2431,24 @@ const __durableObjectRoutingError = (error) => {
   } catch {
     return new DurableObjectRoutingError();
   }
+};
+// A Durable Object handler's uncaught exception reaches a stub caller as the
+// error the handler threw, the way workerd propagates it. The host carries
+// the class name and message apart; a standard error class is rebuilt as
+// itself, and anything else keeps its name on an Error.
+const __cellErrorCtors = Object.freeze({
+  Error, TypeError, RangeError, SyntaxError, ReferenceError, EvalError,
+  URIError, AggregateError,
+});
+const __cellHandlerThrow = (details) => {
+  const name = String(details?.name ?? "Error");
+  const message = String(details?.message ?? "");
+  const ctor = __primHasOwn(__cellErrorCtors, name)
+    ? __cellErrorCtors[name] : undefined;
+  if (ctor !== undefined) return new ctor(message);
+  const error = new Error(message);
+  error.name = name;
+  return error;
 };
 // A cell's input gate as the isolate sees it, for the one delivery
 // point that is inside the isolate rather than in front of it: an
@@ -3266,6 +3318,10 @@ class DurableObjectState {
     return Array.from(ws._tags);
   }
   acceptWebSocket(ws, tags = []) {
+    if (ws._accepted || ws._hibernationAccepted)
+      throw new Error(
+        "Cannot call `acceptWebSocket()` if the WebSocket was already " +
+        "accepted via `accept()`");
     if (__heap_over_admission_share())
       throw new Error(
         "the isolate is near its V8 heap limit, so it refused a " +
@@ -3275,6 +3331,7 @@ class DurableObjectState {
     ws._target = { id: ws._id, scope: this._scope };
     if (ws._peer) ws._peer._target = ws._target;
     ws._hibernatable = true;
+    ws._hibernationAccepted = true;
     if (ws._peer) ws._peer._hibernatable = true;
     ws._tags = acceptedTags;
     __sockets.set(ws._id, ws);
@@ -3284,11 +3341,12 @@ class DurableObjectState {
       this.getWebSockets().find((ws) => ws._id === id) ||
       __wsStub(id);
   }
-  // Workerd actor-state.c++ setWebSocketAutoResponse: no pair unsets, and
-  // each side is capped at 2048 UTF-8 bytes. The pair itself lives in the
-  // shell -- a matched message is answered without waking this cell.
+  // Workerd actor-state.c++ setWebSocketAutoResponse: no argument unsets,
+  // `null` is not a pair and is refused, and each side is capped at 2048
+  // UTF-8 bytes. The pair itself lives in the shell -- a matched message is
+  // answered without waking this cell.
   setWebSocketAutoResponse(pair) {
-    if (pair === undefined || pair === null) {
+    if (pair === undefined) {
       __ws_auto_response_set(this._scope, null, null);
       return;
     }
@@ -6925,6 +6983,11 @@ class DurableObjectNamespace {
             signal,
           );
         }));
+        // The host answers a handler exception with a marked body instead of
+        // a failed transport, so the caller rejects with the handler's own
+        // error (name and message) rather than a host-formatted string.
+        if (r.__celloCellError !== undefined)
+          throw __cellHandlerThrow(r.__celloCellError);
         const body = r.streamId !== undefined
           ? new CelloHttpBodyStream(r.streamId)
           : r.body !== undefined
@@ -7612,47 +7675,60 @@ __cello.__dispatchEntrypointQueue = async (name, incoming) => {
       default: throw new TypeError(`Unknown queue content type: ${message.contentType}`);
     }
   };
-  const messages = incoming.messages.map((message) => ({
-    id: message.id,
-    timestamp: new Date(message.timestamp),
-    body: decode(message),
-    attempts: message.attempts,
+  // Workerd's QueueMessage/QueueBatch (queue.c++): the settle methods live on
+  // the prototype, so Object.keys, spread, JSON.stringify and
+  // structuredClone of a batch or message see only the data fields. The
+  // mutable settlement state stays in the closure, keyed by private fields
+  // that never appear as own properties.
+  class QueueMessage {
+    #id;
+    constructor(message) {
+      this.id = message.id;
+      this.timestamp = new Date(message.timestamp);
+      this.body = decode(message);
+      this.attempts = message.attempts;
+      this.#id = message.id;
+    }
     ack() {
       checkActive();
-      if (ackAll || retryBatch.retry || retries.has(message.id)) return;
-      explicitAcks.add(message.id);
-    },
+      if (ackAll || retryBatch.retry || retries.has(this.#id)) return;
+      explicitAcks.add(this.#id);
+    }
     retry(options) {
       checkActive();
-      if (ackAll || explicitAcks.has(message.id)) return;
+      if (ackAll || explicitAcks.has(this.#id)) return;
       const delaySeconds = retryDelay(options);
-      if (delaySeconds !== undefined || !retries.has(message.id))
-        retries.set(message.id, delaySeconds);
-    },
-  }));
+      if (delaySeconds !== undefined || !retries.has(this.#id))
+        retries.set(this.#id, delaySeconds);
+    }
+  }
+  const messages = incoming.messages.map((message) => new QueueMessage(message));
   const oldest = incoming.metrics.oldestMessageTimestamp;
-  const batch = {
-    queue: incoming.queue,
-    messages,
-    metadata: {
-      metrics: {
-        backlogCount: incoming.metrics.backlogCount,
-        backlogBytes: incoming.metrics.backlogBytes,
-        oldestMessageTimestamp: oldest === undefined ? undefined : new Date(oldest),
-      },
-    },
+  class QueueBatch {
+    constructor() {
+      this.queue = incoming.queue;
+      this.messages = messages;
+      this.metadata = {
+        metrics: {
+          backlogCount: incoming.metrics.backlogCount,
+          backlogBytes: incoming.metrics.backlogBytes,
+          oldestMessageTimestamp: oldest === undefined ? undefined : new Date(oldest),
+        },
+      };
+    }
     ackAll() {
       checkActive();
       if (!retryBatch.retry) ackAll = true;
-    },
+    }
     retryAll(options) {
       checkActive();
       if (ackAll) return;
       retryBatch.retry = true;
       const delaySeconds = retryDelay(options);
       if (delaySeconds !== undefined) retryBatch.delaySeconds = delaySeconds;
-    },
-  };
+    }
+  }
+  const batch = new QueueBatch();
   let outcome = "ok";
   let errorText;
   try {
@@ -7836,6 +7912,11 @@ __cello.__dispatchEntrypointRpc =
 // by wsId -- so the isolate can be hibernated between messages.
 const __wsStub = __cello.__wsStub = (wsId) => ({
   _hibernatable: true,
+  // Workerd's hibernated WebSocket reports the same standard default; a
+  // binary message still reaches `webSocketMessage` as an ArrayBuffer,
+  // whatever this says.
+  get binaryType() { return "blob"; },
+  set binaryType(_) {},
   send: (data) => {
     const bytes = __hostChunk(
       data, "WebSocket.send accepts a string, ArrayBuffer, or view");
@@ -12806,6 +12887,9 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
     this._attachment = undefined;
     this._target = null;
     this._accepted = false;
+    // Accepting for hibernation is a second, distinct acceptance: workerd
+    // refuses `acceptWebSocket()` once either form ran.
+    this._hibernationAccepted = false;
     this._hibernatable = false;
     this._pending = [];
     // The other end of an in-isolate upgrade (a WebSocketPair served
@@ -12985,6 +13069,16 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
   send(data) {
     if (this.readyState !== WebSocket.READY_STATE_OPEN)
       throw new DOMException("WebSocket is not open", "InvalidStateError");
+    // Workerd (web-socket.c++ send): a socket no accept() or
+    // state.acceptWebSocket() has claimed has no transport on either end,
+    // and sending is an error rather than a frame dropped without a trace.
+    // A socket that a 101 response released, one the host joined, or one the
+    // state handed out from `getWebSockets()` is already accepted.
+    if (!this._outbound && !this._accepted && !this._target &&
+        !this._hibernatable && !this._loopback)
+      throw new TypeError(
+        "You must call one of accept() or state.acceptWebSocket() on this " +
+        "WebSocket before sending messages.");
     // Bytes come from the internal slots (#130); anything else is text.
     const bytes = __hostChunk(
       data, "WebSocket.send accepts a string, ArrayBuffer, or view");
@@ -13155,11 +13249,11 @@ globalThis.WebSocketPair = function WebSocketPair() {
   client._peer = server;
   server._peer = client;
   // Indexed AND iterable: `const [client, server] = new WebSocketPair()` is
-  // the form most Cloudflare code uses.
+  // the form most Cloudflare code uses. No own `length` -- workerd's pair is
+  // `{0, 1}`, so Object.keys/spread see exactly the two sockets.
   return {
     0: client,
     1: server,
-    length: 2,
     [Symbol.iterator]() {
       return [client, server][Symbol.iterator]();
     },

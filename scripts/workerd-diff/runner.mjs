@@ -300,6 +300,131 @@ function dechunk(raw) {
   }
 }
 
+/** One masked client frame (RFC 6455). */
+function websocketFrame(opcode, payload) {
+  const bytes = Buffer.from(payload);
+  const mask = Buffer.from([0x11, 0x22, 0x33, 0x44]);
+  let header;
+  if (bytes.length < 126) header = Buffer.from([0x80 | opcode, 0x80 | bytes.length]);
+  else {
+    header = Buffer.alloc(4);
+    header[0] = 0x80 | opcode;
+    header[1] = 0x80 | 126;
+    header.writeUInt16BE(bytes.length, 2);
+  }
+  return Buffer.concat([header, mask, Buffer.from(bytes.map((b, i) => b ^ mask[i % 4]))]);
+}
+
+/** Frames in `buffer`, unmasked; a truncated tail is left unread. */
+function websocketFrames(buffer) {
+  const frames = [];
+  let at = 0;
+  while (at + 2 <= buffer.length) {
+    const opcode = buffer[at] & 0x0f;
+    let length = buffer[at + 1] & 0x7f;
+    let offset = at + 2;
+    if (length === 126) {
+      if (offset + 2 > buffer.length) break;
+      length = buffer.readUInt16BE(offset);
+      offset += 2;
+    } else if (length === 127) {
+      if (offset + 8 > buffer.length) break;
+      length = Number(buffer.readBigUInt64BE(offset));
+      offset += 8;
+    }
+    if (offset + length > buffer.length) break;
+    frames.push({ opcode, payload: buffer.subarray(offset, offset + length) });
+    at = offset + length;
+  }
+  return frames;
+}
+
+/** A frame as a normalized transcript entry. */
+function websocketFrameRecord(frame) {
+  if (frame.opcode === 8) {
+    return {
+      opcode: 8,
+      code: frame.payload.length >= 2 ? frame.payload.readUInt16BE(0) : null,
+      reason: frame.payload.subarray(2).toString("utf8"),
+    };
+  }
+  const text = frame.payload.toString("utf8");
+  if (Buffer.from(text, "utf8").equals(frame.payload)) return { opcode: frame.opcode, text };
+  return {
+    opcode: frame.opcode,
+    bytes: frame.payload.length,
+    sha256: createHash("sha256").update(frame.payload).digest("hex"),
+  };
+}
+
+/**
+ * One raw WebSocket conversation: handshake, a text frame, two binary
+ * frames, then a close. The transcript is the response head plus every
+ * server frame up to and including its close, so a case never depends on
+ * wall time -- it resolves on the frames, not on a delay.
+ */
+function websocketExchange(addr, path) {
+  return new Promise((resolve, reject) => {
+    const socket = createConnection(hostPort(addr));
+    let received = Buffer.alloc(0);
+    let handshake = null;
+    let settled = false;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      if (error) reject(error);
+      else resolve(value);
+    };
+    const timer = setTimeout(
+      () => finish(new Error(`websocket ${path}: no completion within ${requestDeadlineMs} ms`)),
+      requestDeadlineMs,
+    );
+    socket.on("error", (error) => finish(error));
+    socket.on("data", (chunk) => {
+      received = Buffer.concat([received, chunk]);
+      try {
+        if (handshake === null) {
+          const split = received.indexOf("\r\n\r\n");
+          if (split === -1) return;
+          const head = received.subarray(0, split).toString("latin1").split("\r\n");
+          const headers = {};
+          for (const line of head.slice(1)) {
+            const at = line.indexOf(":");
+            headers[line.slice(0, at).trim().toLowerCase()] = line.slice(at + 1).trim();
+          }
+          for (const name of volatileHeaders) delete headers[name];
+          handshake = { status: Number(head[0].split(" ")[1]), headers };
+          received = received.subarray(split + 4);
+          socket.write(websocketFrame(1, "hi"));
+          socket.write(websocketFrame(2, Buffer.from([1, 2, 250])));
+          socket.write(websocketFrame(2, Buffer.from([9, 8])));
+          socket.write(websocketFrame(8, Buffer.from([0x03, 0xe8])));
+        }
+        const frames = websocketFrames(received);
+        if (frames.some((frame) => frame.opcode === 8)) {
+          finish(null, { ...handshake, frames: frames.map(websocketFrameRecord) });
+        }
+      } catch (error) {
+        finish(error);
+      }
+    });
+    socket.once("connect", () => {
+      socket.write([
+        `GET ${path} HTTP/1.1`,
+        `Host: ${addr}`,
+        "Upgrade: websocket",
+        "Connection: Upgrade",
+        "Sec-WebSocket-Key: MDEyMzQ1Njc4OWFiY2RlZg==",
+        "Sec-WebSocket-Version: 13",
+        "",
+        "",
+      ].join("\r\n"));
+    });
+  });
+}
+
 /** The transcript of one request: status, stable headers, body where equal. */
 function record(response) {
   const headers = {};

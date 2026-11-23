@@ -2244,6 +2244,37 @@ fn reject_reason(tc: &mut v8::PinScope, p: v8::Local<v8::Promise>) -> String {
     }
 }
 
+/// A rejected Durable Object handler, split into the name and message a
+/// caller sees. Workerd rethrows the handler's own error object, so a
+/// `TypeError` stays a `TypeError` and the message carries no host framing;
+/// V8 gives a thrown non-object only a string, which workerd reports as an
+/// `Error` with that text.
+fn handler_rejection(
+    tc: &mut v8::PinScope,
+    p: v8::Local<v8::Promise>,
+) -> crate::engine_api::CellHandlerError {
+    let r = p.result(tc);
+    let string_field = |object: &v8::Local<v8::Object>, key: &str| -> Option<String> {
+        let key = v8::String::new(tc, key)?;
+        let value = object.get(tc, key.into())?;
+        if value.is_undefined() || value.is_null() {
+            return None;
+        }
+        let text = value.to_rust_string_lossy(tc);
+        (!text.is_empty()).then_some(text)
+    };
+    let object = r.to_object(tc);
+    let name = object
+        .as_ref()
+        .and_then(|object| string_field(object, "name"))
+        .unwrap_or_else(|| "Error".to_string());
+    let message = object
+        .as_ref()
+        .and_then(|object| string_field(object, "message"))
+        .unwrap_or_else(|| r.to_rust_string_lossy(tc));
+    crate::engine_api::CellHandlerError { name, message }
+}
+
 pub struct Engine;
 impl Engine {
     pub fn init() {
@@ -6872,7 +6903,16 @@ fn settle(tc: &mut v8::PinScope, entry: &mut InFlight) {
             }
             v8::PromiseState::Rejected => {
                 let guard = CurrentGuard::enter(entry.context.clone());
-                let reason = reject_reason(tc, promise);
+                // A Durable Object handler's exception crosses to its caller
+                // as the error the handler threw (name and message), the way
+                // workerd propagates it. Any other failure keeps the host's
+                // descriptive text, which is what a client and the log show.
+                let failure = if entry.scope.is_some() {
+                    let handler = handler_rejection(tc, promise);
+                    anyhow::Error::new(handler)
+                } else {
+                    anyhow!("rejected: {}", reject_reason(tc, promise))
+                };
                 // The handler is what failed, so an alarm's failure here
                 // counts against its retry limit — unlike a budget overrun
                 // or a disconnect, which `fail` records as not counting.
@@ -6883,7 +6923,7 @@ fn settle(tc: &mut v8::PinScope, entry: &mut InFlight) {
                     finish_incoming_request(tc, request_id);
                 }
                 drop(guard);
-                entry.fail_in_turn(anyhow!("rejected: {reason}"));
+                entry.fail_in_turn(failure);
             }
         }
     }
@@ -10241,7 +10281,19 @@ fn op_do_call_impl(
         gated_channel_send(gate, &DO_CALL_TX, request, "no proxy channel").await?;
         let result = match rx.await {
             Ok(Ok(response)) => encode_http_response(response, true, &stream_service),
-            Ok(Err(e)) => Err(format!("{e}")),
+            // A handler exception is not a transport failure: it is the error
+            // the stub call must reject with, name and message intact, so it
+            // answers as a marked body the harness turns back into a throw.
+            Ok(Err(e)) => match crate::engine_api::cell_handler_error(&e) {
+                Some(handler) => Ok(serde_json::json!({
+                    "__celloCellError": {
+                        "name": handler.name,
+                        "message": handler.message,
+                    },
+                })
+                .to_string()),
+                None => Err(format!("{e}")),
+            },
             Err(e) => Err(format!("proxy dropped: {e}")),
         };
         cancel_guard.disarm();
