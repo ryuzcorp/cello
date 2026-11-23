@@ -29,7 +29,7 @@ fn header_pairs(json: &str) -> Option<Vec<(String, String)>> {
     serde_json::from_str(json).ok()
 }
 
-/// `__cache_put(namespace, url, method, status, headersJson, body)`:
+/// `__cache_put(namespace, url, method, status, headersJson, body, statusText)`:
 /// store one response, answering whether it stuck. `namespace` is the word
 /// the `cache.js` handle passes (`default`, or `named:{name}`).
 pub(super) fn op_cache_put(
@@ -62,6 +62,7 @@ pub(super) fn op_cache_put(
         throw_cache_error(scope, "put", "body must be bytes");
         return;
     };
+    let status_text = args.get(6).to_rust_string_lossy(scope);
     let state = actor_runtime_state(scope);
     let script = state.script_name.clone();
     let deployment = state.cache_scope.clone();
@@ -69,6 +70,7 @@ pub(super) fn op_cache_put(
         method: &method,
         url: &url,
         status,
+        status_text: &status_text,
         headers: &headers,
         body: &body,
     };
@@ -87,7 +89,7 @@ pub(super) fn op_cache_put(
 
 /// `__cache_match(namespace, url, method, ignoreMethod, headersJson)`:
 /// look up one request, answering `null` on a miss or
-/// `[status, headersJson, body | null]` on a hit.
+/// `[status, headersJson, body | null, statusText | null]` on a hit.
 pub(super) fn op_cache_match(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -124,6 +126,7 @@ pub(super) fn op_cache_match(
     );
     let worker_cache::MatchOutcome::Hit {
         status,
+        status_text,
         headers,
         body,
     } = outcome
@@ -132,6 +135,12 @@ pub(super) fn op_cache_match(
         return;
     };
     let status = v8::Integer::new(scope, status as i32).into();
+    let status_text = match status_text {
+        Some(text) => v8::String::new(scope, &text)
+            .map(v8::Local::<v8::Value>::from)
+            .unwrap_or_else(|| v8::null(scope).into()),
+        None => v8::null(scope).into(),
+    };
     let headers = v8::String::new(scope, &serde_json::to_string(&headers).unwrap_or_default())
         .map(v8::Local::<v8::Value>::from)
         .unwrap_or_else(|| v8::null(scope).into());
@@ -144,7 +153,7 @@ pub(super) fn op_cache_match(
         },
         None => v8::null(scope).into(),
     };
-    rv.set(v8::Array::new_with_elements(scope, &[status, headers, body]).into());
+    rv.set(v8::Array::new_with_elements(scope, &[status, headers, body, status_text]).into());
 }
 
 /// `__cache_delete(namespace, url, method, ignoreMethod)`: delete one

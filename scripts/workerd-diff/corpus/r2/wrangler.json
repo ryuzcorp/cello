@@ -1,0 +1,7 @@
+{
+  "name": "r2",
+  "main": "index.js",
+  "compatibility_date": "2026-11-01",
+  "no_bundle": true,
+  "r2_buckets": [{ "binding": "B", "bucket_name": "diff-r2" }]
+}

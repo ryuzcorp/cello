@@ -159,6 +159,10 @@ struct Key {
 
 struct Entry {
     status: u16,
+    /// The reason phrase the response was stored with. `Response` keeps it
+    /// verbatim, including an empty one, so a cached copy answers the same
+    /// `statusText` its producer wrote.
+    status_text: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
     expires_at_ms: i64,
@@ -171,6 +175,7 @@ pub struct PutRequest<'a> {
     pub method: &'a str,
     pub url: &'a str,
     pub status: u16,
+    pub status_text: &'a str,
     pub headers: &'a [(String, String)],
     pub body: &'a [u8],
 }
@@ -221,6 +226,10 @@ pub enum MatchOutcome {
     Miss,
     Hit {
         status: u16,
+        /// The stored reason phrase, or `None` for an answer the cache
+        /// synthesised (304, 416, 206): those take `Response`'s default
+        /// phrase for their status, as upstream's do.
+        status_text: Option<String>,
         headers: Vec<(String, String)>,
         body: Option<Vec<u8>>,
     },
@@ -310,6 +319,7 @@ impl WorkerCache {
             key,
             Entry {
                 status: request.status,
+                status_text: request.status_text.to_string(),
                 headers,
                 body: request.body.to_vec(),
                 expires_at_ms,
@@ -635,6 +645,7 @@ fn answer(entry: &Entry, request_headers: &[(String, String)]) -> MatchOutcome {
         headers.retain(|(name, _)| !name.eq_ignore_ascii_case("content-length"));
         return MatchOutcome::Hit {
             status: 304,
+            status_text: None,
             headers,
             body: None,
         };
@@ -644,6 +655,7 @@ fn answer(entry: &Entry, request_headers: &[(String, String)]) -> MatchOutcome {
             RangeOutcome::Unsatisfiable => {
                 return MatchOutcome::Hit {
                     status: 416,
+                    status_text: None,
                     headers: vec![
                         (
                             "content-range".to_string(),
@@ -669,6 +681,7 @@ fn answer(entry: &Entry, request_headers: &[(String, String)]) -> MatchOutcome {
                 headers.push(("content-length".to_string(), body.len().to_string()));
                 return MatchOutcome::Hit {
                     status: 206,
+                    status_text: None,
                     headers,
                     body: Some(body),
                 };
@@ -699,6 +712,7 @@ fn answer(entry: &Entry, request_headers: &[(String, String)]) -> MatchOutcome {
                 headers.push(("content-length".to_string(), body.len().to_string()));
                 return MatchOutcome::Hit {
                     status: 206,
+                    status_text: None,
                     headers,
                     body: Some(body),
                 };
@@ -709,6 +723,7 @@ fn answer(entry: &Entry, request_headers: &[(String, String)]) -> MatchOutcome {
         headers.retain(|(name, _)| !name.eq_ignore_ascii_case("content-length"));
         return MatchOutcome::Hit {
             status: entry.status,
+            status_text: Some(entry.status_text.clone()),
             headers,
             body: None,
         };
@@ -717,6 +732,7 @@ fn answer(entry: &Entry, request_headers: &[(String, String)]) -> MatchOutcome {
     headers.push(("content-length".to_string(), entry.body.len().to_string()));
     MatchOutcome::Hit {
         status: entry.status,
+        status_text: Some(entry.status_text.clone()),
         headers,
         body: Some(entry.body.clone()),
     }
@@ -1132,6 +1148,7 @@ mod tests {
                 method: "GET",
                 url,
                 status,
+                status_text: "",
                 headers: &held,
                 body,
             },
@@ -1231,6 +1248,7 @@ mod tests {
                 method: "POST",
                 url: URL,
                 status: 200,
+                status_text: "",
                 headers: &held,
                 body: b"x",
             },
@@ -1248,6 +1266,7 @@ mod tests {
                 method: "GET",
                 url: URL,
                 status: 206,
+                status_text: "",
                 headers: &held,
                 body: b"x",
             },
@@ -1262,6 +1281,7 @@ mod tests {
                 method: "GET",
                 url: URL,
                 status: 200,
+                status_text: "",
                 headers: &vary,
                 body: b"x",
             },
@@ -1290,6 +1310,69 @@ mod tests {
         assert_eq!(hit_body(&found), b"hello");
         assert_eq!(header(&found, "x-a").as_deref(), Some("b"));
         assert_eq!(header(&found, "cf-cache-status").as_deref(), Some("HIT"));
+    }
+
+    /// The reason phrase is part of the stored response: workerd answers a
+    /// cached 404 with `Not Found` and any other phrase verbatim, including
+    /// an empty one, and a Worker forwarding the hit sends it on.
+    #[test]
+    fn round_trip_keeps_the_reason_phrase() {
+        let mut cache = store();
+        let held = headers(&[("cache-control", "max-age=60")]);
+        for phrase in ["Gone Fishing", ""] {
+            cache
+                .put(
+                    SCRIPT,
+                    &Namespace::Default,
+                    &PutRequest {
+                        method: "GET",
+                        url: URL,
+                        status: 404,
+                        status_text: phrase,
+                        headers: &held,
+                        body: b"d",
+                    },
+                    NOW,
+                )
+                .expect("a 404 with freshness stores");
+            let MatchOutcome::Hit { status_text, .. } = lookup(&mut cache, URL, &[], NOW) else {
+                panic!("expected a hit");
+            };
+            assert_eq!(status_text.as_deref(), Some(phrase));
+        }
+    }
+
+    /// An answer the cache synthesised (304 here) carries no stored phrase,
+    /// so `Response` supplies its status's default, as upstream's does.
+    #[test]
+    fn synthesised_answers_have_no_reason_phrase_of_their_own() {
+        let mut cache = store();
+        cache
+            .put(
+                SCRIPT,
+                &Namespace::Default,
+                &PutRequest {
+                    method: "GET",
+                    url: URL,
+                    status: 200,
+                    status_text: "",
+                    headers: &headers(&[("cache-control", "max-age=60"), ("etag", "\"v1\"")]),
+                    body: b"body",
+                },
+                NOW,
+            )
+            .expect("stored");
+        let found = lookup(&mut cache, URL, &[("if-none-match", "\"v1\"")], NOW);
+        let MatchOutcome::Hit {
+            status,
+            status_text,
+            ..
+        } = found
+        else {
+            panic!("expected a 304 hit");
+        };
+        assert_eq!(status, 304);
+        assert_eq!(status_text, None);
     }
 
     #[test]
@@ -1351,6 +1434,7 @@ mod tests {
                         method: "GET",
                         url: URL,
                         status: 200,
+                        status_text: "",
                         headers: &held,
                         body,
                     },
@@ -2279,6 +2363,7 @@ mod tests {
                         method: "GET",
                         url: &url,
                         status: 200,
+                        status_text: "",
                         headers: &held,
                         body: b"x",
                     },
@@ -2321,6 +2406,7 @@ mod tests {
                     method: "GET",
                     url: URL,
                     status: 200,
+                    status_text: "",
                     headers: &pairs,
                     body: b"x",
                 },
@@ -2346,6 +2432,7 @@ mod tests {
                     method: "GET",
                     url: URL,
                     status: 200,
+                    status_text: "",
                     headers: &pairs,
                     body: b"x",
                 },
@@ -2439,6 +2526,7 @@ mod tests {
                 method: "GET",
                 url,
                 status: 200,
+                status_text: "",
                 headers: &held,
                 body,
             },

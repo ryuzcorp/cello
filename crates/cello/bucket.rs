@@ -398,6 +398,34 @@ fn is_deploy_key(key: &str) -> bool {
     )
 }
 
+/// The store refused the requested byte range: it starts past the end of
+/// the object, or is a zero-length bounded range. It is a type of its own
+/// so the R2 layer can answer R2's own error code instead of rendering the
+/// store's address (`read dev:///…/objects.sqlite3/…`), which tells a
+/// Worker nothing and leaks the node's state path.
+#[derive(Debug)]
+pub struct RangeNotSatisfiable;
+
+impl std::fmt::Display for RangeNotSatisfiable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("the requested range is not satisfiable")
+    }
+}
+
+impl std::error::Error for RangeNotSatisfiable {}
+
+/// Whether a failed read failed because the range lies outside the object.
+/// The development store reports it as [`RangeNotSatisfiable`]; a real
+/// backend reports the 416 in its own words.
+pub fn is_range_not_satisfiable(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<RangeNotSatisfiable>().is_some()
+            || cause.to_string().contains("not satisfiable")
+            || cause.to_string().contains("Wanted range starting at")
+            || cause.to_string().contains("416")
+    })
+}
+
 /// The byte range a `get` asked for. R2 spells a range four ways and so
 /// does `object_store`, so the request reaches the backend as the caller
 /// wrote it rather than widened to a whole-object read.

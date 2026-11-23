@@ -2885,6 +2885,10 @@ pub struct D1Meta {
     changes: u64,
     changed_db: bool,
     size_after: u64,
+    /// One primary, no retries: a statement either answered or failed. The
+    /// field exists because upstream's `D1Meta` carries it, and a Worker
+    /// instrumenting retries reads `undefined` without it.
+    total_attempts: u32,
     served_by: &'static str,
     served_by_region: &'static str,
     /// One writer, no replicas: every read is served by the primary, and
@@ -2949,6 +2953,19 @@ fn d1_exec_error(message: impl Into<String>) -> D1Failure {
     D1Failure {
         family: "D1_EXEC_ERROR",
         message: message.into(),
+    }
+}
+
+/// Upstream's `exec()` names the input line a failure came from:
+/// `Error in line 1: <line>: <sqlite>`. Its local implementation runs every
+/// line as one query, and reports the first line's number and text whatever
+/// line failed, so this reproduces that shape rather than inventing a better
+/// one a Worker's matcher would not expect.
+fn d1_exec_line(input: &str, failure: D1Failure) -> D1Failure {
+    let line = input.trim().split('\n').next().unwrap_or_default();
+    D1Failure {
+        family: failure.family,
+        message: format!("Error in line 1: {line}: {}", failure.message),
     }
 }
 
@@ -3189,6 +3206,7 @@ unsafe fn d1_step_to_done(
                     database,
                     started_in_transaction,
                     code,
+                    0,
                 ))
             }
         }
@@ -3223,19 +3241,115 @@ fn d1_schema_version(connection: &Connection) -> i64 {
 /// operation prefix, because applications match on it -- upstream reports
 /// `D1_ERROR: no such table: x`, not the name of the internal step that
 /// noticed.
+///
+/// Upstream appends the result code, and the token offset when SQLite knows
+/// one: `near "SELEC": syntax error at offset 0: SQLITE_ERROR`, and
+/// `...: SQLITE_CONSTRAINT (extended: SQLITE_CONSTRAINT_UNIQUE)` when the
+/// extended code says more than the primary. Rendered here, at the one
+/// place every D1 failure passes through, so `prepare()`, `run()` and
+/// `exec()` agree.
 fn d1_sqlite_failure(
     scope: &str,
     database: *mut rusqlite::ffi::sqlite3,
     started_in_transaction: bool,
     result_code: i32,
+    skipped: usize,
 ) -> String {
     let _ = sqlite_operation_failure(scope, database, started_in_transaction, result_code, "d1");
-    // SAFETY: database is the live handle owned by the scope's Connection.
+    // SAFETY: database is the live handle owned by the scope's Connection,
+    // and the error state it holds is read before the statement is finalized.
     unsafe {
-        CStr::from_ptr(rusqlite::ffi::sqlite3_errmsg(database))
+        let message = CStr::from_ptr(rusqlite::ffi::sqlite3_errmsg(database))
             .to_string_lossy()
-            .into_owned()
+            .into_owned();
+        // SQLite counts from the start of the statement text it was given.
+        // Upstream's local engine prepares each statement without the
+        // whitespace a previous one left behind (a newline between two
+        // lines), and reports that offset, so the leading trivia is
+        // discounted here. `skipped` is derived from the bytes actually
+        // prepared.
+        let offset = rusqlite::ffi::sqlite3_error_offset(database);
+        let extended = rusqlite::ffi::sqlite3_extended_errcode(database);
+        let primary = sqlite_code_name(extended & 0xff)
+            .map(str::to_string)
+            .unwrap_or_else(|| (extended & 0xff).to_string());
+        let extended = sqlite_code_name(extended)
+            .filter(|name| Some(*name) != sqlite_code_name(extended & 0xff));
+        let code = match extended {
+            Some(extended) => format!("{primary} (extended: {extended})"),
+            None => primary,
+        };
+        match offset >= 0 {
+            true => format!(
+                "{message} at offset {}: {code}",
+                (offset as usize).saturating_sub(skipped)
+            ),
+            false => format!("{message}: {code}"),
+        }
     }
+}
+
+/// How many leading ASCII whitespace bytes SQLite's parser skips before the
+/// first token. Its error offset counts from the start of the text it was
+/// given, and upstream prepares each statement without the trivia a
+/// previous one left, so this is subtracted to match.
+fn leading_trivia(input: &[u8]) -> usize {
+    input
+        .iter()
+        .take_while(|byte| byte.is_ascii_whitespace())
+        .count()
+}
+
+/// The SQLite result-code name upstream spells, for the codes a D1 error
+/// can carry. An unknown code falls back to its number.
+fn sqlite_code_name(code: i32) -> Option<&'static str> {
+    Some(match code {
+        1 => "SQLITE_ERROR",
+        2 => "SQLITE_INTERNAL",
+        3 => "SQLITE_PERM",
+        4 => "SQLITE_ABORT",
+        5 => "SQLITE_BUSY",
+        6 => "SQLITE_LOCKED",
+        7 => "SQLITE_NOMEM",
+        8 => "SQLITE_READONLY",
+        9 => "SQLITE_INTERRUPT",
+        10 => "SQLITE_IOERR",
+        11 => "SQLITE_CORRUPT",
+        12 => "SQLITE_NOTFOUND",
+        13 => "SQLITE_FULL",
+        14 => "SQLITE_CANTOPEN",
+        15 => "SQLITE_PROTOCOL",
+        16 => "SQLITE_EMPTY",
+        17 => "SQLITE_SCHEMA",
+        18 => "SQLITE_TOOBIG",
+        19 => "SQLITE_CONSTRAINT",
+        20 => "SQLITE_MISMATCH",
+        21 => "SQLITE_MISUSE",
+        22 => "SQLITE_NOLFS",
+        23 => "SQLITE_AUTH",
+        24 => "SQLITE_FORMAT",
+        25 => "SQLITE_RANGE",
+        26 => "SQLITE_NOTADB",
+        27 => "SQLITE_NOTICE",
+        28 => "SQLITE_WARNING",
+        100 => "SQLITE_ROW",
+        101 => "SQLITE_DONE",
+        516 => "SQLITE_ABORT_ROLLBACK",
+        769 => "SQLITE_ERROR_SNAPSHOT",
+        1299 => "SQLITE_CONSTRAINT_NOTNULL",
+        1555 => "SQLITE_CONSTRAINT_PRIMARYKEY",
+        1811 => "SQLITE_CONSTRAINT_TRIGGER",
+        2067 => "SQLITE_CONSTRAINT_UNIQUE",
+        2323 => "SQLITE_CONSTRAINT_VTAB",
+        2579 => "SQLITE_CONSTRAINT_ROWID",
+        275 => "SQLITE_CONSTRAINT_CHECK",
+        531 => "SQLITE_CONSTRAINT_COMMITHOOK",
+        787 => "SQLITE_CONSTRAINT_FOREIGNKEY",
+        1043 => "SQLITE_CONSTRAINT_FUNCTION",
+        2835 => "SQLITE_CONSTRAINT_PINNED",
+        3091 => "SQLITE_CONSTRAINT_DATATYPE",
+        _ => return None,
+    })
 }
 
 /// Whether `tail` holds another statement. Trivia -- whitespace and comments,
@@ -3261,6 +3375,23 @@ unsafe fn d1_tail_has_statement(
     prepare != rusqlite::ffi::SQLITE_OK
 }
 
+/// How one exec-style run treats input that prepared nothing, and a tail
+/// SQLite could not parse.
+#[derive(Clone, Copy)]
+struct D1RunPolicy {
+    /// Refuse input that prepared nothing at all -- an empty string, only
+    /// comments, only semicolons -- with upstream's
+    /// `No SQL statements detected.`, which is what `exec()` answers. A
+    /// migration file may legitimately hold nothing, so it passes `false`.
+    require_statements: bool,
+    /// Keep the loud "ends in an incomplete statement" diagnosis for a
+    /// migration, where a truncated file once recorded itself as applied.
+    /// `exec()` reports whatever SQLite says -- a syntax error, an
+    /// unrecognized token -- because upstream does, and a Worker debugging
+    /// SQL should see the statement it broke, not a guess about a cut.
+    refuse_incomplete: bool,
+}
+
 /// The count and rows of an exec-style run over `source`. On success the
 /// whole source ran; the caller owns any surrounding transaction.
 unsafe fn d1_run_statements(
@@ -3270,6 +3401,7 @@ unsafe fn d1_run_statements(
     input: &str,
     keep_rows: bool,
     failure: fn(String) -> D1Failure,
+    policy: D1RunPolicy,
 ) -> Result<(u64, Vec<D1Rows>), D1Failure> {
     let database = connection.handle();
     let started_in_transaction = rusqlite::ffi::sqlite3_get_autocommit(database) == 0;
@@ -3291,14 +3423,18 @@ unsafe fn d1_run_statements(
             // whatever syntax error the cut happened to produce, because the
             // statements before it have already run and the operator needs
             // to know work was dropped, not to parse SQLite's guess.
-            if rusqlite::ffi::sqlite3_complete(source_ptr) == 0 {
+            if policy.refuse_incomplete && rusqlite::ffi::sqlite3_complete(source_ptr) == 0 {
                 return Err(failure(D1_INCOMPLETE.to_string()));
             }
+            // SAFETY: `source_ptr` points inside the C string `source`
+            // holds for the whole walk.
+            let skipped = leading_trivia(CStr::from_ptr(source_ptr).to_bytes());
             return Err(failure(d1_sqlite_failure(
                 scope,
                 database,
                 started_in_transaction,
                 prepare,
+                skipped,
             )));
         }
         if statement.is_null() {
@@ -3307,6 +3443,9 @@ unsafe fn d1_run_statements(
             // is whole, not a stream, so a final statement without its
             // semicolon is a statement, not a fragment (upstream runs
             // `exec("select 1")`).
+            if count == 0 && policy.require_statements {
+                return Err(failure("No SQL statements detected.".to_string()));
+            }
             return Ok((count, results));
         }
         let offset = tail.offset_from(source.as_ptr()) as usize;
@@ -3376,6 +3515,7 @@ unsafe fn d1_run_prepared(
             database,
             started_in_transaction,
             prepare,
+            leading_trivia(sql.as_bytes()),
         )));
     }
     if statement.is_null() {
@@ -3396,7 +3536,13 @@ unsafe fn d1_run_prepared(
     }
     for (offset, value) in binds.iter().enumerate() {
         if let Err(code) = bind_cursor_value(statement, offset as i32 + 1, value) {
-            let failure = d1_sqlite_failure(scope, database, started_in_transaction, code);
+            let failure = d1_sqlite_failure(
+                scope,
+                database,
+                started_in_transaction,
+                code,
+                leading_trivia(sql.as_bytes()),
+            );
             rusqlite::ffi::sqlite3_finalize(statement);
             return Err(d1_error(failure));
         }
@@ -3439,6 +3585,7 @@ unsafe fn d1_run_prepared(
             changes,
             changed_db,
             size_after: d1_database_size(connection),
+            total_attempts: 1,
             served_by: "cello",
             served_by_region: "local",
             served_by_primary: true,
@@ -4518,7 +4665,18 @@ pub fn d1_run(scope: &str, request: &D1Request) -> Result<D1Response, D1Failure>
                     // SAFETY: the connection lives in DBS until close();
                     // every prepared statement is finalized on all paths.
                     unsafe {
-                        d1_run_statements(scope, connection, &source, sql, *rows, d1_exec_error)
+                        d1_run_statements(
+                            scope,
+                            connection,
+                            &source,
+                            sql,
+                            *rows,
+                            d1_exec_error,
+                            D1RunPolicy {
+                                require_statements: true,
+                                refuse_incomplete: false,
+                            },
+                        )
                     }
                 });
                 match ran {
@@ -4544,7 +4702,7 @@ pub fn d1_run(scope: &str, request: &D1Request) -> Result<D1Response, D1Failure>
                                 d1_exec_error,
                             );
                         }
-                        Err(failure)
+                        Err(d1_exec_line(sql, failure))
                     }
                 }
             })
@@ -4578,7 +4736,18 @@ pub fn d1_run(scope: &str, request: &D1Request) -> Result<D1Response, D1Failure>
                 let applied = as_user_sql(|| {
                     // SAFETY: as for the exec mode above.
                     let (count, _) = unsafe {
-                        d1_run_statements(scope, connection, &source, sql, false, d1_error)
+                        d1_run_statements(
+                            scope,
+                            connection,
+                            &source,
+                            sql,
+                            false,
+                            d1_error,
+                            D1RunPolicy {
+                                require_statements: false,
+                                refuse_incomplete: true,
+                            },
+                        )
                     }?;
                     // The bookkeeping row rides the same transaction. The
                     // name is a bound parameter, so a file name never
@@ -7803,6 +7972,145 @@ mod bytes_key_tests {
         for key in [BYTES_KEY, LEGACY_BYTES_KEY] {
             let v = serde_json::json!({ key: [1, 2, 255] });
             assert_eq!(json_to_sql(&v), Value::Blob(vec![1, 2, 255]), "{key}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod d1_exec_error_tests {
+    use super::d1_test_db::TestDb;
+    use super::*;
+
+    fn exec(db: &TestDb, sql: &str) -> Result<D1Response, D1Failure> {
+        d1_run(
+            &db.scope,
+            &D1Request::Exec {
+                sql: sql.to_string(),
+                rows: false,
+            },
+        )
+    }
+
+    fn exec_message(db: &TestDb, sql: &str) -> String {
+        match exec(db, sql) {
+            Ok(_) => panic!("expected {sql:?} to fail"),
+            Err(failure) => {
+                assert_eq!(failure.family, "D1_EXEC_ERROR");
+                failure.message
+            }
+        }
+    }
+
+    /// An empty statement set is an error, not a successful no-op, and the
+    /// message names the line the way upstream's does. Whitespace,
+    /// semicolons and comments are all "no statements".
+    #[test]
+    fn exec_refuses_an_empty_statement_set() {
+        let db = TestDb::open("exec-empty");
+        for (sql, line) in [
+            ("", ""),
+            ("   \n\t", ""),
+            (";", ";"),
+            (";;", ";;"),
+            ("-- nothing", "-- nothing"),
+            ("/* hi */", "/* hi */"),
+        ] {
+            let message = exec_message(&db, sql);
+            assert_eq!(
+                message,
+                format!("Error in line 1: {line}: No SQL statements detected."),
+                "input {sql:?}"
+            );
+        }
+    }
+
+    /// An invalid statement is reported as SQLite's syntax error, with the
+    /// token offset and the result code, not as an "incomplete statement".
+    #[test]
+    fn exec_reports_the_sqlite_syntax_error() {
+        let db = TestDb::open("exec-syntax");
+        assert_eq!(
+            exec_message(&db, "NOT SQL AT ALL"),
+            "Error in line 1: NOT SQL AT ALL: near \"NOT\": syntax error at offset 0: SQLITE_ERROR"
+        );
+        assert_eq!(
+            exec_message(&db, "SELECT 'x"),
+            "Error in line 1: SELECT 'x: unrecognized token: \"'x\" at offset 7: SQLITE_ERROR"
+        );
+        assert_eq!(
+            exec_message(&db, "SELECT (1"),
+            "Error in line 1: SELECT (1: incomplete input: SQLITE_ERROR"
+        );
+    }
+
+    /// Upstream's local `exec` names line 1 and the first line of the
+    /// input whatever line actually failed; a Worker matching the message
+    /// must see the same thing here.
+    #[test]
+    fn exec_names_the_first_line_of_the_input() {
+        let db = TestDb::open("exec-lines");
+        assert_eq!(
+            exec_message(&db, "SELECT 1;\nSELEC 2"),
+            "Error in line 1: SELECT 1;: near \"SELEC\": syntax error at offset 0: SQLITE_ERROR"
+        );
+        // The trimmed first line is the reported one.
+        assert_eq!(
+            exec_message(&db, "\nSELEC 2"),
+            "Error in line 1: SELEC 2: near \"SELEC\": syntax error at offset 0: SQLITE_ERROR"
+        );
+    }
+
+    /// A runtime failure carries the extended constraint code, as
+    /// upstream's message does.
+    #[test]
+    fn exec_reports_the_extended_result_code() {
+        let db = TestDb::open("exec-codes");
+        db.exec("CREATE TABLE u (id INTEGER PRIMARY KEY, v TEXT UNIQUE)");
+        db.exec("INSERT INTO u (id, v) VALUES (1, 'a')");
+        assert_eq!(
+            exec_message(&db, "INSERT INTO u (id, v) VALUES (2, 'a')"),
+            "Error in line 1: INSERT INTO u (id, v) VALUES (2, 'a'): UNIQUE constraint failed: u.v: SQLITE_CONSTRAINT (extended: SQLITE_CONSTRAINT_UNIQUE)"
+        );
+    }
+
+    /// A `prepare()` failure uses the same detail, under `D1_ERROR`.
+    #[test]
+    fn prepared_reports_offset_and_code() {
+        let db = TestDb::open("prepare-syntax");
+        match d1_run(
+            &db.scope,
+            &D1Request::Prepared {
+                sql: "SELEC 1".to_string(),
+                params: Vec::new(),
+                first: false,
+            },
+        ) {
+            Err(failure) => {
+                assert_eq!(failure.family, "D1_ERROR");
+                assert_eq!(
+                    failure.message,
+                    "near \"SELEC\": syntax error at offset 0: SQLITE_ERROR"
+                );
+            }
+            Ok(_) => panic!("expected a syntax error"),
+        }
+    }
+
+    /// `meta.total_attempts` is part of upstream's `D1Meta`.
+    #[test]
+    fn meta_reports_total_attempts() {
+        let db = TestDb::open("meta-attempts");
+        db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY)");
+        match d1_run(
+            &db.scope,
+            &D1Request::Prepared {
+                sql: "INSERT INTO t (id) VALUES (1)".to_string(),
+                params: Vec::new(),
+                first: false,
+            },
+        ) {
+            Ok(D1Response::Prepared(result)) => assert_eq!(result.meta.total_attempts, 1),
+            _ => panic!("expected a prepared result"),
         }
     }
 }

@@ -15,6 +15,7 @@ use futures_util::future::BoxFuture;
 use futures_util::stream::{self, BoxStream};
 use futures_util::FutureExt as _;
 use futures_util::StreamExt as _;
+use md5::Digest as _;
 use object_store::list::{PaginatedListOptions, PaginatedListResult, PaginatedListStore};
 use object_store::path::Path;
 use object_store::{
@@ -62,6 +63,10 @@ struct PutRequest {
     key: String,
     body: Bytes,
     options: PutOptions,
+    /// The ETag the caller has already computed, for a multipart completion
+    /// whose parts are hashed as they arrive. A single-request write leaves
+    /// it unset and the store hashes the body.
+    etag: Option<String>,
     modified_ms: i64,
     reply: oneshot::Sender<object_store::Result<PutResult>>,
 }
@@ -76,7 +81,15 @@ struct StoredObject {
     key: String,
     body: Vec<u8>,
     size: u64,
-    etag: i64,
+    /// The object's content ETag (its MD5 for a single-part write), which
+    /// is what R2 reports as `etag`. Before 0.2.9 the store had no content
+    /// ETag at all; [`content_etag`] reads such a row's old sequence number
+    /// as text rather than re-reading its body.
+    etag: String,
+    /// The store's unique id for the version that wrote the row. It is the
+    /// write sequence, never the content: two writes of the same bytes are
+    /// two versions with one etag.
+    version: String,
     modified_ms: i64,
     attributes: String,
 }
@@ -95,12 +108,41 @@ impl StoredObject {
         Ok(StoredObject {
             key: row.get(0)?,
             body: row.get(1)?,
-            size: row.get(5)?,
-            etag: row.get(2)?,
-            modified_ms: row.get(3)?,
-            attributes: row.get(4)?,
+            size: row.get(7)?,
+            etag: content_etag(row, 2, 3)?,
+            version: stored_version(row, 4, 2)?,
+            modified_ms: row.get(5)?,
+            attributes: row.get(6)?,
         })
     }
+}
+
+/// The content ETag a row carries: the MD5 a 0.2.9-or-later write stored,
+/// or the legacy sequence number a pre-0.2.9 write stored, as text.
+fn content_etag(row: &rusqlite::Row<'_>, legacy: usize, md5: usize) -> rusqlite::Result<String> {
+    if let Some(etag) = row.get::<_, Option<String>>(md5)? {
+        return Ok(etag);
+    }
+    Ok(row
+        .get::<_, Option<i64>>(legacy)?
+        .unwrap_or_default()
+        .to_string())
+}
+
+/// The write id a row carries. A row an older store wrote has none of its
+/// own, and its old etag (the sequence that named the write) fills in.
+fn stored_version(
+    row: &rusqlite::Row<'_>,
+    version: usize,
+    legacy: usize,
+) -> rusqlite::Result<String> {
+    if let Some(version) = row.get::<_, Option<String>>(version)? {
+        return Ok(version);
+    }
+    Ok(row
+        .get::<_, Option<i64>>(legacy)?
+        .unwrap_or_default()
+        .to_string())
 }
 
 /// The exclusive upper bound of a byte-prefix range: the prefix with its
@@ -128,10 +170,12 @@ fn listing_sql(bounded: bool) -> &'static str {
         // would compare by storage class (every TEXT sorts before
         // any BLOB) and filter nothing, while the CAST text
         // compares byte-wise under BINARY collation.
-        "SELECT key, CAST(X'' AS BLOB), etag, modified_ms, attributes, length(body)
+        "SELECT key, CAST(X'' AS BLOB), etag, etag_md5, version, modified_ms,
+                attributes, length(body)
          FROM objects WHERE key >= ?1 AND key < CAST(?2 AS TEXT) ORDER BY key"
     } else {
-        "SELECT key, CAST(X'' AS BLOB), etag, modified_ms, attributes, length(body)
+        "SELECT key, CAST(X'' AS BLOB), etag, etag_md5, version, modified_ms,
+                attributes, length(body)
          FROM objects WHERE key >= ?1 ORDER BY key"
     }
 }
@@ -166,7 +210,13 @@ impl LocalStore {
                 "CREATE TABLE IF NOT EXISTS objects (
                    key TEXT PRIMARY KEY,
                    body BLOB NOT NULL,
-                   etag INTEGER NOT NULL,
+                   -- The pre-0.2.9 write sequence, which was also the etag.
+                   -- A row written since carries its content etag in
+                   -- `etag_md5` and only this sequence here, to satisfy the
+                   -- NOT NULL an upgraded table still declares.
+                   etag INTEGER,
+                   etag_md5 TEXT,
+                   version TEXT,
                    modified_ms INTEGER NOT NULL,
                    attributes TEXT NOT NULL
                  );
@@ -174,16 +224,10 @@ impl LocalStore {
                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                    next_etag INTEGER NOT NULL
                  );
-                 INSERT OR IGNORE INTO store_sequence(singleton, next_etag) VALUES (1, 1);
-                 -- The listing query below selects exactly these columns, so
-                 -- the store answers a LIST from this index without touching
-                 -- a row's overflow pages. Without it every listing reads
-                 -- the whole file, because `etag` and friends sit behind
-                 -- `body` in the row.
-                 CREATE INDEX IF NOT EXISTS objects_listing
-                   ON objects(key, etag, modified_ms, attributes, length(body));",
+                 INSERT OR IGNORE INTO store_sequence(singleton, next_etag) VALUES (1, 1);",
             )
             .map_err(db_error)?;
+        upgrade_schema(&connection)?;
         Ok(store)
     }
 
@@ -196,17 +240,19 @@ impl LocalStore {
     fn read(&self, key: &str) -> object_store::Result<StoredObject> {
         self.connect()?
             .query_row(
-                "SELECT key, body, etag, modified_ms, attributes, length(body)
+                "SELECT key, body, etag, etag_md5, version, modified_ms, attributes,
+                        length(body)
                  FROM objects WHERE key = ?1",
                 [key],
                 |row| {
                     Ok(StoredObject {
                         key: row.get(0)?,
                         body: row.get(1)?,
-                        size: row.get(5)?,
-                        etag: row.get(2)?,
-                        modified_ms: row.get(3)?,
-                        attributes: row.get(4)?,
+                        size: row.get(7)?,
+                        etag: content_etag(row, 2, 3)?,
+                        version: stored_version(row, 4, 2)?,
+                        modified_ms: row.get(5)?,
+                        attributes: row.get(6)?,
                     })
                 },
             )
@@ -242,13 +288,21 @@ impl LocalStore {
         key: String,
         body: Bytes,
         options: PutOptions,
+        etag: Option<String>,
     ) -> object_store::Result<PutResult> {
         let modified_ms = crate::asyncrt::wall_ms();
         let mut connection = self.connect()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(db_error)?;
-        let result = apply_put(&transaction, &key, &body, &options, modified_ms)?;
+        let result = apply_put(
+            &transaction,
+            &key,
+            &body,
+            etag.as_deref(),
+            &options,
+            modified_ms,
+        )?;
         transaction.commit().map_err(db_error)?;
         Ok(result)
     }
@@ -258,18 +312,26 @@ impl LocalStore {
 /// conditional check, the ETag draw, and the upsert. Shared by the
 /// single-PUT path and the writer thread's batches so both enforce the same
 /// conflict rule.
+///
+/// `etag` carries a content hash the caller already computed (a multipart
+/// completion's `md5(md5s)-N`); a plain write leaves it unset and the body
+/// is hashed here. Either way the row's `version` is the store's own
+/// sequence, so two identical writes share an etag and not a version.
 fn apply_put(
     transaction: &Transaction,
     key: &str,
     body: &[u8],
+    etag: Option<&str>,
     options: &PutOptions,
     modified_ms: i64,
 ) -> object_store::Result<PutResult> {
     let attributes = encode_attributes(&options.attributes)?;
     let current = transaction
-        .query_row("SELECT etag FROM objects WHERE key = ?1", [key], |row| {
-            row.get::<_, i64>(0)
-        })
+        .query_row(
+            "SELECT etag, etag_md5 FROM objects WHERE key = ?1",
+            [key],
+            |row| content_etag(row, 0, 1),
+        )
         .optional()
         .map_err(db_error)?;
     match &options.mode {
@@ -277,35 +339,67 @@ fn apply_put(
         PutMode::Create if current.is_some() => return Err(already_exists(key)),
         PutMode::Create => {}
         PutMode::Update(version) => {
-            let current = current.map(|etag| etag.to_string());
             if current.as_deref().is_none() || version.e_tag.as_deref() != current.as_deref() {
                 return Err(precondition(key));
             }
         }
     }
-    let etag = transaction
+    let etag = match etag {
+        Some(etag) => etag.to_string(),
+        None => content_md5(body),
+    };
+    let version = transaction
         .query_row(
             "UPDATE store_sequence SET next_etag = next_etag + 1
              WHERE singleton = 1 RETURNING next_etag - 1",
             [],
             |row| row.get::<_, i64>(0),
         )
-        .map_err(db_error)?;
+        .map_err(db_error)?
+        .to_string();
     transaction
         .execute(
-            "INSERT INTO objects(key, body, etag, modified_ms, attributes)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO objects(key, body, etag, etag_md5, version, modified_ms, attributes)
+             VALUES (?1, ?2, CAST(?4 AS INTEGER), ?3, ?4, ?5, ?6)
              ON CONFLICT(key) DO UPDATE SET
                body = excluded.body,
                etag = excluded.etag,
+               etag_md5 = excluded.etag_md5,
+               version = excluded.version,
                modified_ms = excluded.modified_ms,
                attributes = excluded.attributes",
-            params![key, body, etag, modified_ms, attributes],
+            params![key, body, etag, version, modified_ms, attributes],
         )
         .map_err(db_error)?;
     Ok(PutResult {
-        e_tag: Some(etag.to_string()),
-        version: None,
+        e_tag: Some(etag),
+        version: Some(version),
+    })
+}
+
+/// The content ETag R2 reports for a single-request write: the lowercase
+/// hex MD5 of its bytes.
+fn content_md5(body: &[u8]) -> String {
+    hex(&md5::Md5::digest(body))
+}
+
+/// The ETag R2 reports for a multipart upload: the MD5 of the concatenated
+/// per-part MD5s, suffixed with the part count and a dash. S3 computes the
+/// same value for a real bucket.
+fn multipart_etag<'a>(parts: impl IntoIterator<Item = &'a Bytes>) -> String {
+    let mut combined = md5::Md5::new();
+    let mut count = 0usize;
+    for part in parts {
+        combined.update(md5::Md5::digest(part));
+        count += 1;
+    }
+    format!("{}-{count}", hex(&combined.finalize()))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().fold(String::new(), |mut out, byte| {
+        out.push_str(&format!("{byte:02x}"));
+        out
     })
 }
 
@@ -379,6 +473,7 @@ fn apply_batch(
                 &transaction,
                 &request.key,
                 &request.body,
+                request.etag.as_deref(),
                 &request.options,
                 request.modified_ms,
             );
@@ -420,9 +515,76 @@ impl LocalStore {
                 attributes,
                 ..PutOptions::default()
             },
+            None,
         )?;
         Ok(())
     }
+}
+
+/// Bring a database an earlier dev store wrote to the current shape.
+///
+/// Before 0.2.9 `etag` held the store's write sequence as an INTEGER and
+/// there was no `version` column, so one number served as both. Two columns
+/// are added: `etag_md5` for the content ETag, and `version` for the write
+/// id. A row written then keeps its sequence — inventing an MD5 would mean
+/// reading every body, and a condition a caller holds matches what the row
+/// carries either way — as its etag and takes that number as its version.
+/// Only a rewrite earns the content MD5. No schema version is stamped: the
+/// columns' presence says whether the work is done.
+fn upgrade_schema(connection: &Connection) -> object_store::Result<()> {
+    let has_version: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM pragma_table_info('objects') WHERE name = 'version'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if has_version == 0 {
+        connection
+            .execute_batch("ALTER TABLE objects ADD COLUMN version TEXT")
+            .map_err(db_error)?;
+    }
+    let has_md5: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM pragma_table_info('objects') WHERE name = 'etag_md5'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if has_md5 == 0 {
+        connection
+            .execute_batch("ALTER TABLE objects ADD COLUMN etag_md5 TEXT")
+            .map_err(db_error)?;
+    }
+    // A row an earlier store wrote keeps its sequence as the etag a caller
+    // may already hold; inventing an MD5 would mean reading every body. The
+    // sequence also becomes the version, so the write still has an id. The
+    // row earns a content MD5 the next time it is written.
+    connection
+        .execute_batch("UPDATE objects SET version = CAST(etag AS TEXT) WHERE version IS NULL;")
+        .map_err(db_error)?;
+    // The listing query selects exactly these columns, so the store answers
+    // a LIST from this index without touching a row's overflow pages. The
+    // 0.2.8 index lacks `version`; replacing it is a one-time migration, not
+    // a per-boot rewrite.
+    let indexed_version: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM pragma_index_info('objects_listing') WHERE name = 'version'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if indexed_version == 0 {
+        connection
+            .execute_batch(
+                "DROP INDEX IF EXISTS objects_listing;
+                 CREATE INDEX objects_listing
+                   ON objects(key, etag, etag_md5, version, modified_ms,
+                              attributes, length(body));",
+            )
+            .map_err(db_error)?;
+    }
+    Ok(())
 }
 
 fn configure_connection(connection: &Connection) -> object_store::Result<()> {
@@ -443,19 +605,21 @@ impl fmt::Display for LocalStore {
     }
 }
 
-#[async_trait]
-impl ObjectStore for LocalStore {
-    async fn put_opts(
+impl LocalStore {
+    /// Enqueue one write, optionally with an ETag the caller computed.
+    async fn put_opts_with_etag(
         &self,
         location: &Path,
         payload: PutPayload,
         options: PutOptions,
+        etag: Option<String>,
     ) -> object_store::Result<PutResult> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let request = PutRequest {
             key: location.to_string(),
             body: payload.into(),
             options,
+            etag,
             modified_ms: crate::asyncrt::wall_ms(),
             reply: reply_tx,
         };
@@ -467,7 +631,7 @@ impl ObjectStore for LocalStore {
             let request = failed.0;
             let store = self.clone();
             return crate::asyncrt::blocking(move || {
-                store.put_sync(request.key, request.body, request.options)
+                store.put_sync(request.key, request.body, request.options, request.etag)
             })
             .await
             .map_err(db_error)?;
@@ -475,6 +639,19 @@ impl ObjectStore for LocalStore {
         reply_rx
             .await
             .map_err(|_| message_error("dev store writer stopped"))?
+    }
+}
+
+#[async_trait]
+impl ObjectStore for LocalStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        options: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.put_opts_with_etag(location, payload, options, None)
+            .await
     }
 
     async fn put_multipart_opts(
@@ -504,7 +681,12 @@ impl ObjectStore for LocalStore {
         options.check_preconditions(&meta)?;
         let full = 0..object.body.len() as u64;
         let range = match options.range {
-            Some(range) => range.as_range(full.end).map_err(db_error)?,
+            // A range outside the object is a type of its own, so the R2
+            // layer can answer R2's `(10039)` rather than a developer path.
+            Some(range) => range.as_range(full.end).map_err(|_| Error::Generic {
+                store: STORE,
+                source: Box::new(crate::bucket::RangeNotSatisfiable),
+            })?,
             None => full,
         };
         let body = Bytes::from(object.body).slice(range.start as usize..range.end as usize);
@@ -674,19 +856,25 @@ impl MultipartUpload for LocalUpload {
 
     async fn complete(&mut self) -> object_store::Result<PutResult> {
         let parts = std::mem::take(&mut *self.parts.lock().unwrap());
+        // A multipart object's ETag is `md5(md5s)-N`, not the MD5 of the
+        // assembled bytes: R2 and S3 both name a multipart upload that way,
+        // and a store that only hashed the body would disagree with a
+        // deployed node for the same object.
+        let etag = multipart_etag(&parts);
         let bytes = parts.iter().map(Bytes::len).sum();
         let mut body = Vec::with_capacity(bytes);
-        for part in parts {
-            body.extend_from_slice(&part);
+        for part in &parts {
+            body.extend_from_slice(part);
         }
         self.store
-            .put_opts(
+            .put_opts_with_etag(
                 &self.location,
                 body.into(),
                 PutOptions {
                     attributes: self.attributes.clone(),
                     ..PutOptions::default()
                 },
+                Some(etag),
             )
             .await
     }
@@ -705,8 +893,8 @@ fn object_meta(object: &StoredObject) -> object_store::Result<ObjectMeta> {
         location: stored_location(&object.key)?,
         last_modified: modified.into(),
         size: object.size,
-        e_tag: Some(object.etag.to_string()),
-        version: None,
+        e_tag: Some(object.etag.clone()),
+        version: Some(object.version.clone()),
     })
 }
 
@@ -923,6 +1111,7 @@ mod tests {
             key: key.to_string(),
             body: Bytes::from(body.to_vec()),
             options,
+            etag: None,
             modified_ms: 1,
             reply: oneshot::channel().0,
         };
@@ -1024,6 +1213,7 @@ mod tests {
                 key.to_string(),
                 bytes::Bytes::from(vec![b'x'; body_len]),
                 PutOptions::default(),
+                None,
             )
             .unwrap();
     }
@@ -1104,5 +1294,151 @@ mod tests {
                 .any(|step| step.contains("SEARCH") && step.contains("objects_listing")),
             "the empty-prefix listing must seek the covering index too: {plan:?}"
         );
+    }
+
+    /// R2's `etag` is the object's content hash and its `version` is a
+    /// write id. The dev store used to hand out one sequence number for
+    /// both, so identical bytes under two keys answered different etags
+    /// and the same etag could never revalidate a cached copy.
+    #[test]
+    fn etag_is_the_content_md5_and_version_names_the_write() {
+        use md5::Digest as _;
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let (_dir, store) = open_store();
+            let first = store
+                .put_opts(
+                    &"etag/first".to_string().into(),
+                    PutPayload::from(Bytes::from_static(b"abc")),
+                    PutOptions::default(),
+                )
+                .await
+                .unwrap();
+            let second = store
+                .put_opts(
+                    &"etag/second".to_string().into(),
+                    PutPayload::from(Bytes::from_static(b"abc")),
+                    PutOptions::default(),
+                )
+                .await
+                .unwrap();
+            let md5 = hex(&md5::Md5::digest(b"abc"));
+            assert_eq!(md5, "900150983cd24fb0d6963f7d28e17f72");
+            assert_eq!(first.e_tag.as_deref(), Some(md5.as_str()));
+            assert_eq!(
+                second.e_tag.as_deref(),
+                Some(md5.as_str()),
+                "identical bytes answer one content etag, whatever the key"
+            );
+            assert_ne!(
+                first.version, second.version,
+                "each write is its own version"
+            );
+            let head = store.head(&"etag/first".to_string().into()).await.unwrap();
+            assert_eq!(head.e_tag.as_deref(), Some(md5.as_str()));
+            assert_eq!(
+                head.version.as_deref(),
+                first.version.as_deref(),
+                "the version read back is the one the write answered"
+            );
+        });
+    }
+
+    /// A multipart object's etag is `md5(md5(part)…)-N`, as R2 and S3
+    /// compute it, not the md5 of the assembled bytes.
+    #[test]
+    fn multipart_etag_is_the_md5_of_part_md5s() {
+        use md5::Digest as _;
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let (_dir, store) = open_store();
+            let parts: [&[u8]; 2] = [b"first-part", b"second"];
+            let mut upload = store
+                .put_multipart_opts(
+                    &"mp/object".to_string().into(),
+                    PutMultipartOptions::default(),
+                )
+                .await
+                .unwrap();
+            for part in parts {
+                upload
+                    .put_part(PutPayload::from(Bytes::from_static(part)))
+                    .await
+                    .unwrap();
+            }
+            let result = upload.complete().await.unwrap();
+            let mut combined = md5::Md5::new();
+            for part in parts {
+                combined.update(md5::Md5::digest(part));
+            }
+            let expected = format!("{}-2", hex(&combined.finalize()));
+            assert_eq!(result.e_tag.as_deref(), Some(expected.as_str()));
+            assert!(
+                result.version.is_some(),
+                "a multipart write still names its version"
+            );
+        });
+    }
+
+    /// A row the pre-0.2.9 store wrote carries its old sequence as its
+    /// etag. Opening must not read every body to invent an md5: the row
+    /// keeps the etag a caller already holds, gains that value as its
+    /// version, and earns a content md5 only when it is rewritten.
+    #[test]
+    fn pre_md5_rows_keep_their_etag_and_gain_a_version() {
+        use md5::Digest as _;
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("objects.sqlite3");
+        {
+            let connection = Connection::open(&database).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE objects (
+                       key TEXT PRIMARY KEY,
+                       body BLOB NOT NULL,
+                       etag INTEGER NOT NULL,
+                       modified_ms INTEGER NOT NULL,
+                       attributes TEXT NOT NULL
+                     );
+                     CREATE TABLE store_sequence (
+                       singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                       next_etag INTEGER NOT NULL
+                     );
+                     INSERT INTO store_sequence(singleton, next_etag) VALUES (1, 8);
+                     INSERT INTO objects(key, body, etag, modified_ms, attributes)
+                       VALUES ('old', X'616263', 7, 1000, '[]');",
+                )
+                .unwrap();
+        }
+        let store = LocalStore::open(&database).unwrap();
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let location: Path = "old".to_string().into();
+            let head = store.head(&location).await.unwrap();
+            assert_eq!(head.e_tag.as_deref(), Some("7"));
+            assert_eq!(head.version.as_deref(), Some("7"));
+            // The old etag still satisfies a conditional update.
+            store
+                .put_opts(
+                    &location,
+                    PutPayload::from(Bytes::from_static(b"abc")),
+                    put_mode(PutMode::Update(UpdateVersion {
+                        e_tag: Some("7".to_string()),
+                        version: None,
+                    })),
+                )
+                .await
+                .expect("an update on the row's own etag lands");
+            let rewritten = store.head(&location).await.unwrap();
+            assert_eq!(
+                rewritten.e_tag.as_deref(),
+                Some(hex(&md5::Md5::digest(b"abc")).as_str())
+            );
+            assert_ne!(
+                rewritten.version.as_deref(),
+                Some("7"),
+                "the rewrite takes the next write id, not the old one"
+            );
+        });
     }
 }

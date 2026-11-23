@@ -139,9 +139,11 @@ function waitListening(addr) {
 /** Boots workerd for the fixture; resolves with its address and a stop hook. */
 async function bootWorkerd(dir) {
   // A fixture that needs an instance-only service (the Cache API's backend,
-  // which a deployment config cannot define) ships a `workerd.capnp` and is
-  // booted from it; such services are experimental. Every other fixture uses
-  // the `wrangler.json` both runtimes share.
+  // which a deployment config cannot define) ships a `workerd.capnp`. Binding
+  // fixtures -- `kv_namespaces`, `r2_buckets`, `d1_databases`,
+  // `durable_objects`, `queues` -- need `--experimental` for `wrangler.json`
+  // too, because workerd refuses those keys without it. Passing the flag for
+  // every fixture is harmless for the ones that declare nothing.
   const instanceConfig = join(dir, "workerd.capnp");
   const fromInstanceConfig = existsSync(instanceConfig);
   const child = spawn(
@@ -151,7 +153,7 @@ async function bootWorkerd(dir) {
       fromInstanceConfig ? "workerd.capnp" : "wrangler.json",
       "-s", "http=127.0.0.1:0",
       "--control-fd", "3",
-      ...(fromInstanceConfig ? ["--experimental"] : []),
+      "--experimental",
     ],
     { cwd: dir, stdio: ["ignore", "ignore", "pipe", "pipe"] },
   );
