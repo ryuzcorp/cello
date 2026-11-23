@@ -209,6 +209,7 @@ export const cases = [
   { name: "request-body-used-incoming-post", fixture: "fetchapi", requests: [{ method: "POST", path: "/request/body-used-incoming", body: ["hello"] }] },
   { name: "issue-blob-body-content-type", fixture: "fetchapi", path: "/issue/blob-body-content-type" },
   { name: "issue-header-latin1", fixture: "fetchapi", path: "/issue/header-latin1" },
+  { name: "issue-null-body-zero-length", fixture: "fetchapi", path: "/issue/null-body-zero-length" },
   // These three agreed once #140/#142's body-presence rules landed on main
   // (#174's body stream); the rest of the sweep's `issue-*` replicas stay out
   // until their own slices pass.

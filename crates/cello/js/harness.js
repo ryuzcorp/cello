@@ -598,8 +598,10 @@ globalThis.Response = class Response {
     // buffers must stay header-free, so they are excluded here -- by internal
     // slot, not `instanceof` -- as is every body that became a stream or
     // carries its own type.
+    // A null-body status never infers a type: workerd reports no body at all
+    // for one, so `new Response("", {status: 204})` carries no `content-type`.
     if (body != null && stream === null && typed === null &&
-        __bodyChunkKind(body) === 0 &&
+        __bodyChunkKind(body) === 0 && !__nullBodyStatus(status) &&
         !this.headers.has("content-type"))
       this.headers.set("content-type", "text/plain;charset=UTF-8");
     // A null-body status refuses a body. Workerd allows a zero-length
@@ -611,6 +613,13 @@ globalThis.Response = class Response {
       throw new TypeError(
         "Response with null body status (101, 204, 205, or 304) cannot " +
         "have a body.");
+    // Workerd accepts such a body and then reports none: `body === null` and
+    // an empty read. Keep that shape so a zero-length body is
+    // indistinguishable from an absent one, as on Cloudflare.
+    if (__nullBodyStatus(status) && body != null) {
+      this._bodyBytes = new Uint8Array(0);
+      this.body = null;
+    }
     this.webSocket = webSocket;
     this._wsTarget = wsTarget;
     this.ok = this.status >= 200 && this.status <= 299;

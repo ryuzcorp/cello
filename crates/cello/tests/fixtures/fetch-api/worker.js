@@ -88,6 +88,29 @@ const routes = {
     })(),
   }),
 
+  // #165: a zero-length buffered body on a null-body status becomes no body
+  // at all, exactly like an absent one, and so infers no content-type.
+  "/response/null-body-zero-length": async () => {
+    const build = async (body, init = {}) => {
+      const response = new Response(body, { status: 204, ...init });
+      return {
+        status: response.status,
+        bodyIsNull: response.body === null,
+        headers: [...response.headers],
+        text: await response.text(),
+        bodyUsed: response.bodyUsed,
+      };
+    };
+    return {
+      emptyString: await build(""),
+      emptyBytes: await build(new Uint8Array(0)),
+      emptyBlob: await build(new Blob([])),
+      explicitType: await build("", { headers: { "content-type": "application/custom" } }),
+      emptyString304: await build("", { status: 304 }),
+      nonEmpty: settle(() => new Response("x", { status: 204 }).status),
+    };
+  },
+
   // #160 cache modes, #175 relative URL, #176 GET/HEAD body, #177 defaults,
   // #178 signal/integrity, #184 redirect value, #190 TRACE.
   "/request-options": () => ({

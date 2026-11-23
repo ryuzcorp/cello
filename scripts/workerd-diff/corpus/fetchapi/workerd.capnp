@@ -10,7 +10,10 @@ const config :Workerd.Config = (
     (name = "main", worker = (
       modules = [(name = "index.js", esModule = embed "index.js")],
       compatibilityDate = "2026-11-01",
-      bindings = [(name = "HELPER", text = "__HELPER__")],
+      bindings = [(name = "HELPER", text = "__HELPER__"),
+                  (name = "EMPTY_BODY", durableObjectNamespace = "NullBodyObject")],
+      durableObjectNamespaces = [(className = "NullBodyObject", uniqueKey = "fetchapi-null-body")],
+      durableObjectStorage = (inMemory = void),
       globalOutbound = "internet",
     )),
     (name = "internet", network = (
