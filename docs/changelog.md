@@ -357,9 +357,9 @@ calls).
   `101`), a null-body status (`101`, `204`, `205`, `304`) refuses a non-empty
   or streaming body, and a C0 control in `statusText` is `TypeError: Invalid
   statusText`. A zero-length buffered body on a null-body status (an empty
-  string, byte array or `Blob`) is accepted and then reported as no body at
-  all, as workerd does: `body` is `null`, the read is empty, and no
-  `content-type` is inferred. An explicit one is kept.
+  string, byte array, `Blob`, typed `Blob` or `URLSearchParams`) is accepted
+  and then reported as no body at all, as workerd does: `body` is `null`, the
+  read is empty, and no `content-type` is inferred. An explicit one is kept.
 - **An incoming request's headers are immutable** (#169). `set`, `append` and
   `delete` on `request.headers` throw `TypeError: Can't modify immutable
   headers.` instead of silently doing nothing, and `Request.prototype.headers`

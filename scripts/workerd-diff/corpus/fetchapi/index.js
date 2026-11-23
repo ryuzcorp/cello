@@ -1206,6 +1206,8 @@ const routes = {
       emptyString: await build(""),
       emptyBytes: await build(new Uint8Array(0)),
       emptyBlob: await build(new Blob([])),
+      emptyTypedBlob: await build(new Blob([], { type: "text/plain" })),
+      emptySearchParams: await build(new URLSearchParams("")),
       explicitType: await build("", { headers: { "content-type": "application/custom" } }),
       emptyString304: await build("", { status: 304 }),
       nonEmpty: await build("x"),
