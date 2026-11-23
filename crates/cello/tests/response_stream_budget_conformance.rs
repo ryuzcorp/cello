@@ -70,12 +70,28 @@ fn fixture_tempdir(prefix: &str) -> tempfile::TempDir {
 }
 
 fn copy_dir(src: &Path, dst: &Path) {
+    copy_dir_with_origin(src, dst, None);
+}
+
+/// Copy the fixture, substituting the drip origin's port in `index.js`. Every
+/// other file is copied byte for byte.
+fn copy_dir_with_origin(src: &Path, dst: &Path, drip_port: Option<u16>) {
     std::fs::create_dir_all(dst).expect("copy fixture dir");
     for entry in std::fs::read_dir(src).expect("read fixture dir") {
         let entry = entry.expect("fixture entry");
         let to = dst.join(entry.file_name());
         if entry.file_type().expect("file type").is_dir() {
-            copy_dir(&entry.path(), &to);
+            copy_dir_with_origin(&entry.path(), &to, drip_port);
+        } else if drip_port.is_some() && entry.file_name() == "index.js" {
+            let source = std::fs::read_to_string(entry.path()).expect("read fixture worker");
+            std::fs::write(
+                to,
+                source.replace(
+                    "__DRIP_PORT__",
+                    &drip_port.expect("drip port is set").to_string(),
+                ),
+            )
+            .expect("write fixture worker");
         } else {
             std::fs::copy(entry.path(), to).expect("copy fixture file");
         }
@@ -92,29 +108,36 @@ struct TestNode {
 
 impl TestNode {
     fn boot(project: &Path) -> Self {
+        Self::boot_with(project, &[])
+    }
+
+    fn boot_with(project: &Path, extra_env: &[(&str, String)]) -> Self {
+        let mut env = vec![
+            ("NO_COLOR".to_string(), "1".to_string()),
+            (
+                "CELLO_BACKGROUND_BUDGET_S".to_string(),
+                BACKGROUND_BUDGET_S.to_string(),
+            ),
+        ];
+        env.extend(
+            extra_env
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), value.clone())),
+        );
         // Port zero: the OS assigns the worker port, so parallel boots never
         // claim the same one; discovery below learns it.
-        let mut child = cello_command(
-            project,
-            [
-                ("NO_COLOR".to_string(), "1".to_string()),
-                (
-                    "CELLO_BACKGROUND_BUDGET_S".to_string(),
-                    BACKGROUND_BUDGET_S.to_string(),
-                ),
-            ],
-        )
-        .arg("dev")
-        .arg(project)
-        .arg("--port")
-        .arg("0")
-        .arg("--no-watch")
-        .arg("--clean")
-        .arg("--logs")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn cello dev");
+        let mut child = cello_command(project, env)
+            .arg("dev")
+            .arg(project)
+            .arg("--port")
+            .arg("0")
+            .arg("--no-watch")
+            .arg("--clean")
+            .arg("--logs")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn cello dev");
         let mut stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         std::thread::spawn(move || {
@@ -280,6 +303,98 @@ fn boot_node() -> (tempfile::TempDir, TestNode) {
     copy_dir(&fixture_dir(), &app_project);
     let node = TestNode::boot(&app_project);
     (dir, node)
+}
+
+fn boot_node_with_origin(origin: &DripOrigin) -> (tempfile::TempDir, TestNode) {
+    let dir = fixture_tempdir("cello-stream-budget-");
+    let app_project = dir.path().join("app");
+    copy_dir_with_origin(&fixture_dir(), &app_project, Some(origin.port));
+    // The idle deadline must not be what ends the background read: every
+    // drip refreshes it, and it is set well past the budget anyway.
+    let node = TestNode::boot_with(
+        &app_project,
+        &[("CELLO_HTTP_STREAM_IDLE_S", IDLE_BUDGET_S.to_string())],
+    );
+    (dir, node)
+}
+
+/// How often the drip origin emits one byte. Longer than the background
+/// budget, so a read that is only ended by the driver's next wake overruns
+/// it visibly, and far shorter than the idle deadline.
+const DRIP_INTERVAL: Duration = Duration::from_millis(1_200);
+/// The stream idle deadline every drip node runs with.
+const IDLE_BUDGET_S: u64 = 30;
+
+/// A loopback origin that answers any GET with a chunked body that emits one
+/// byte per [`DRIP_INTERVAL`] forever, and records when a client closes.
+///
+/// It is the upstream a `waitUntil` body read can hold: every byte refreshes
+/// the HTTP stream idle deadline, so only the background budget can end it.
+struct DripOrigin {
+    port: u16,
+    closed_at: Arc<Mutex<Option<Instant>>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    listener: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DripOrigin {
+    fn start() -> Self {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind drip origin to a free port");
+        let port = listener.local_addr().expect("drip origin address").port();
+        let closed_at: Arc<Mutex<Option<Instant>>> = Arc::default();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let accepted = Arc::clone(&closed_at);
+        let stop_flag = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            for connection in listener.incoming() {
+                if stop_flag.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
+                let Ok(mut stream) = connection else { continue };
+                let closed = Arc::clone(&accepted);
+                std::thread::spawn(move || {
+                    let mut request = [0u8; 1024];
+                    let _ = stream.read(&mut request);
+                    let head = b"HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\n\
+                                 transfer-encoding: chunked\r\n\r\n";
+                    if stream.write_all(head).is_err() {
+                        *closed.lock().expect("closed lock") = Some(Instant::now());
+                        return;
+                    }
+                    loop {
+                        if stream.write_all(b"1\r\nx\r\n").is_err() {
+                            *closed.lock().expect("closed lock") = Some(Instant::now());
+                            return;
+                        }
+                        std::thread::sleep(DRIP_INTERVAL);
+                    }
+                });
+            }
+        });
+        Self {
+            port,
+            closed_at,
+            stop,
+            listener: Some(handle),
+        }
+    }
+
+    /// When a client closed its connection, if one has.
+    fn closed_at(&self) -> Option<Instant> {
+        *self.closed_at.lock().expect("closed lock")
+    }
+}
+
+impl Drop for DripOrigin {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        // Wake the blocking accept so the listener thread observes `stop`.
+        let _ = TcpStream::connect(("127.0.0.1", self.port));
+        if let Some(handle) = self.listener.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 /// Span between the first and last frame read, and the count.
@@ -547,6 +662,132 @@ fn stalled_client_ends_the_blocked_write_at_the_stream_deadline() {
     assert!(
         ended >= Duration::from_secs(55),
         "the stalled stream ended after {ended:?}, before the 60 s stream deadline"
+    );
+    drop(stream);
+}
+
+/// A fetch body read only by `ctx.waitUntil()` work outlives the idle
+/// deadline (every drip byte refreshes it) but not the background budget
+/// (#141). The read must be rejected with an error the Worker can observe,
+/// and the upstream request must be cancelled: before the fix the driver's
+/// abort pass dropped the read silently, leaving neither a settled promise
+/// nor a closed upstream socket until a later drip woke it.
+#[test]
+fn waituntil_body_read_ends_at_the_background_budget() {
+    let origin = DripOrigin::start();
+    let (_dir, node) = boot_node_with_origin(&origin);
+    let started = Instant::now();
+    let (status, body) = get(&node.public, "/drip-waituntil").expect("drip route answers");
+    assert_eq!((status, body.as_str()), (200, "ok"));
+    let state = poll_until(
+        "the waitUntil body read is rejected",
+        Duration::from_secs(15),
+        || {
+            let (status, body) = get(&node.public, "/drip-state").ok()?;
+            if status != 200 {
+                return None;
+            }
+            let state: Value = serde_json::from_str(&body).ok()?;
+            state["error"].is_string().then_some(body)
+        },
+    );
+    let elapsed = started.elapsed();
+    let state: Value = serde_json::from_str(&state).expect("state json");
+    let error = state["error"].as_str().expect("error is a string");
+    assert!(
+        error.contains("background budget"),
+        "the read must fail with the background-budget Error, got {error:?}"
+    );
+    // The Worker measures the read itself; the outer elapsed only guards the
+    // HTTP round trip, so a loaded CI runner cannot turn this into a flake.
+    let read_ms = state["elapsed"].as_u64().expect("the read measured itself");
+    assert!(
+        read_ms <= (BUDGET + Duration::from_secs(1)).as_millis() as u64,
+        "the read must end at the {BACKGROUND_BUDGET_S}s background budget, not \
+         {read_ms} ms after it started"
+    );
+    assert!(
+        elapsed <= BUDGET + Duration::from_secs(5),
+        "the rejection must reach the Worker promptly ({elapsed:?} after the request)"
+    );
+    poll_until(
+        "the upstream request is cancelled",
+        Duration::from_secs(5),
+        || origin.closed_at().map(|_| String::new()),
+    );
+    let closed = origin.closed_at().expect("upstream connection closed");
+    // The origin only observes the close when a later write hits the closed
+    // socket, so allow a couple of drip intervals for that. The point is
+    // that the connection ends while nothing is reading it, not that the
+    // origin's next write is prompt.
+    assert!(
+        closed.duration_since(started) <= BUDGET + DRIP_INTERVAL * 3,
+        "the upstream socket must close once the read is cut (closed {:?} after \
+         the request)",
+        closed.duration_since(started)
+    );
+}
+
+/// A response body that reads an upstream body through a JS pump is response
+/// work: the client bounds it, so the background budget must not cut it
+/// (#139, and Noite's control-plane streams). Only a body read by
+/// `waitUntil` work alone carries the background deadline.
+#[test]
+fn proxied_body_read_outlives_the_background_budget() {
+    let origin = DripOrigin::start();
+    let (_dir, node) = boot_node_with_origin(&origin);
+    let mut stream = TcpStream::connect(&node.public).expect("connect proxy stream");
+    stream
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .expect("proxy stream read timeout");
+    let wire = format!(
+        "GET /proxy-stream HTTP/1.1\r\nHost: {}\r\nAccept: */*\r\n\r\n",
+        node.public
+    );
+    stream
+        .write_all(wire.as_bytes())
+        .expect("write proxy request");
+    let started = Instant::now();
+    let mut raw = Vec::new();
+    let mut header_end = None;
+    let mut body_arrivals = Vec::new();
+    let mut buf = [0u8; 4096];
+    while started.elapsed() < BUDGET * 5 {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(read) => {
+                raw.extend_from_slice(&buf[..read]);
+                if let Some(end) = header_end {
+                    if raw.len() > end {
+                        body_arrivals.push(Instant::now());
+                    }
+                } else if let Some(position) =
+                    raw.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    header_end = Some(position + 4);
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => panic!("proxy stream read failed: {error}"),
+        }
+    }
+    assert!(
+        body_arrivals.len() >= 3,
+        "the proxied body must keep producing ({})",
+        body_arrivals.len()
+    );
+    let span = body_arrivals
+        .last()
+        .expect("body arrived")
+        .duration_since(*body_arrivals.first().expect("body arrived"));
+    assert!(
+        span >= BUDGET * 4,
+        "a proxied response body must outlive the {BACKGROUND_BUDGET_S}s background \
+         budget while the client reads, but its bytes spanned only {span:?}"
     );
     drop(stream);
 }

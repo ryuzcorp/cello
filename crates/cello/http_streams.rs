@@ -12,6 +12,7 @@ use crate::engine_api::RequestBody;
 use anyhow::Result;
 use futures_util::StreamExt as _;
 use std::collections::HashMap;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
@@ -227,6 +228,12 @@ pub(crate) enum HttpStreamTerminationReason {
     /// so a consumer that was mid-read cannot mistake dropped bytes for the
     /// end of the body.
     Skewed = 4,
+    /// A fetch body read issued from post-response `waitUntil` work outlived
+    /// the event's background budget (#141). The source ends and the read
+    /// rejects, instead of a 1-byte drip refreshing the idle window and
+    /// holding the event, its isolate and the upstream socket past the
+    /// budget.
+    BackgroundExpired = 5,
 }
 
 impl HttpStreamTerminationReason {
@@ -237,6 +244,7 @@ impl HttpStreamTerminationReason {
             2 => Self::Cancelled,
             3 => Self::Expired,
             4 => Self::Skewed,
+            5 => Self::BackgroundExpired,
             _ => unreachable!("invalid HTTP stream termination reason {value}"),
         }
     }
@@ -314,6 +322,23 @@ enum HttpStreamSourceSlot {
 pub(crate) struct HttpStreamEntry {
     generation: u64,
     deadline_ms: u64,
+    /// Absolute end of the background phase that read this source, when the
+    /// read was issued from `waitUntil` work after the handler answered
+    /// (#141).
+    ///
+    /// The idle deadline alone cannot bound such a read: every received
+    /// chunk refreshes it, so a 1-byte drip holds the event, its isolate and
+    /// the upstream socket for as long as the peer keeps dripping. This one
+    /// is anchored to the response, not to activity, so it cannot be
+    /// refreshed. A response body never sets it: its read is client-bound
+    /// response work, not background work.
+    ///
+    /// Once set it stays for the source's whole life: one fetch body has one
+    /// consumer, and an absolute deadline that already passed cannot become
+    /// wrong for a later read of the same source. A tee branch sets it only on
+    /// the branch `waitUntil` reads, so a sibling returned as the response
+    /// body keeps its client-bound behaviour.
+    background_deadline_ms: Option<u64>,
     source: HttpStreamSourceSlot,
     pub(crate) termination: Arc<HttpStreamTermination>,
     /// Request contexts that can still read this source. A dispatch guard can
@@ -346,6 +371,7 @@ impl HttpStreamEntry {
         Self {
             generation,
             deadline_ms,
+            background_deadline_ms: None,
             source: HttpStreamSourceSlot::Available(source),
             termination: Arc::new(HttpStreamTermination::new()),
             owners: 0,
@@ -363,18 +389,23 @@ impl HttpStreamEntry {
             && self.active_closes == 0
     }
 
-    /// Whether this entry's deadline is a wake the sweeper must schedule.
+    /// Why this entry must be expired now, if it must.
     ///
-    /// A response body is transferred to the host for its whole life, so its
-    /// source stays leased; it still needs the deadline watched (upstream
-    /// #275).
-    fn watches_deadline(&self) -> bool {
-        self.is_expiry_eligible() || self.response
-    }
-
-    fn is_due(&self, now_ms: u64) -> bool {
+    /// The background deadline wins a tie: it is the stricter bound and
+    /// carries its own error, which is what a `waitUntil` read has to see.
+    fn due_reason(&self, now_ms: u64) -> Option<HttpStreamTerminationReason> {
+        if self
+            .background_deadline_ms
+            .is_some_and(|deadline_ms| now_ms >= deadline_ms)
+        {
+            // A background read is checked out for exactly that work, so an
+            // owner that is still reading does not exempt it: the sweeper
+            // commits the termination, the parked read observes it, and
+            // dropping the source closes the upstream connection.
+            return Some(HttpStreamTerminationReason::BackgroundExpired);
+        }
         if now_ms < self.deadline_ms {
-            return false;
+            return None;
         }
         if self.response {
             // A response body's deadline is refreshed by every successful
@@ -384,9 +415,21 @@ impl HttpStreamEntry {
             // blocked on backpressure. Expire it whatever holds the entry;
             // the blocked write or close observes the termination and ends
             // the pump.
-            return true;
+            return Some(HttpStreamTerminationReason::Expired);
         }
         self.is_expiry_eligible()
+            .then_some(HttpStreamTerminationReason::Expired)
+    }
+
+    /// The earliest deadline the sweeper has to wake for, if any.
+    fn watch_deadline_ms(&self) -> Option<u64> {
+        let watched = self.is_expiry_eligible() || self.response;
+        match (self.background_deadline_ms, watched) {
+            (Some(background), true) => Some(background.min(self.deadline_ms)),
+            (Some(background), false) => Some(background),
+            (None, true) => Some(self.deadline_ms),
+            (None, false) => None,
+        }
     }
 }
 
@@ -703,6 +746,20 @@ impl HttpStreamService {
         format!("HTTP stream {stream_id} expired or is not registered")
     }
 
+    /// The error a `waitUntil` body read gets when it outlived the event's
+    /// background budget (#141).
+    ///
+    /// It names the knob and the phase, because the read is still legal from
+    /// the handler: what ended it is the post-response budget, not the
+    /// upstream or the stream idle deadline. A Worker can catch it, unlike
+    /// the silent drop the driver's abort pass used to produce.
+    fn background_expired_error() -> String {
+        format!(
+            "fetch: a body read in ctx.waitUntil exceeded the {} second background budget (CELLO_BACKGROUND_BUDGET_S)",
+            crate::engine_api::background_budget().as_secs()
+        )
+    }
+
     fn termination_result(
         stream_id: u64,
         reason: HttpStreamTerminationReason,
@@ -713,7 +770,15 @@ impl HttpStreamService {
             }
             HttpStreamTerminationReason::Skewed => Err(HTTP_TEE_SKEW_MESSAGE.to_string()),
             HttpStreamTerminationReason::Expired => Err(Self::expired_error(stream_id)),
+            HttpStreamTerminationReason::BackgroundExpired => Err(Self::background_expired_error()),
             HttpStreamTerminationReason::Live => Err(Self::unknown_error(stream_id)),
+        }
+    }
+
+    fn reason_error(stream_id: u64, reason: HttpStreamTerminationReason) -> String {
+        match Self::termination_result(stream_id, reason) {
+            Err(error) => error,
+            Ok(_) => Self::unknown_error(stream_id),
         }
     }
 
@@ -910,17 +975,12 @@ impl HttpStreamService {
                     .registration_clock(&mut state, &mut drain)
                     .map(|(_, now_ms)| now_ms);
                 if let Some(now_ms) = now_ms {
-                    if state
+                    if let Some(reason) = state
                         .sources
                         .get(&stream_id)
-                        .is_some_and(|entry| entry.is_due(now_ms))
+                        .and_then(|entry| entry.due_reason(now_ms))
                     {
-                        Self::remove_locked(
-                            &mut state,
-                            stream_id,
-                            HttpStreamTerminationReason::Expired,
-                            &mut drain,
-                        );
+                        Self::remove_locked(&mut state, stream_id, reason, &mut drain);
                     } else if let Some(stream) = state.sources.get_mut(&stream_id) {
                         stream.owners = stream.owners.saturating_add(1);
                         generation = Some(stream.generation);
@@ -978,8 +1038,14 @@ impl HttpStreamService {
     pub(crate) fn checkout_source(
         self: &Arc<Self>,
         stream_id: u64,
+        background_deadline_ms: Option<u64>,
     ) -> Result<(HttpSourceLease, HttpStreamSource), String> {
-        self.checkout(stream_id, HttpSourceLeaseMode::Pull, None)
+        self.checkout(
+            stream_id,
+            HttpSourceLeaseMode::Pull,
+            None,
+            background_deadline_ms,
+        )
     }
 
     pub(crate) fn checkout_transfer(
@@ -987,8 +1053,12 @@ impl HttpStreamService {
         stream_id: u64,
         claim_generation: Option<u64>,
     ) -> Result<HttpTransferredStream, String> {
-        let (lease, source) =
-            self.checkout(stream_id, HttpSourceLeaseMode::Transfer, claim_generation)?;
+        let (lease, source) = self.checkout(
+            stream_id,
+            HttpSourceLeaseMode::Transfer,
+            claim_generation,
+            None,
+        )?;
         Ok(HttpTransferredStream {
             inner: http_chunk_stream(source),
             lease: HttpTransferLease::new(lease),
@@ -1001,6 +1071,7 @@ impl HttpStreamService {
         stream_id: u64,
         mode: HttpSourceLeaseMode,
         claim_generation: Option<u64>,
+        background_deadline_ms: Option<u64>,
     ) -> Result<(HttpSourceLease, HttpStreamSource), String> {
         let mut drain = HttpStreamDrain::default();
         let mut checkout = None;
@@ -1014,18 +1085,13 @@ impl HttpStreamService {
                     .registration_clock(&mut state, &mut drain)
                     .map(|(_, now_ms)| now_ms);
                 if let Some(now_ms) = now_ms {
-                    if state
+                    if let Some(reason) = state
                         .sources
                         .get(&stream_id)
-                        .is_some_and(|entry| entry.is_due(now_ms))
+                        .and_then(|entry| entry.due_reason(now_ms))
                     {
-                        Self::remove_locked(
-                            &mut state,
-                            stream_id,
-                            HttpStreamTerminationReason::Expired,
-                            &mut drain,
-                        );
-                        error = Some(Self::expired_error(stream_id));
+                        Self::remove_locked(&mut state, stream_id, reason, &mut drain);
+                        error = Some(Self::reason_error(stream_id, reason));
                     } else if !state.sources.contains_key(&stream_id) {
                         error = Some(Self::unknown_error(stream_id));
                     } else {
@@ -1036,6 +1102,13 @@ impl HttpStreamService {
                         }) {
                             error = Some(Self::unknown_error(stream_id));
                         } else {
+                            // A pull issued from post-response `waitUntil`
+                            // work carries the event's background deadline:
+                            // from here on the source ends at it even while
+                            // a drip keeps refreshing the idle window (#141).
+                            if let Some(deadline_ms) = background_deadline_ms {
+                                entry.background_deadline_ms = Some(deadline_ms);
+                            }
                             let leased = HttpStreamSourceSlot::Leased { token, mode };
                             match std::mem::replace(&mut entry.source, leased) {
                                 HttpStreamSourceSlot::Available(source) => {
@@ -1384,17 +1457,12 @@ impl HttpStreamService {
                     .registration_clock(&mut state, &mut drain)
                     .map(|(_, now_ms)| now_ms);
                 if let Some(now_ms) = now_ms {
-                    if state
+                    if let Some(reason) = state
                         .sources
                         .get(&stream_id)
-                        .is_some_and(|entry| entry.is_due(now_ms))
+                        .and_then(|entry| entry.due_reason(now_ms))
                     {
-                        Self::remove_locked(
-                            &mut state,
-                            stream_id,
-                            HttpStreamTerminationReason::Expired,
-                            &mut drain,
-                        );
+                        Self::remove_locked(&mut state, stream_id, reason, &mut drain);
                         error = Some(HttpStreamActivityError::Gone);
                     } else {
                         let endpoints = state
@@ -1563,16 +1631,11 @@ impl HttpStreamService {
                 let mut due = state
                     .sources
                     .iter()
-                    .filter_map(|(id, entry)| entry.is_due(now_ms).then_some(*id))
+                    .filter_map(|(id, entry)| entry.due_reason(now_ms).map(|reason| (*id, reason)))
                     .collect::<Vec<_>>();
-                due.sort_unstable();
-                for id in due {
-                    Self::remove_locked(
-                        &mut state,
-                        id,
-                        HttpStreamTerminationReason::Expired,
-                        &mut drain,
-                    );
+                due.sort_unstable_by_key(|(id, _)| *id);
+                for (id, reason) in due {
+                    Self::remove_locked(&mut state, id, reason, &mut drain);
                 }
                 if state.sources.is_empty() {
                     state.sweeper_running = false;
@@ -1580,8 +1643,7 @@ impl HttpStreamService {
                 } else if let Some(deadline_ms) = state
                     .sources
                     .values()
-                    .filter(|entry| entry.watches_deadline())
-                    .map(|entry| entry.deadline_ms)
+                    .filter_map(HttpStreamEntry::watch_deadline_ms)
                     .min()
                 {
                     HttpSweepWait::Deadline(deadline_ms)
@@ -2299,8 +2361,9 @@ pub(crate) fn settle_http_stream_read(
 pub(crate) fn http_stream_read(
     service: Arc<HttpStreamService>,
     stream_id: u64,
-) -> impl std::future::Future<Output = Result<Option<Vec<u8>>, String>> + Send + 'static {
-    let checkout = service.checkout_source(stream_id);
+    background_deadline_ms: Option<u64>,
+) -> impl Future<Output = Result<Option<Vec<u8>>, String>> + Send + 'static {
+    let checkout = service.checkout_source(stream_id, background_deadline_ms);
     async move {
         let (lease, source) = checkout?;
         let mut pull = HttpPull { lease, source };
@@ -2318,8 +2381,8 @@ pub(crate) fn http_stream_read(
 pub(crate) fn http_stream_read_source_first_for_test(
     service: Arc<HttpStreamService>,
     stream_id: u64,
-) -> impl std::future::Future<Output = Result<Option<Vec<u8>>, String>> + Send + 'static {
-    let checkout = service.checkout_source(stream_id);
+) -> impl Future<Output = Result<Option<Vec<u8>>, String>> + Send + 'static {
+    let checkout = service.checkout_source(stream_id, None);
     async move {
         let (lease, source) = checkout?;
         let mut pull = HttpPull { lease, source };

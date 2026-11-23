@@ -5,6 +5,43 @@ import { DurableObject, waitUntil } from 'cloudflare:workers';
 // a budget that seals the pump shows up as ticks that stop arriving.
 const TICK_MS = 100;
 
+// The drip origin the suite starts. It answers one 1-byte chunk per interval,
+// slowly enough that the idle deadline (which every chunk refreshes) cannot
+// end the body inside the test's window: only the background budget can.
+const DRIP_ORIGIN = 'http://127.0.0.1:__DRIP_PORT__';
+
+// Observable outcome of the last `/drip-waituntil` run, so the test can see
+// whether the read was rejected with an Error or silently abandoned.
+let dripState = { reads: 0, error: null, done: false, elapsed: null };
+
+/// Read an upstream body forever inside `ctx.waitUntil()`: a fetch body the
+/// background budget, not the idle deadline, has to end (#141). `elapsed` is
+/// measured inside the Worker, so it is the read's own lifetime, not the
+/// test's HTTP round trip.
+const dripInBackground = (ctx) => {
+  dripState = { reads: 0, error: null, done: false, elapsed: null };
+  const state = dripState;
+  const started = Date.now();
+  ctx.waitUntil((async () => {
+    try {
+      const response = await fetch(`${DRIP_ORIGIN}/drip`);
+      const reader = response.body.getReader();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) {
+          state.done = true;
+          return;
+        }
+        state.reads += value.length;
+      }
+    } catch (error) {
+      state.error = String(error && (error.message || error));
+    } finally {
+      state.elapsed = Date.now() - started;
+    }
+  })());
+};
+
 // An SSE body that keeps producing for as long as the client stays connected.
 // `onTick` records progress; the producer stops when the pump cancels it on a
 // client disconnect (the forwarded signal) or when its write fails because the
@@ -78,7 +115,7 @@ export class Streamer extends DurableObject {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (url.pathname === '/health') {
       // The test's readiness probe: a complete response, not a stream.
@@ -95,6 +132,36 @@ export default {
       // whether or not another response is streaming.
       waitUntil(new Promise(() => {}));
       return new Response('ok');
+    }
+    if (url.pathname === '/drip-waituntil') {
+      // A fetch body read only by `waitUntil` work: the background budget
+      // ends it with an Error, even though every drip byte refreshes the
+      // idle deadline.
+      dripInBackground(ctx);
+      return new Response('ok');
+    }
+    if (url.pathname === '/drip-state') {
+      return Response.json(dripState);
+    }
+    if (url.pathname === '/proxy-stream') {
+      // A response body that reads an upstream body through a JS pump: the
+      // read is response work, so the client bounds it, not the background
+      // budget (#139).
+      const upstream = await fetch(`${DRIP_ORIGIN}/drip`);
+      const reader = upstream.body.getReader();
+      const body = new ReadableStream({
+        async pull(controller) {
+          const { done, value } = await reader.read();
+          if (done) controller.close();
+          else controller.enqueue(value);
+        },
+        cancel(reason) {
+          reader.cancel(reason).catch(() => {});
+        },
+      });
+      return new Response(body, {
+        headers: { 'content-type': 'application/octet-stream' },
+      });
     }
     if (url.pathname === '/idle') {
       // A body that never produces and never closes: the idle deadline, not

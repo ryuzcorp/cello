@@ -51,6 +51,20 @@ fixes because they break bundles that relied on them.
   scheduling-independent contract: the handler answers, at least one copy
   reports the skew cap, and every copy that reports success carries the whole
   40 MiB.
+- **A `fetch()` body read in `ctx.waitUntil()` is bounded by the background
+  budget** (#141). Since #139 removed the total fetch deadline, a read that
+  only `waitUntil` work drove was bounded only by
+  `CELLO_HTTP_STREAM_IDLE_S`, which every received chunk refreshes: a
+  1-byte drip kept the read running past `CELLO_BACKGROUND_BUDGET_S` and
+  pinned the event, its isolate and the upstream socket until the idle
+  deadline. The driver's abort pass did not end it, because it adopts the
+  operations that own the `IoContext`. A read issued from post-response
+  `waitUntil` work now carries the event's absolute background deadline on
+  its HTTP stream source; at that deadline the HTTP stream registry cancels
+  the upstream request and the read rejects with an `Error` naming the knob.
+  A response body the client is still reading keeps its client-bound
+  behaviour, and the `CELLO_BACKGROUND_BUDGET_S` wording now states what is
+  enforced.
 
 **Breaking:** a Worker can no longer generate code at run time (#194).
 `eval()`, `new Function()` and `Function(...)` throw `EvalError: Code
