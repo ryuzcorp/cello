@@ -64,6 +64,12 @@ const ENTRY_OVERHEAD_BYTES: u64 = 640;
 /// kilobytes while occupying tens.
 const HEADER_OVERHEAD_BYTES: u64 = 96;
 
+/// Fixed overhead charged for an entry's reason phrase. The 24-byte `String`
+/// slot lives inside `Entry`; this covers allocator size-class rounding for
+/// a short phrase. The phrase's bytes are charged separately, as a header's
+/// are, so a long phrase cannot hide under the fixed term.
+const STATUS_TEXT_OVERHEAD_BYTES: u64 = 32;
+
 /// Resolve the process-wide cap once: an unset variable selects the
 /// default, a supplied one must parse, so a typo cannot silently resize a
 /// running node. `0` disables the cache. Loud on garbage even without the
@@ -302,7 +308,14 @@ impl WorkerCache {
         else {
             return Ok(PutOutcome::NotStored);
         };
-        let bytes = entry_bytes(scope, namespace, request.url, &headers, request.body);
+        let bytes = entry_bytes(
+            scope,
+            namespace,
+            request.url,
+            request.status_text,
+            &headers,
+            request.body,
+        );
         if bytes > MAX_ENTRY_BYTES || bytes > self.cap_bytes {
             return Ok(PutOutcome::NotStored);
         }
@@ -413,6 +426,7 @@ fn entry_bytes(
     scope: &str,
     namespace: &Namespace,
     url: &str,
+    status_text: &str,
     headers: &[(String, String)],
     body: &[u8],
 ) -> u64 {
@@ -425,7 +439,12 @@ fn entry_bytes(
         .iter()
         .map(|(name, value)| name.len() as u64 + value.len() as u64 + HEADER_OVERHEAD_BYTES)
         .sum();
-    key * 2 + headers + body.len() as u64 + ENTRY_OVERHEAD_BYTES
+    key * 2
+        + headers
+        + status_text.len() as u64
+        + STATUS_TEXT_OVERHEAD_BYTES
+        + body.len() as u64
+        + ENTRY_OVERHEAD_BYTES
 }
 
 fn header_values<'a>(headers: &'a [(String, String)], name: &str) -> Vec<&'a str> {
@@ -1373,6 +1392,52 @@ mod tests {
         };
         assert_eq!(status, 304);
         assert_eq!(status_text, None);
+    }
+
+    /// The reason phrase is part of the entry's memory, so replacing an
+    /// entry with the same shape but a longer phrase must raise the charge
+    /// by at least the phrase's bytes (its slot is already in `Entry`).
+    #[test]
+    fn the_reason_phrase_is_charged() {
+        let mut cache = store();
+        let held = headers(&[("cache-control", "max-age=60")]);
+        let put_with = |cache: &mut WorkerCache, phrase: &str| {
+            cache
+                .put(
+                    SCRIPT,
+                    &Namespace::Default,
+                    &PutRequest {
+                        method: "GET",
+                        url: URL,
+                        status: 404,
+                        status_text: phrase,
+                        headers: &held,
+                        body: b"d",
+                    },
+                    NOW,
+                )
+                .expect("a 404 with freshness stores")
+        };
+        put_with(&mut cache, "");
+        let without = cache.used_bytes();
+        put_with(&mut cache, "Gone Fishing");
+        let with = cache.used_bytes();
+        let floor = honest_floor_with_status(
+            SCRIPT,
+            &Namespace::Default,
+            URL,
+            "Gone Fishing",
+            &held,
+            b"d",
+        );
+        assert!(
+            with >= without + "Gone Fishing".len() as u64,
+            "phrase bytes are charged: {without} -> {with}"
+        );
+        assert!(
+            with >= floor,
+            "used {with} below honest floor {floor} with a phrase"
+        );
     }
 
     #[test]
@@ -2332,6 +2397,17 @@ mod tests {
         headers: &[(String, String)],
         body: &[u8],
     ) -> u64 {
+        honest_floor_with_status(scope, namespace, url, "", headers, body)
+    }
+
+    fn honest_floor_with_status(
+        scope: &str,
+        namespace: &Namespace,
+        url: &str,
+        status_text: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> u64 {
         let namespace = match namespace {
             Namespace::Default => 0,
             Namespace::Named(name) => name.len() as u64,
@@ -2346,6 +2422,7 @@ mod tests {
             + std::mem::size_of::<Entry>() as u64
             + header_heap
             + std::mem::size_of::<(String, String)>() as u64 * headers.len() as u64
+            + status_text.len() as u64
             + body.len() as u64
     }
 
