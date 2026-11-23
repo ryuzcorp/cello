@@ -590,7 +590,11 @@ globalThis.Response = class Response {
       throw new TypeError("Invalid statusText");
     this.statusText = statusText;
     this.headers = new Headers(init.headers);
-    if (typed && typed.type && !this.headers.has("content-type"))
+    // A null-body status infers nothing from the body: workerd reports no body
+    // at all, so an empty typed Blob or URLSearchParams carries no
+    // `content-type` either. An explicit header is still kept.
+    if (typed && typed.type && !__nullBodyStatus(status) &&
+        !this.headers.has("content-type"))
       this.headers.set("content-type", typed.type);
     // A USVString (or any other non-BodyInit value) body carries the
     // Fetch-standard default type. Without it a string body reached the wire

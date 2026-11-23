@@ -545,6 +545,8 @@ fn null_body_zero_length_body_becomes_null() {
         ("emptyString", 204),
         ("emptyBytes", 204),
         ("emptyBlob", 204),
+        ("emptyTypedBlob", 204),
+        ("emptySearchParams", 204),
         ("emptyString304", 304),
     ] {
         let response = &out[case];

@@ -80,7 +80,9 @@ use. An unsupported feature that stays silent is a defect.
   `WebSocket`), refuses a non-empty or streaming body on a null-body status
   (`101`, `204`, `205`, `304`), and refuses a C0 control in `statusText`. An
   accepted zero-length buffered body there becomes no body at all: `body` is
-  `null`, `text()` is empty and no `content-type` is inferred, as in workerd.
+  `null`, `text()` is empty and no `content-type` is inferred, as in workerd
+  -- including the type an empty typed `Blob` or `URLSearchParams` would
+  otherwise carry.
 - `Response.blob().type` is the parsed and re-serialized `content-type`;
   `Blob.type` on a user-built `Blob` is the raw lower-cased string, as in
   workerd.
