@@ -11259,13 +11259,17 @@ fn op_fetch(
             return Err(error);
         }
         let m = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
-        // a timeout bounds a black-hole host: the future settles (Err) instead
-        // of parking run_loop forever — the hang the Drop guard can't catch.
+        // The budget bounds the request, not the body. Connect, a streamed
+        // request body, and the wait for the response head settle (Err)
+        // instead of parking run_loop forever — the hang the Drop guard
+        // can't catch (#136) — while a live response body keeps streaming:
+        // reqwest's request timeout is a TOTAL deadline that would truncate a
+        // stream at the budget (an SSE feed, a proxied download), and the
+        // HTTP stream service already ends a body that makes no progress for
+        // `CELLO_HTTP_STREAM_IDLE_S`.
         let fetch_timeout = crate::env_vars::positive_or("CELLO_FETCH_TIMEOUT_S", 120)
             .expect("validated CELLO_FETCH_TIMEOUT_S");
-        let mut rb = client
-            .request(m, &url)
-            .timeout(std::time::Duration::from_secs(fetch_timeout));
+        let mut rb = client.request(m, &url);
         // reqwest omits Content-Length for an empty Vec, which collapses the
         // wire representation of `Some([])` into the representation of
         // `None`. Install the zero length here unless the Worker supplied a
@@ -11306,14 +11310,23 @@ fn op_fetch(
         // connection, which is what tells the upstream to stop producing. After
         // this point the response body is a registered stream, and
         // `__http_stream_cancel` is what ends it.
+        let send = async move {
+            match crate::asyncrt::timeout(std::time::Duration::from_secs(fetch_timeout), rb.send())
+                .await
+            {
+                Ok(Ok(response)) => Ok(response),
+                Ok(Err(error)) => Err(fetch_request_error(&error)),
+                Err(_) => Err(format!("fetch: no response head within {fetch_timeout} s")),
+            }
+        };
         let sent = match cancel {
             Some(cancel) => crate::asyncrt::select_biased! {
                 "a cancel that is ready wins a tie, so an aborted request never \
                  hands back a response and never leaves a body stream nobody reads";
                 _ = cancel => None,
-                result = rb.send() => Some(result),
+                result = send => Some(result),
             },
-            None => Some(rb.send().await),
+            None => Some(send.await),
         };
         let Some(sent) = sent else {
             let error = "fetch: the request was aborted".to_string();
@@ -11338,14 +11351,14 @@ fn op_fetch(
                     .collect::<Vec<_>>();
                 let source = match encoding {
                     crate::http_streams::FetchBodyEncoding::Identity => {
-                        HttpStreamSource::Response(resp)
+                        HttpStreamSource::Stream(crate::http_streams::response_body_stream(resp))
                     }
                     coding => {
                         // The wire size no longer describes the body.
                         // `content-encoding` itself stays, as in workerd.
                         headers.retain(|(name, _)| !name.eq_ignore_ascii_case("content-length"));
-                        HttpStreamSource::Stream(crate::http_streams::decoded_fetch_stream(
-                            resp, coding,
+                        HttpStreamSource::Stream(crate::http_streams::idle_bounded_stream(
+                            crate::http_streams::decoded_fetch_stream(resp, coding),
                         ))
                     }
                 };
@@ -11360,8 +11373,7 @@ fn op_fetch(
                 })
                 .to_string())
             }
-            Err(e) => {
-                let error = fetch_request_error(&e);
+            Err(error) => {
                 finish(false, None, Some(error.clone()));
                 Err(error)
             }

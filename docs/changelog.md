@@ -4,10 +4,13 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
 ---
 ## Unreleased
 
-One stream divergence from workerd is fixed, found by the workerd
-differential harness: `writer.close()` after the readable side of a
+Two stream fixes: `fetch()` no longer puts a live response body on a total
+deadline (a control plane proxying its own SSE through a Worker was cut at
+the budget), and one workerd `TransformStream` divergence found by the
+differential harness (`writer.close()` after the readable side of a
 `TransformStream` was cancelled now rejects with the cancel reason instead of
-a generic `TypeError`. No configuration, data, or bucket-format changes.
+a generic `TypeError`). No configuration, data, or bucket-format changes
+beyond the new `CELLO_HTTP_STREAM_IDLE_S` knob.
 
 - **`writer.close()` after a readable cancel rejects with the cancel
   reason** (#129). Cancelling a `TransformStream`'s readable errors its
@@ -20,6 +23,23 @@ a generic `TypeError`. No configuration, data, or bucket-format changes.
   `FixedLengthStream` cancel reaches the same path with workerd's converted
   `Error`. The differential gate gained the `transform-close-after-cancel`
   case.
+
+- **`fetch()` no longer puts a live response body on a total deadline**
+  (#136). `CELLO_FETCH_TIMEOUT_S` was applied as reqwest's total request
+  timeout, which covers the response body, so a Worker streaming an
+  upstream body — an SSE feed, a proxied download — had its body truncated
+  at exactly the budget while chunks were still arriving (a control plane
+  proxying its own SSE through a Worker `fetch` died at 120 s). The budget
+  now bounds the connect, a streamed request body and the wait for the
+  response head; the response body keeps streaming, and a body that makes
+  no progress still ends at the HTTP stream idle deadline. That deadline is
+  now the documented `CELLO_HTTP_STREAM_IDLE_S` knob (default 60 s, every
+  received chunk refreshes it), so a black-holed upstream can never pin a
+  connection. No data-format or behaviour change for short fetches.
+- **The HTTP stream idle deadline is settable** (#136).
+  `CELLO_HTTP_STREAM_IDLE_S` defaults to 60 and is validated at startup; a
+  non-positive or malformed value stops the node instead of silently
+  disabling the bound.
 
 ## v0.2.7
 

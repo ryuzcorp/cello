@@ -56,9 +56,16 @@ services, APIs, and Wrangler configuration.
   started stop one budget window after the body ends.
 - An open response still ends: when the body completes or errors, when the
   client disconnects (which cancels the producer), after `CELLO_HANDLER_BUDGET_S`
-  if the handler has not answered, when the node shuts down, and after 60
-  seconds without progress: the body produces nothing, or the client stops
-  reading.
+  if the handler has not answered, when the node shuts down, and after
+  `CELLO_HTTP_STREAM_IDLE_S` (60 s by default) without progress: the body
+  produces nothing, or the client stops reading.
+- A Worker `fetch()` is bounded the same way, and not by a total deadline:
+  `CELLO_FETCH_TIMEOUT_S` bounds the connect, a streamed request body, and
+  the wait for the response head. The response body then streams for as long
+  as the upstream keeps sending — an SSE feed or a proxied download is never
+  truncated because it outlived that budget — and a body the Worker stops
+  reading follows the idle rule above (every received chunk refreshes it, so
+  a silent or black-holed upstream still ends).
 - A streamed body keeps its event, isolate, and cell resident until it ends,
   so a retiring generation waits for open streams before it frees its heaps.
 - A `TransformStream` applies backpressure: while nobody reads the readable

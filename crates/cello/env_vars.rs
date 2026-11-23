@@ -284,6 +284,7 @@ pub fn validate() -> anyhow::Result<()> {
         "CELLO_DEPLOY_POLL_S",
         "CELLO_FETCH_TIMEOUT_S",
         "CELLO_HANDLER_BUDGET_S",
+        "CELLO_HTTP_STREAM_IDLE_S",
         "CELLO_IDLE_EVICT_S",
         "CELLO_LOG_PIPELINE",
         "CELLO_LTX_COMPACTIONS",
