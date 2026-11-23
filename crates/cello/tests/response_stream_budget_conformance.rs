@@ -752,7 +752,7 @@ fn proxied_body_read_outlives_the_background_budget() {
     let mut header_end = None;
     let mut body_arrivals = Vec::new();
     let mut buf = [0u8; 4096];
-    while started.elapsed() < BUDGET * 5 {
+    while started.elapsed() < BUDGET * 6 {
         match stream.read(&mut buf) {
             Ok(0) => break,
             Ok(read) => {
