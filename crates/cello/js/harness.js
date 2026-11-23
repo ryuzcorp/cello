@@ -577,6 +577,12 @@ globalThis.Request = class Request {
     // The explicit half of the prototype `bodyUsed` accessor below; kept an
     // own field here so every Request has one hidden class.
     this._bodyUsed = false;
+    // Whether the request carries a body at all. Workerd's `body` is null
+    // when none was supplied (a bodyless POST, or a GET), while cello still
+    // hands out an empty stream for a bodyless POST; the fetch surfaces read
+    // this to consume only a real body (#127).
+    this._hasBody = stream !== null ||
+      (hasBody ? body !== null : prior ? prior._hasBody : false);
     // The body stream and the signal stay eager, own properties: the RPC and
     // storage serializers fall back to the lift-into-marker path only when a
     // value is not directly structured-cloneable, and a Request's un-cloneable
@@ -823,7 +829,7 @@ const __EGRESS_REFUSAL_MARKER = "CELLO_EGRESS_REFUSED:";
 // with its own `body` leaves the input alone, both as workerd behaves.
 const __FETCH_USED = "Cannot reconstruct a Request with a used body.";
 const __fetchAdoptsBody = (input, init) =>
-  input instanceof Request && input.body !== null &&
+  input instanceof Request && input._hasBody === true &&
   !(init !== null && typeof init === "object" &&
     Object.prototype.hasOwnProperty.call(init, "body"));
 // Run before the Request copy: the constructor marks a streaming prior as it
@@ -5481,6 +5487,10 @@ const __reviveBlob = (marker, bytes) => {
 const __adoptBody = (target, bytes) => {
   target._bodyBytes = bytes;
   target._body = undefined; // decoded lazily on the first text()/json()
+  // A revived Request got its body as bytes adopted here (it was built
+  // without `init.body`), so record that it has one: the fetch surfaces
+  // consume only a real body (#127).
+  if (target instanceof Request) target._hasBody = true;
   const body = target.body;
   if (body !== null) {
     body._st.bytes = bytes;

@@ -59,8 +59,10 @@ bucket-format changes.
   drain summed `chunk.byteLength`, which is `NaN` for a string, then copied
   into an empty target and threw `RangeError: offset is out of bounds` without
   storing anything. A `put()` now consumes the body the way the host does: a
-  string chunk is encoded as UTF-8, and any other chunk goes through the same
-  window-safe byte check every Body consumer uses.
+  string chunk is encoded as UTF-8, any other chunk goes through the same
+  window-safe byte check every Body consumer uses, and each chunk is copied as
+  it is read, so a producer that reuses one buffer across pulls cannot corrupt
+  the stored entry.
 
 - **`fetch()` no longer puts a live response body on a total deadline**
   (#136). `CELLO_FETCH_TIMEOUT_S` was applied as reqwest's total request
