@@ -40,7 +40,9 @@ bucket-format changes.
   `new Response(["alpha", "beta"]).text()` therefore rejects with
   `TypeError: This ReadableStream did not return bytes.`, an infinite
   generator constructs and reads a bounded prefix, and a non-iterable object
-  with its own `toString` still stringifies.
+  with its own `toString` still stringifies. Cancelling the body pulls the
+  producer's cleanup and adopts its outcome, so a rejecting `finally` or
+  `return()` rejects `cancel()` with that reason, as workerd's does.
 - **A body can be consumed once** (#127). A buffered body re-served its bytes
   on every `text()`, `json()`, `formData()`, `blob()`, `arrayBuffer()`, or
   `bytes()` call, so a Worker that read a body twice (or through two
@@ -52,9 +54,12 @@ bucket-format changes.
   the request's body too, even when the fetch never sends it — an aborted
   signal still leaves `bodyUsed` true and a second `fetch` refused with
   `TypeError: Cannot reconstruct a Request with a used body.` — while a
-  request with no body and an `init` carrying its own body leave the input
-  alone, as workerd behaves. A `null` body carries nothing and stays
-  readable, as in workerd.
+  request with no body, an `init` carrying its own body and a fetch whose
+  `init` is refused (an invalid method or redirect) leave the input alone,
+  and an unsupported `redirect` value reports workerd's message. A Request
+  handed to another isolate (a Durable Object call) carries body presence in
+  its marker, so a revived bodyless GET stays bodyless. A `null` body carries
+  nothing and stays readable, as in workerd.
 - **`cache.put()` takes a string chunk as its UTF-8 bytes** (#128). The capped
   drain summed `chunk.byteLength`, which is `NaN` for a string, then copied
   into an empty target and threw `RangeError: offset is out of bounds` without
