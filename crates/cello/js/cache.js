@@ -46,13 +46,20 @@
   // internal slots and rejects a chunk that is not bytes. Without the
   // coercion a string chunk made `size` NaN, the target array empty, and the
   // copy threw `RangeError: offset is out of bounds` with nothing stored.
+  // A chunk is copied as it is read, not when the body is assembled: a
+  // producer may reuse the buffer it enqueued once the next pull runs, and a
+  // retained view would then hold the later bytes. Workerd writes each chunk
+  // out host-side as it reads it, so a reused 3-byte buffer stores "alpbra";
+  // deferring the copy stored "brabra".
   const encoder = new TextEncoder();
   // Captured at install time: the harness declares these in its own script
   // scope, so they reach this script only through `__cello`.
   const bodyChunk = __cello.__bodyChunk;
   const markBodyUsed = __cello.__markBodyUsed;
   const chunkBytes = (value) =>
-    typeof value === "string" ? encoder.encode(value) : bodyChunk(value);
+    typeof value === "string"
+      ? encoder.encode(value)
+      : bodyChunk(value).slice();
 
   // Drain a response body with an explicit byte budget, like the KV value
   // drain: chunk by chunk, aborting as soon as the body alone exceeds the

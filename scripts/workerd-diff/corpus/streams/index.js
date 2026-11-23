@@ -697,11 +697,18 @@ const routes = {
     const streamedOutcome = await settle(fetch(streamed));
     const streamedUsed = streamed.bodyUsed;
     const streamedReread = await settle(streamed.text());
+    // A POST with no body supplied carries nothing to consume: workerd's
+    // `body` is null there, so a fetch leaves the request unused.
+    const bodyless = new Request("https://diff.test/bodyless", { method: "POST" });
+    const bodylessOutcome = await settle(fetch(bodyless, { signal: aborted() }));
+    const bodylessUsed = bodyless.bodyUsed;
+    const bodylessSecond = await settle(fetch(bodyless, { signal: aborted() }));
     return report({
       fetchOutcome, bodyUsed, reread, secondFetch,
       getOutcome, getUsed, getSecond,
       replacedOutcome, replacedUsed,
       streamedOutcome, streamedUsed, streamedReread,
+      bodylessOutcome, bodylessUsed, bodylessSecond,
     });
   },
 
