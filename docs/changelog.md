@@ -95,7 +95,7 @@ at run time (#194), described below. The differential gate gained six cases
 from those fixes and fourteen Request/body cases from the changes below,
 plus 25 binding cases, six Web Crypto cases, 23 Durable Object and
 WebSocket cases, 66 Fetch API cases and nine missing-API cases (all below),
-191 in total. No configuration or
+193 in total. No configuration or
 bucket-format changes; the development store gains two nullable
 columns, which is backward compatible (see below). The `eval`,
 `Function` and wasm runtime-compilation changes are listed after the stream
