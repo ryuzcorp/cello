@@ -1,0 +1,677 @@
+// Modified by Ryuz Corp (Cello): Fetch API object-model conformance (workerd
+// differential sweep).
+// Copyright 2026 Deno Land Inc. Apache-2.0 license.
+
+// A black-box runner, not node code: it boots the binary, copies fixtures,
+// and polls TCP with wall-clock deadlines, so the execution boundary's
+// injected clock/filesystem/async rules do not apply to it.
+#![allow(clippy::disallowed_methods)]
+
+//! The Fetch API object model answers what workerd 1.20261121.1 answers.
+//!
+//! Every assertion here is one divergence the differential harness found and
+//! filed: a string body's default `content-type` (#159), cache modes (#160),
+//! an incoming request's `manual` redirect mode (#161), `Response` status
+//! validation (#163), a body on a null-body status (#165), CR/LF in
+//! `statusText` (#167), immutable incoming headers (#169), the abort reason
+//! wording (#172), a followed redirect's `url`/`redirected` (#173), relative
+//! URLs in `new Request` (#175), a GET/HEAD body (#176), `integrity`/
+//! `keepalive` defaults (#177), a non-signal `signal` and a non-empty
+//! `integrity` (#178), `File.lastModified` (#179), the retained
+//! `content-length` (#180), header validation messages (#182), URL /
+//! `AbortSignal.any` / redirect error messages (#184), `blob().type` (#186),
+//! a FormData Blob's name (#188) and TRACE (#190).
+//!
+//! The same Worker runs on workerd under `scripts/workerd-diff`, so the
+//! transcripts are pinned on both sides.
+
+use serde_json::Value;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Stdio};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+mod common;
+use common::{announced, cello_command, forward_announce};
+
+/// The gzip member for "hello gzip" (30 bytes), so the helper origin can
+/// answer a compressed body with a `content-length` that does not describe
+/// the decoded bytes.
+const GZIP_BODY: [u8; 30] = [
+    31, 139, 8, 0, 0, 0, 0, 0, 0, 3, 203, 72, 205, 201, 201, 87, 72, 175, 202, 44, 0, 0, 25, 106,
+    210, 223, 10, 0, 0, 0,
+];
+
+fn fixture_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/fetch-api")
+        .canonicalize()
+        .expect("fixture exists")
+}
+
+/// Tempdir for one fixture copy: `/dev/shm` when usable, else the default
+/// tempdir.
+fn fixture_tempdir(prefix: &str) -> tempfile::TempDir {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(prefix);
+    match builder.tempdir_in("/dev/shm") {
+        Ok(dir) => dir,
+        Err(error) => {
+            eprintln!("fixture tempdir fell back to disk (/dev/shm unusable: {error})");
+            builder.tempdir().expect("fixture tempdir")
+        }
+    }
+}
+
+fn copy_dir(src: &Path, dst: &Path, origin_port: u16) {
+    std::fs::create_dir_all(dst).expect("create fixture dir");
+    std::fs::copy(src.join("wrangler.json"), dst.join("wrangler.json"))
+        .expect("copy wrangler.json");
+    let worker = std::fs::read_to_string(src.join("worker.js")).expect("read worker.js");
+    std::fs::write(
+        dst.join("worker.js"),
+        worker.replace("__ORIGIN_PORT__", &origin_port.to_string()),
+    )
+    .expect("write worker.js");
+}
+
+/// A booted `cello dev` and its address. Kills the child on drop, so a
+/// failing assertion cannot leak a server onto its port.
+struct TestNode {
+    child: Child,
+    public: String,
+}
+
+impl TestNode {
+    fn boot(app_project: &Path) -> Self {
+        let mut child = cello_command(app_project, [("NO_COLOR", "1".to_string())])
+            .arg("dev")
+            .arg(app_project)
+            .arg("--port")
+            .arg("0")
+            .arg("--no-watch")
+            .arg("--logs")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn cello dev");
+        let mut stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+        std::thread::spawn(move || {
+            let mut sink = Vec::new();
+            let _ = stdout.read_to_end(&mut sink);
+        });
+        let announced_lines: Arc<Mutex<Vec<String>>> = Arc::default();
+        forward_announce(stderr, Arc::clone(&announced_lines));
+        let mut node = Self {
+            child,
+            public: String::new(),
+        };
+        node.public = poll_until("boot", Duration::from_secs(120), || {
+            if let Some(status) = node.child.try_wait().expect("poll child") {
+                panic!("cello dev exited during boot: {status}");
+            }
+            let addr = announced(&announced_lines, "cello listening on ")?;
+            probe(&addr, "/health").then_some(addr)
+        });
+        node
+    }
+}
+
+impl Drop for TestNode {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn read_head(stream: &mut TcpStream) -> Vec<u8> {
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        stream.read_exact(&mut byte).expect("read request head");
+        head.push(byte[0]);
+        if head.ends_with(b"\r\n\r\n") {
+            return head;
+        }
+        assert!(head.len() < 8192, "request head too long");
+    }
+}
+
+/// The helper origin the fixture fetches, so its `fetch()` calls do not target
+/// this Worker. It answers plain HTTP/1.1 on loopback.
+fn serve_origin(listener: TcpListener) {
+    for stream in listener.incoming() {
+        let Ok(mut stream) = stream else {
+            continue;
+        };
+        std::thread::spawn(move || {
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+            let head = read_head(&mut stream);
+            let line = String::from_utf8_lossy(&head);
+            let request = line.lines().next().unwrap_or_default().to_string();
+            let mut parts = request.split_whitespace();
+            let method = parts.next().unwrap_or_default();
+            let target = parts.next().unwrap_or_default();
+            if target.starts_with("/redirect") {
+                let code = target
+                    .split("code=")
+                    .nth(1)
+                    .and_then(|rest| rest.split('&').next())
+                    .unwrap_or("302");
+                let to = target
+                    .split("to=")
+                    .nth(1)
+                    .and_then(|rest| rest.split('&').next())
+                    .unwrap_or("/target");
+                let response = format!(
+                    "HTTP/1.1 {code} Found\r\nLocation: {to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(response.as_bytes());
+            } else if target.starts_with("/gzip") {
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    GZIP_BODY.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(&GZIP_BODY);
+            } else if target.starts_with("/echo") {
+                // Reproduce the request head so the test can assert the
+                // subrequest carried a default content type (#159).
+                let mut headers = serde_json::Map::new();
+                for header in line.lines().skip(1) {
+                    if let Some((name, value)) = header.split_once(':') {
+                        if name.trim().eq_ignore_ascii_case("content-type") {
+                            headers.insert(
+                                "content-type".into(),
+                                Value::String(value.trim().to_string()),
+                            );
+                        }
+                    }
+                }
+                let body = serde_json::json!({
+                    "method": method,
+                    "headers": Value::Object(headers),
+                })
+                .to_string();
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(body.as_bytes());
+            } else {
+                let body = b"target-body";
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(body);
+            }
+            let _ = stream.flush();
+        });
+    }
+}
+
+fn get(addr: &str, path: &str) -> Result<(u16, String), String> {
+    let mut stream = TcpStream::connect(addr).map_err(|error| format!("connect: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .map_err(|error| format!("timeout: {error}"))?;
+    let wire = format!(
+        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nx-sent: one\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+    );
+    stream
+        .write_all(wire.as_bytes())
+        .map_err(|error| format!("write: {error}"))?;
+    let mut raw = Vec::new();
+    stream
+        .read_to_end(&mut raw)
+        .map_err(|error| format!("read: {error}"))?;
+    let raw = String::from_utf8(raw).map_err(|error| format!("utf8: {error}"))?;
+    let (head, body) = raw
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| format!("no header/body split in {raw:?}"))?;
+    let status: u16 = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .ok_or_else(|| format!("no status in {head:?}"))?;
+    Ok((status, body.to_string()))
+}
+
+fn probe(addr: &str, path: &str) -> bool {
+    matches!(get(addr, path), Ok((200, _)))
+}
+
+fn poll_until(
+    name: &str,
+    deadline: Duration,
+    mut condition: impl FnMut() -> Option<String>,
+) -> String {
+    let start = Instant::now();
+    loop {
+        if let Some(done) = condition() {
+            return done;
+        }
+        if start.elapsed() > deadline {
+            panic!("{name}: condition unmet within the deadline");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn json_of(body: &str) -> Value {
+    serde_json::from_str(body).unwrap_or_else(|error| panic!("result JSON ({error}): {body}"))
+}
+
+/// Reads `/path` and returns the route's own report, so a failed route surfaces
+/// its `uncaught` entry instead of a JSON parse error.
+fn route(node: &TestNode, path: &str) -> Value {
+    let (status, body) = get(&node.public, path).expect("request");
+    assert_eq!(status, 200, "{path}: {body}");
+    let out = json_of(&body);
+    assert!(
+        out.get("uncaught").is_none(),
+        "{path} threw: {}",
+        out["uncaught"]
+    );
+    out
+}
+
+/// The outcome of one `settle` attempt at `path`, either `.ok` or
+/// `.threw.name`/`.threw.message`.
+fn outcome(value: &Value) -> String {
+    if let Some(ok) = value.get("ok") {
+        return match ok {
+            Value::String(text) => text.clone(),
+            other => other.to_string(),
+        };
+    }
+    let threw = &value["threw"];
+    format!(
+        "{}: {}",
+        threw["name"].as_str().unwrap_or("?"),
+        threw["message"].as_str().unwrap_or("?")
+    )
+}
+
+fn assert_outcome(value: &Value, expected: &str, what: &str) {
+    assert_eq!(outcome(value), expected, "{what}: {value}");
+}
+
+#[test]
+fn fetch_api_object_model_matches_workerd() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind origin");
+    let origin_port = listener.local_addr().expect("origin addr").port();
+    std::thread::spawn(move || serve_origin(listener));
+
+    let fixture = fixture_dir();
+    let project = fixture_tempdir("cello-fetch-api-");
+    copy_dir(&fixture, project.path(), origin_port);
+    let node = TestNode::boot(project.path());
+
+    // #159 / #186: a string body's default type, bytes staying untyped, and
+    // the parsed MIME type of a Blob built from a response.
+    let body = route(&node, "/body-defaults");
+    assert_eq!(
+        body["string"],
+        serde_json::json!([["content-type", "text/plain;charset=UTF-8"]]),
+        "#159: a string Response body carries the Fetch default type: {body}"
+    );
+    assert_eq!(
+        body["requestString"],
+        serde_json::json!([["content-type", "text/plain;charset=UTF-8"]]),
+        "#159: a string Request body carries the Fetch default type: {body}"
+    );
+    assert_eq!(
+        body["bytes"],
+        serde_json::json!([]),
+        "#159: bytes stay untyped"
+    );
+    assert_eq!(
+        body["requestBytes"],
+        serde_json::json!([]),
+        "#159: byte bodies stay untyped"
+    );
+    assert_eq!(
+        body["number"],
+        serde_json::json!([["content-type", "text/plain;charset=UTF-8"]]),
+        "#159: a non-BodyInit body stringifies and carries the default type"
+    );
+    assert_eq!(
+        body["explicit"],
+        serde_json::json!([["content-type", "text/html"]]),
+        "#159: an explicit content-type is never overwritten"
+    );
+    assert_eq!(
+        body["blobTypes"]["spaced"], "text/plain;charset=utf-8",
+        "#186: blob().type re-serializes the MIME type: {body}"
+    );
+    assert_eq!(
+        body["blobTypes"]["upper"], "text/plain;charset=UTF-8",
+        "#186"
+    );
+    assert_eq!(
+        body["blobTypes"]["boundary"], "text/plain;charset=utf-8; boundary=abc",
+        "#186: workerd keeps a space before boundary: {body}"
+    );
+    assert_eq!(
+        body["blobTypes"]["bare"], "text/plain;charset=UTF-8",
+        "#159/#186"
+    );
+    assert_eq!(
+        body["blobTypes"]["invalid"], "",
+        "#186: an unparsable type is empty"
+    );
+    assert_eq!(body["text"], "hello");
+
+    // #163 / #165 / #167.
+    let status = route(&node, "/response-status");
+    let range = "RangeError: Responses may only be constructed with status codes in the range 200 to 599, inclusive.";
+    for code in ["0", "99", "101", "600", "junk"] {
+        assert_outcome(
+            &status["status"][code],
+            range,
+            &format!("#163 status {code}"),
+        );
+    }
+    assert_eq!(status["status"]["200"]["ok"], 200);
+    assert_eq!(
+        status["status"]["201.5"]["ok"], 201,
+        "#163: a fractional status truncates"
+    );
+    assert_eq!(
+        status["status"]["string"]["ok"], 200,
+        "#163: a numeric string converts"
+    );
+    let null_body =
+        "TypeError: Response with null body status (101, 204, 205, or 304) cannot have a body.";
+    for case in ["204-string", "205-string", "304-stream"] {
+        assert_outcome(
+            &status["nullBody"][case],
+            null_body,
+            &format!("#165 {case}"),
+        );
+    }
+    assert_eq!(status["nullBody"]["204-null"]["ok"], 204);
+    assert_eq!(
+        status["nullBody"]["204-empty"]["ok"], 204,
+        "#165: an empty body is allowed"
+    );
+    assert_eq!(status["nullBody"]["304-null"]["ok"], 304);
+    for case in ["newline", "cr", "tab"] {
+        assert_outcome(
+            &status["statusText"][case],
+            "TypeError: Invalid statusText",
+            &format!("#167 {case}"),
+        );
+    }
+    assert_eq!(status["statusText"]["plain"]["ok"], "Made It");
+    assert_eq!(status["statusText"]["unicode"]["ok"], "h\u{e9}llo");
+    assert_eq!(
+        status["plainWebSocket"]["status"], 101,
+        "#163: a 101 with a WebSocket is valid"
+    );
+    assert_eq!(status["plainWebSocket"]["body"], Value::Null);
+    assert_outcome(
+        &status["plainWebSocket"]["mismatch"],
+        "RangeError: Responses with a WebSocket must have status code 101.",
+        "#163",
+    );
+
+    // #160 / #175 / #176 / #177 / #178 / #184 / #190.
+    let options = route(&node, "/request-options");
+    assert_eq!(options["cache"]["no-store"]["ok"], "no-store", "#160");
+    assert_eq!(options["cache"]["no-cache"]["ok"], "no-cache", "#160");
+    assert_outcome(
+        &options["cache"]["default"],
+        "TypeError: Unsupported cache mode: default",
+        "#160",
+    );
+    assert_outcome(
+        &options["cache"]["bogus"],
+        "TypeError: Unsupported cache mode: bogus",
+        "#160",
+    );
+    assert_outcome(
+        &options["url"]["relative"],
+        "TypeError: Invalid URL: /x",
+        "#175",
+    );
+    assert_outcome(
+        &options["url"]["junk"],
+        "TypeError: Invalid URL: not a url",
+        "#175",
+    );
+    assert_eq!(
+        options["url"]["normal"]["ok"], "https://example.com/a%20b",
+        "#175: the stored url is the serialized absolute URL: {options}"
+    );
+    let get_body = "TypeError: Request with a GET or HEAD method cannot have a body.";
+    assert_outcome(&options["body"]["get"], get_body, "#176");
+    assert_outcome(&options["body"]["head"], get_body, "#176");
+    assert_eq!(options["body"]["post"]["ok"], "POST");
+    assert_eq!(options["defaults"]["integrity"], "", "#177");
+    assert_eq!(options["defaults"]["keepalive"], false, "#177");
+    assert_eq!(options["defaults"]["cache"], "<undefined>", "#177/#160");
+    assert_outcome(
+        &options["signal"]["junk"],
+        "TypeError: Incorrect type for the 'signal' field on 'RequestInitializerDict': the provided value is not of type 'AbortSignal'.",
+        "#178",
+    );
+    assert_eq!(
+        options["signal"]["null"]["ok"], true,
+        "#178: null is an absent signal"
+    );
+    assert_outcome(
+        &options["integrity"]["value"],
+        "TypeError: Subrequest integrity checking is not implemented. The integrity option must be either undefined or an empty string.",
+        "#178",
+    );
+    assert_eq!(options["integrity"]["empty"]["ok"], "", "#178");
+    assert_outcome(
+        &options["redirect"]["error"],
+        "TypeError: Invalid redirect value, must be one of \"follow\" or \"manual\" (\"error\" won't be implemented since it does not make sense at the edge; use \"manual\" and check the response status code).",
+        "#184",
+    );
+    assert_eq!(
+        options["redirect"]["upper"]["ok"], "follow",
+        "#184: the mode is case-insensitive"
+    );
+    assert_outcome(&options["redirect"]["bogus"], "TypeError: Invalid redirect value, must be one of \"follow\" or \"manual\" (\"error\" won't be implemented since it does not make sense at the edge; use \"manual\" and check the response status code).", "#184");
+    assert_eq!(options["method"]["trace"]["ok"], "TRACE", "#190");
+    assert_eq!(options["method"]["TRACE"]["ok"], "TRACE", "#190");
+    assert_outcome(
+        &options["method"]["connect"],
+        "TypeError: Invalid HTTP method string: connect",
+        "#190",
+    );
+
+    // #172 / #184.
+    let abort = route(&node, "/abort");
+    assert_eq!(abort["name"], "AbortError", "#172");
+    assert_eq!(abort["message"], "The operation was aborted", "#172");
+    assert_outcome(
+        &abort["thrown"],
+        "AbortError: The operation was aborted",
+        "#172",
+    );
+    assert_outcome(
+        &abort["anyElement"],
+        "TypeError: Incorrect type for array element 0: the provided value is not of type 'AbortSignal'.",
+        "#184",
+    );
+    assert_outcome(
+        &abort["anyElementIndex"],
+        "TypeError: Incorrect type for array element 1: the provided value is not of type 'AbortSignal'.",
+        "#184",
+    );
+    assert_outcome(
+        &abort["anyNotArray"],
+        "TypeError: Failed to execute 'any' on 'AbortSignal': parameter 1 is not of type 'Array'.",
+        "#184",
+    );
+
+    // #184.
+    let url = route(&node, "/url");
+    assert_outcome(
+        &url["invalidPort"],
+        "TypeError: Invalid URL string.",
+        "#184",
+    );
+    assert_outcome(&url["invalid"], "TypeError: Invalid URL string.", "#184");
+    assert_outcome(&url["relative"], "TypeError: Invalid URL string.", "#184");
+    assert_outcome(
+        &url["searchParams"],
+        "TypeError: Cannot assign to read only property 'searchParams' of object '[object URL]'",
+        "#184",
+    );
+
+    // #179 / #188.
+    let file = route(&node, "/file-formdata");
+    assert_eq!(
+        file["lastModified"]["infinity"]["ok"],
+        Value::Null,
+        "#179: Infinity survives"
+    );
+    assert_eq!(file["lastModified"]["nan"]["ok"], 0, "#179");
+    assert_eq!(file["lastModified"]["negative"]["ok"], -1, "#179");
+    assert_eq!(file["names"]["blob"], "blobNoName", "#188");
+    assert_eq!(
+        file["names"]["explicit"], "explicit.bin",
+        "#188: an explicit filename wins"
+    );
+    assert_eq!(file["names"]["file"], "own.txt", "#188");
+    assert_eq!(
+        file["names"]["set"], "setKey",
+        "#188: set() names it after the key too"
+    );
+
+    // #182.
+    let headers = route(&node, "/headers");
+    assert_outcome(
+        &headers["appendSpace"],
+        "TypeError: Invalid header name.",
+        "#182",
+    );
+    assert_outcome(
+        &headers["valueNewline"],
+        "TypeError: Invalid header value.",
+        "#182",
+    );
+    assert_outcome(
+        &headers["valueNul"],
+        "TypeError: Invalid header value.",
+        "#182",
+    );
+    assert_eq!(
+        headers["emptyName"]["ok"],
+        serde_json::json!([["", "v"]]),
+        "#182: workerd accepts an empty header name (a deliberate deviation from the spec)"
+    );
+    assert_eq!(
+        headers["unicodeName"]["ok"],
+        serde_json::json!([["\u{2713}", "v"]]),
+        "#182: workerd accepts a non-ASCII header name"
+    );
+    assert_outcome(
+        &headers["sequenceEntry"],
+        "TypeError: To initialize a Headers object from a sequence, each inner sequence must have exactly two elements.",
+        "#182",
+    );
+    assert_outcome(
+        &headers["primitiveInit"],
+        "TypeError: Failed to construct 'Headers': constructor parameter 1 is not of type 'Headers or Sequence or object'.",
+        "#182",
+    );
+    assert_outcome(
+        &headers["stringInit"],
+        "TypeError: Failed to construct 'Headers': constructor parameter 1 is not of type 'Headers or Sequence or object'.",
+        "#182: a string is not a valid init",
+    );
+    assert_eq!(
+        headers["functionInit"]["ok"],
+        serde_json::json!([]),
+        "#182: a function is a record"
+    );
+
+    // #161 / #169 / #176.
+    let incoming = route(&node, "/incoming");
+    assert_eq!(incoming["redirect"], "manual", "#161");
+    assert_eq!(incoming["copyRedirect"], "manual", "#161");
+    for case in ["set", "append", "delete"] {
+        assert_outcome(
+            &incoming["headers"][case],
+            "TypeError: Can't modify immutable headers.",
+            &format!("#169 incoming headers.{case}"),
+        );
+    }
+    assert_eq!(
+        incoming["headers"]["after"],
+        Value::Null,
+        "#169: the header was not added"
+    );
+    assert_eq!(incoming["headers"]["kept"], "one", "#169");
+    assert_eq!(
+        incoming["copyMutable"]["ok"], "1",
+        "#169: a copy's headers are mutable"
+    );
+    assert_eq!(
+        incoming["bodylessGet"]["clone"]["ok"], "GET",
+        "#176: a host-built GET is not refused"
+    );
+
+    // #173 / #161 / #180 / #159 (subrequest) / #178 (fetch init).
+    let fetch = route(&node, "/fetch");
+    assert_eq!(fetch["follow"]["status"], 200, "#173: {fetch}");
+    assert_eq!(
+        fetch["follow"]["redirected"], true,
+        "#173: a followed redirect is reported"
+    );
+    assert_eq!(
+        fetch["follow"]["url"], "/target",
+        "#173: response.url is the final URL"
+    );
+    assert_eq!(fetch["follow"]["body"], "target-body", "#173");
+    assert_eq!(
+        fetch["manual"]["status"], 302,
+        "#173: manual does not follow"
+    );
+    assert_eq!(fetch["manual"]["redirected"], false, "#173");
+    assert_eq!(fetch["manual"]["location"], "/target", "#173");
+    assert_eq!(
+        fetch["proxied"]["status"], 302,
+        "#161: an incoming request proxies as manual"
+    );
+    assert_eq!(fetch["proxied"]["redirectMode"], "manual", "#161");
+    assert_eq!(fetch["gzip"]["encoding"], "gzip", "#180");
+    assert_eq!(
+        fetch["gzip"]["length"], "30",
+        "#180: content-length is retained"
+    );
+    assert_eq!(fetch["gzip"]["body"], "hello gzip", "#180");
+    assert_eq!(fetch["echo"]["method"], "POST");
+    assert_eq!(
+        fetch["echo"]["contentType"], "text/plain;charset=UTF-8",
+        "#159: a string body reaches the origin typed"
+    );
+    assert_eq!(
+        fetch["fetchInit"]["cache"]["ok"], 200,
+        "#160: fetch(url, {{ cache }}) works"
+    );
+    assert_outcome(
+        &fetch["fetchInit"]["integrity"],
+        "TypeError: Subrequest integrity checking is not implemented. The integrity option must be either undefined or an empty string.",
+        "#178 fetch init",
+    );
+    assert_outcome(
+        &fetch["fetchInit"]["redirectError"],
+        "TypeError: Invalid redirect value, must be one of \"follow\" or \"manual\" (\"error\" won't be implemented since it does not make sense at the edge; use \"manual\" and check the response status code).",
+        "#184 fetch init",
+    );
+}

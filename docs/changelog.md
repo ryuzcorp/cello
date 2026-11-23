@@ -322,6 +322,92 @@ Object SQL is still stored as INTEGER `1`/`0`, not workerd's TEXT
 types would make `if (row.flag)` truthy for a new `'false'` while an old `0`
 stayed falsy, with no migration able to rewrite a stored value's type. See
 [Durable Objects](../services/durable-objects.md).
+The Fetch API object model now answers what workerd 1.20261121.1 answers. A
+differential sweep filed 23 divergences (#159-#190); this release fixes the
+High and Medium ones and the cheap Low ones. A string body carries its default
+`content-type`, an incoming request's redirect mode is `manual` and its headers
+are immutable, `Response` validates its status, status text and body, a
+followed redirect reports where it landed, and `new Request` validates its URL,
+method, body, cache mode, signal and integrity. The new
+`fetch_api_conformance` suite pins each one, and `scripts/workerd-diff` gained
+the sweep's agreeing Fetch probes (a second origin serves their `fetch()`
+calls).
+
+- **A string body carries `content-type: text/plain;charset=UTF-8`** (#159).
+  `new Response("hello")` and `new Request(url, { body: "hello" })` left the
+  header unset, so a returned string body reached the wire untyped and a
+  proxied string body lost its type on the subrequest. A non-BodyInit body
+  (a number, an object stringified) gets it too, an explicit `content-type`
+  always wins, and byte, Blob, FormData, URLSearchParams and stream bodies
+  keep their own rules.
+- **Cache modes validate like workerd's** (#160). `cache: "no-store"` and
+  `"no-cache"` are accepted and reported by `request.cache`; every other mode,
+  including `"default"` and `"reload"`, is `TypeError: Unsupported cache mode:
+  <value>`. Before this, every mode -- including the ubiquitous
+  `fetch(url, { cache: "no-store" })` -- threw a blanket "not implemented"
+  `Error`.
+- **An incoming request's redirect mode is `manual`** (#161). A proxy that
+  forwarded an incoming request with `fetch(request)` followed redirects and
+  returned the target's 200; it now returns the 3xx, as on Cloudflare.
+- **`Response` validates its status, status text and body** (#163, #165,
+  #167). A status outside 200-599 (or not a number, or `0`) is a `RangeError`
+  with workerd's message, a fractional status truncates (`201.5` is `201`), a
+  `101` is allowed only alongside a `WebSocket` (and a `WebSocket` only with a
+  `101`), a null-body status (`101`, `204`, `205`, `304`) refuses a non-empty
+  or streaming body, and a C0 control in `statusText` is `TypeError: Invalid
+  statusText`.
+- **An incoming request's headers are immutable** (#169). `set`, `append` and
+  `delete` on `request.headers` throw `TypeError: Can't modify immutable
+  headers.` instead of silently doing nothing, and `Request.prototype.headers`
+  is a readonly accessor. A copy made with `new Request(request)` keeps a
+  mutable list.
+- **The default abort reason reads `The operation was aborted`** (#172), as
+  workerd's does.
+- **A followed redirect reports its final URL** (#173). `response.url` is the
+  URL that answered and `response.redirected` is true; before this the
+  response claimed the original URL and `redirected: false`, so a proxy that
+  resolved links against `response.url` produced wrong URLs. `clone()` copies
+  both fields.
+- **`new Request` validates its URL and body** (#175, #176). A relative or
+  unparsable input is `TypeError: Invalid URL: <input>`, and the stored `url`
+  is the serialized absolute URL; a GET or HEAD with a body is `TypeError:
+  Request with a GET or HEAD method cannot have a body.` An incoming GET is
+  not refused: the host builds its request through an internal path, as
+  workerd's runtime does.
+- **`integrity` and `keepalive` have their spec defaults** (#177): `""` and
+  `false`. A non-empty `integrity` is refused (#178) with workerd's "not
+  implemented" `TypeError`, and a non-`AbortSignal` `signal` is refused with
+  the type error it names. `null` is an absent signal. The same validation
+  covers `fetch(url, init)`.
+- **`File.lastModified` keeps `Infinity`** (#179); only `NaN` becomes 0.
+- **`fetch()` keeps `content-length` on a decompressed response** (#180), as
+  workerd does, alongside the retained `content-encoding`.
+- **Error messages match workerd's** (#184): `Invalid URL string.` for a URL
+  that does not parse, workerd's read-only message for assigning
+  `url.searchParams`, `Unable to parse URL: <input>` from `Response.redirect`,
+  the element-typed `TypeError` from `AbortSignal.any`, and the invalid-redirect
+  message for `redirect: "error"`, which is now refused at construction
+  (previously accepted and failed later).
+- **`Response.blob()` re-serializes the MIME type** (#186). `blob().type` is
+  the parsed and re-serialized `content-type` (`text/plain;charset=UTF-8`, not
+  the raw lower-cased header), so a MIME equality check on a blob's type
+  matches workerd's.
+- **Header validation follows workerd** (#182): the messages are workerd's,
+  and workerd's *acceptance* of an empty header name and a non-ASCII one is
+  reproduced deliberately -- both deviate from the spec's token production,
+  and a name workerd accepts must not throw here. The outgoing HTTP layer
+  still refuses to put such a name on the wire.
+- **A `Blob` appended to `FormData` without a filename is named after the
+  entry key** (#188), which is workerd's behaviour; the WHATWG spec says
+  `"blob"`, so this deliberately follows workerd.
+- **`TRACE` is a known method again** (#190). `new Request(url, { method:
+  "trace" })` normalizes to `"TRACE"` instead of throwing. `CONNECT` and
+  `TRACK` are still refused. (The filed issue expected workerd to refuse
+  `"TRACE"`; workerd 1.20261121.1 accepts it, and the gate pins that.)
+
+Still divergent and left for the slices that own them: the internal-own-key and
+`[object Object]` tag differences (#170, #171) and the incoming GET body stream
+(#174).
 
 ## v0.2.8
 

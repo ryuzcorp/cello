@@ -66,12 +66,38 @@ use. An unsupported feature that stays silent is a defect.
 
 ### [Fetch, Request, Response, and Headers](https://developers.cloudflare.com/workers/runtime-apis/fetch/)
 
-- The `cache` request option is unavailable.
+- `Request` and `fetch()` accept `cache: "no-store"` and `cache: "no-cache"`
+  and refuse every other mode with workerd's `TypeError: Unsupported cache
+  mode: <value>`; the cache is not consulted. `redirect: "error"` is refused
+  at construction, as in workerd, because the mode is not implemented.
+- An incoming request's `redirect` is `manual` and its `headers` are
+  immutable, so `fetch(request)` returns a 3xx instead of following it and a
+  header rewrite throws `TypeError: Can't modify immutable headers.`
+- A string body (or any other non-`BodyInit` value) carries
+  `content-type: text/plain;charset=UTF-8` unless the init names one. Bytes,
+  `Blob`, `FormData`, `URLSearchParams` and stream bodies keep their own rules.
+- `Response` validates its status (`200`-`599`, except `101` with a
+  `WebSocket`), refuses a body on a null-body status (`101`, `204`, `205`,
+  `304`) unless it is empty, and refuses a C0 control in `statusText`.
+- `Response.blob().type` is the parsed and re-serialized `content-type`;
+  `Blob.type` on a user-built `Blob` is the raw lower-cased string, as in
+  workerd.
+- Header names are validated with workerd's rule rather than the spec's token
+  production: an empty name and a non-ASCII name are accepted (workerd
+  accepts them), and the outgoing HTTP layer refuses to send them.
+- A `Blob` appended to `FormData` without a filename is named after the entry
+  key, which is workerd's behaviour and not the WHATWG spec's `"blob"`.
+- `new Request(url, { method: "trace" })` normalizes to `TRACE`; `CONNECT`
+  and `TRACK` are refused.
 - A gzip or deflate response body decodes before delivery, unless your
   request names `accept-encoding` (then the body arrives raw, as the Fetch
-  standard requires). `content-encoding` stays on the response, as in
-  workerd; the wire size no longer describes the body, so `content-length`
-  is removed.
+  standard requires). `content-encoding` and the original `content-length`
+  both stay on the response, as in workerd, even though neither describes the
+  decoded body.
+- A followed redirect sets `response.url` to the URL that answered and
+  `response.redirected` to `true`. A redirect chain that lands back on the
+  exact request URL reports `redirected: false` (the hop count is not
+  exposed by the HTTP client).
 - An inbound `Request` carries a `cf` object without Cloudflare edge
   fields. Cello cannot prove the geolocation, colo, or TLS metadata.
 - Cello removes `Content-Length` from a Worker response, except for a

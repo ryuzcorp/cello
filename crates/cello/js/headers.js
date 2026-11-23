@@ -1,4 +1,12 @@
-const _tokenRe = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+// Workerd's name rule, which is looser than the spec's token production: it
+// rejects C0 controls, SP, DEL and the RFC 2616 separators, and accepts every
+// other byte -- including an empty name and bytes above DEL. Matching it lets
+// a Worker that round-trips a proxied or computed header name behave the same
+// on both runtimes; the outgoing HTTP layer still refuses to put such a name
+// on the wire, exactly as workerd's does. A stricter check here made
+// `new Headers({ "": "v" })` and a non-ASCII name throw where workerd
+// accepts them (#182).
+const _tokenRe = /^[^\u0000-\u0020\u007f()<>@,;:\\"\/\[\]?={}]*$/;
 // Token validation is memoized by name: a Worker sends the same handful of
 // header names on every subrequest, so the regex would run once per header
 // per request forever. The cache is a null-prototype object because the key
@@ -21,8 +29,7 @@ function _checkName(name) {
     _nameCache[name] = valid;
   }
   if (!valid)
-    throw new TypeError(
-      "Invalid header name: " + name);
+    throw new TypeError("Invalid header name.");
   // The name is returned as written. Lower-casing here would put cello's
   // spelling on the wire instead of the author's, which anything that
   // canonicalizes over the received bytes can see -- an AWS SigV4 signer
@@ -46,7 +53,7 @@ function _checkValue(value) {
     const c = value.charCodeAt(i);
     if (c === 0 || c === 0x0A || c === 0x0D)
       throw new TypeError(
-        "Invalid header value");
+        "Invalid header value.");
   }
   return value;
 }
@@ -145,8 +152,15 @@ class Headers {
   constructor(init) {
     this.__celloHost = _noClone;
     if (init === undefined) return;
-    if (init === null || typeof init !== "object")
-      throw new TypeError("Invalid Headers init");
+    // WebIDL's "Headers or Sequence or object": a primitive is none of them,
+    // so it is refused before any iteration. A function is an object (a
+    // record with no enumerable properties, so an empty Headers), and a
+    // string is not, though it is iterable.
+    if (init === null ||
+        (typeof init !== "object" && typeof init !== "function"))
+      throw new TypeError(
+        "Failed to construct 'Headers': constructor parameter 1 is not of " +
+        "type 'Headers or Sequence or object'.");
     // Sequence-like (includes Headers with its default
     // iterator or any user-overridden one) takes precedence
     // over record so custom iterators are honored.
@@ -155,7 +169,8 @@ class Headers {
         if (!pair || typeof pair !== "object"
             || pair.length !== 2)
           throw new TypeError(
-            "Headers init entry must be a 2-tuple");
+            "To initialize a Headers object from a sequence, each inner " +
+            "sequence must have exactly two elements.");
         this.append(pair[0], pair[1]);
       }
     } else {
