@@ -388,6 +388,29 @@ fn forwards_worker_header(
             && status != StatusCode::NO_CONTENT))
 }
 
+/// A Worker response header the HTTP layer can represent, or none.
+///
+/// workerd keeps the response: a name its header layer cannot represent (an
+/// empty name, a non-ASCII one, anything with a separator) is dropped, and a
+/// value drops the bytes a field value may not carry instead of failing the
+/// whole response. Cello's `Headers` now accepts the same names workerd does
+/// (#182), so without this a Worker that replays a computed header name would
+/// turn its own response into `500 invalid Worker headers`.
+fn representable_worker_header(
+    name: &str,
+    value: &str,
+) -> Option<(hyper::header::HeaderName, hyper::header::HeaderValue)> {
+    let name = hyper::header::HeaderName::from_bytes(name.as_bytes()).ok()?;
+    // The field-value grammar: HT, SP and every byte above SP except DEL.
+    // Non-ASCII bytes are kept (obs-text), as workerd's writer keeps them.
+    let value: Vec<u8> = value
+        .bytes()
+        .filter(|byte| *byte == b'\t' || (*byte > 0x1F && *byte != 0x7F))
+        .collect();
+    let value = hyper::header::HeaderValue::from_bytes(&value).ok()?;
+    Some((name, value))
+}
+
 fn runtime_response(
     worker_response: cello::js::HttpResponse,
     preserve_representation_length: bool,
@@ -400,7 +423,9 @@ fn runtime_response(
         if !forwards_worker_header(&name, preserve_representation_length, status) {
             continue;
         }
-        builder = builder.header(name, value);
+        if let Some((name, value)) = representable_worker_header(&name, &value) {
+            builder = builder.header(name, value);
+        }
     }
     let body = match worker_response.stream {
         Some(stream) => {

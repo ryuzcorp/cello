@@ -133,6 +133,12 @@ const routes = {
       TRACE: settle(() => new Request("https://e.com/", { method: "TRACE" }).method),
       connect: settle(() => new Request("https://e.com/", { method: "connect" }).method),
     },
+    // #169: `headers` is a readonly attribute with workerd's message.
+    headersAssign: settle(() => {
+      const request = new Request("https://e.com/");
+      request.headers = new Headers({ x: "1" });
+      return "assigned";
+    }),
   }),
 
   // #172 the default abort reason; #184 AbortSignal.any's element check.
@@ -160,6 +166,51 @@ const routes = {
       return url.href;
     }),
   }),
+
+  // #165: a fetched 204/205/304 has no body at all, as workerd's response.
+  "/fetch/null-body": async () => {
+    const one = async (path) => {
+      const response = await fetch(`${HELPER}${path}`);
+      return {
+        status: response.status,
+        bodyIsNull: response.body === null,
+        contentType: response.headers.get("content-type"),
+        text: await response.text(),
+        ok: response.ok,
+      };
+    };
+    return {
+      noContent: await one("/no-content"),
+      resetContent: await one("/reset-content"),
+      notModified: await one("/not-modified"),
+    };
+  },
+
+  // #180: a forwarded response's `content-length` must not frame the new
+  // subrequest body; the origin reports what it actually read.
+  "/fetch/reframe": async () => {
+    const compressed = await fetch(`${HELPER}/gzip`);
+    const text = await compressed.text();
+    const echoed = await fetch(`${HELPER}/echo`, {
+      method: "POST",
+      headers: compressed.headers,
+      body: text,
+    }).then((response) => response.json());
+    return {
+      responseEncoding: compressed.headers.get("content-encoding"),
+      responseLength: compressed.headers.get("content-length"),
+      sentLength: echoed.headers["content-length"],
+      sentBytes: echoed.bodyBytes,
+      body: text,
+    };
+  },
+
+  // #182: an odd header name is dropped and the response still goes out; an
+  // unrepresentable byte in a value is dropped from the value.
+  "/raw/odd-headers": () =>
+    new Response("ok", {
+      headers: { "": "v", "x-ok": "1", "x-ctl": "a\u0001b", "\u2713": "v" },
+    }),
 
   // #179 File lastModified; #188 a Blob entry's name.
   "/file-formdata": () => {
