@@ -366,14 +366,24 @@ fn durable_object_and_websocket_match_workerd() {
         "arraybuffer",
     );
 
-    // #151: a stub rejection is the handler's own error, with no host frame.
+    // #151: the stub rejects with the value the handler threw -- class,
+    // message, `remote` and a first-line stack, with no Cello frame.
     let thrown = answer!("/throw");
-    for (label, name, message) in [
-        ("error", "Error", "handler exploded"),
-        ("type", "TypeError", "bad type"),
-        ("string", "Error", "plain string"),
-        ("dom", "AbortError", "boom"),
+    for (label, ctor, name, message) in [
+        ("error", "Error", "Error", "handler exploded"),
+        ("type", "TypeError", "TypeError", "bad type"),
+        ("string", "Error", "Error", "plain string"),
+        ("dom", "DOMException", "AbortError", "aborted!"),
+        ("num", "Error", "Error", "42"),
+        ("null", "Error", "Error", "null"),
+        ("empty", "TypeError", "TypeError", ""),
     ] {
+        expect(
+            &mut failures,
+            &format!("throw.{label}.ctor"),
+            text(&thrown, &[label, "ctor"]),
+            ctor,
+        );
         expect(
             &mut failures,
             &format!("throw.{label}.name"),
@@ -388,25 +398,184 @@ fn durable_object_and_websocket_match_workerd() {
         );
         expect(
             &mut failures,
-            &format!("throw.{label}.hostFrames"),
-            text(&thrown, &[label, "hostFrames"]),
-            "false",
+            &format!("throw.{label}.remote"),
+            text(&thrown, &[label, "remote"]),
+            "true",
+        );
+        let line = text(&thrown, &[label, "stack"])
+            .split('\n')
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        let want = if message.is_empty() {
+            name.to_string()
+        } else {
+            format!("{name}: {message}")
+        };
+        expect(
+            &mut failures,
+            &format!("throw.{label}.stackFirst"),
+            line,
+            &want,
+        );
+        expect(
+            &mut failures,
+            &format!("throw.{label}.stackLines"),
+            text(&thrown, &[label, "stackLines"]),
+            "1",
         );
     }
+    expect(
+        &mut failures,
+        "throw.dom.isDom",
+        text(&thrown, &["dom", "isDom"]),
+        "true",
+    );
+    expect(
+        &mut failures,
+        "throw.obj.ctor",
+        text(&thrown, &["obj", "ctor"]),
+        "Object",
+    );
+    expect(
+        &mut failures,
+        "throw.obj.isError",
+        text(&thrown, &["obj", "isError"]),
+        "false",
+    );
+    expect(
+        &mut failures,
+        "throw.obj.name",
+        text(&thrown, &["obj", "name"]),
+        "ObjError",
+    );
+    expect(
+        &mut failures,
+        "throw.obj.message",
+        text(&thrown, &["obj", "message"]),
+        "obj msg",
+    );
+    expect(
+        &mut failures,
+        "throw.obj.remote",
+        text(&thrown, &["obj", "remote"]),
+        "true",
+    );
+    expect(
+        &mut failures,
+        "throw.obj.stack",
+        text(&thrown, &["obj", "stack"]),
+        "null",
+    );
 
-    // #154 and #191: a boolean bind is text, and a cursor keeps no own fields.
+    // The same shapes over RPC: a DOMException stays one, a thrown string is
+    // an Error, an object stays an object, and the stack starts with the
+    // caller's frames after the first line.
+    let rpc = answer!("/rpc-throw");
+    for (method, ctor, name, message) in [
+        ("dom", "DOMException", "AbortError", "aborted!"),
+        ("str", "Error", "Error", "plain string"),
+        ("empty", "TypeError", "TypeError", ""),
+    ] {
+        expect(
+            &mut failures,
+            &format!("rpc.{method}.ctor"),
+            text(&rpc, &[method, "ctor"]),
+            ctor,
+        );
+        expect(
+            &mut failures,
+            &format!("rpc.{method}.name"),
+            text(&rpc, &[method, "name"]),
+            name,
+        );
+        expect(
+            &mut failures,
+            &format!("rpc.{method}.message"),
+            text(&rpc, &[method, "message"]),
+            message,
+        );
+        expect(
+            &mut failures,
+            &format!("rpc.{method}.remote"),
+            text(&rpc, &[method, "remote"]),
+            "true",
+        );
+    }
+    expect(
+        &mut failures,
+        "rpc.dom.isDom",
+        text(&rpc, &["dom", "isDom"]),
+        "true",
+    );
+    expect(
+        &mut failures,
+        "rpc.obj.ctor",
+        text(&rpc, &["obj", "ctor"]),
+        "Object",
+    );
+    expect(
+        &mut failures,
+        "rpc.obj.isError",
+        text(&rpc, &["obj", "isError"]),
+        "false",
+    );
+    expect(
+        &mut failures,
+        "rpc.obj.remote",
+        text(&rpc, &["obj", "remote"]),
+        "true",
+    );
+    // Workerd's RPC stack keeps the caller's own frames; the first line is
+    // the error, and no host frame may appear.
+    let rpc_stack = text(&rpc, &["str", "stack"]);
+    expect(
+        &mut failures,
+        "rpc.str.stackFirst",
+        rpc_stack.split('\n').next().unwrap_or_default().to_string(),
+        "Error: plain string",
+    );
+    if rpc_stack.contains("<anonymous>") || rpc_stack.contains("__cellHandlerThrow") {
+        failures.push(format!("rpc.str.stack leaks a host frame: {rpc_stack:?}"));
+    }
+
+    // #149: a constructor-time setAlarm is allowed on a class with no
+    // alarm() handler, as in workerd's Initializing state.
+    let ctor = answer!("/alarm-ctor");
+    expect(
+        &mut failures,
+        "alarmCtor.threw",
+        text(&ctor, &["threw"]),
+        "null",
+    );
+    expect(
+        &mut failures,
+        "alarmCtor.alarmType",
+        text(&ctor, &["alarmType"]),
+        "number",
+    );
+    expect(
+        &mut failures,
+        "alarmCtor.alarmSet",
+        text(&ctor, &["alarmSet"]),
+        "true",
+    );
+
+    // #154 is a deliberate deviation: a boolean bind stays INTEGER 1/0 so
+    // existing rows keep their type (see cloudflare-compat.md). #191: a
+    // cursor keeps no own fields.
     let sql = answer!("/sql");
     expect(
         &mut failures,
         "sql.boolType",
         text(&sql, &["boolType"]),
-        "text",
+        "integer",
     );
     expect(
         &mut failures,
         "sql.boolValue",
         text(&sql, &["boolValue"]),
-        "true",
+        "1",
     );
     expect(
         &mut failures,
@@ -485,4 +654,80 @@ fn durable_object_and_websocket_match_workerd() {
     );
 
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A compatibility date before the standard binaryType default, which the
+/// gate's fixtures (all 2026-11-01) never exercise.
+#[test]
+fn legacy_compatibility_date_keeps_arraybuffer() {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/do-ws-legacy")
+        .canonicalize()
+        .expect("fixture exists");
+    let project = fixture_tempdir("cello-do-ws-legacy-");
+    copy_dir(&fixture, project.path());
+    let node = TestNode::boot(project.path());
+
+    let answer = route(&node.public, "/pair").expect("pair route answers");
+    assert_eq!(
+        text(&answer, &["binaryType"]),
+        "arraybuffer",
+        "a 2026-01-01 deployment keeps the ArrayBuffer default"
+    );
+    assert_eq!(text(&answer, &["clientBinaryType"]), "arraybuffer");
+    assert_eq!(
+        text(&answer, &["seen", "0", "tag"]),
+        "[object ArrayBuffer]",
+        "a binary message is an ArrayBuffer at the legacy date"
+    );
+    assert_eq!(text(&answer, &["seen", "0", "bytes"]), "[1,2]");
+}
+
+/// Workerd refuses a config that both enables and disables one behaviour.
+#[test]
+fn contradictory_compat_flags_refuse_startup() {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/do-ws-bad-flags")
+        .canonicalize()
+        .expect("fixture exists");
+    let project = fixture_tempdir("cello-do-ws-bad-flags-");
+    copy_dir(&fixture, project.path());
+
+    let mut child = cello_command(project.path(), [("NO_COLOR", "1")])
+        .arg("dev")
+        .arg(project.path())
+        .arg("--port")
+        .arg("0")
+        .arg("--no-watch")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn cello dev");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll child") {
+            break status;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("cello dev booted with contradictory compatibility flags");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .expect("piped stderr")
+        .read_to_string(&mut stderr)
+        .expect("read stderr");
+    assert!(!status.success(), "startup must fail: {stderr}");
+    assert!(
+        stderr.contains(
+            "Compatibility flags are mutually contradictory: \
+             websocket_standard_binary_type vs no_websocket_standard_binary_type"
+        ),
+        "stderr: {stderr}"
+    );
 }

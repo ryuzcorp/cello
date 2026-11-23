@@ -320,11 +320,17 @@ pub fn worker_compat(metadata: &serde_json::Value) -> js::Compat {
             "2024-03-26",
         ),
         sqlite_vec: has_flag("sqlite_vec"),
-        websocket_standard_binary_type: switch(
-            "websocket_standard_binary_type",
-            "no_websocket_standard_binary_type",
-            "2026-03-17",
-        ),
+        // A deployment with no compatibility_date behaves as workerd's
+        // default (the newest date), so it gets the standard "blob" default;
+        // only a date older than the implied one keeps ArrayBuffer. The
+        // explicit opt-out wins either way.
+        websocket_standard_binary_type: if has_flag("no_websocket_standard_binary_type") {
+            false
+        } else if has_flag("websocket_standard_binary_type") {
+            true
+        } else {
+            date.is_none_or(|date| date >= "2026-03-17")
+        },
         queue_json_messages: switch("queue_json_messages", "queue_v8_messages", "2024-03-18"),
         // The opt-out wins over both the implicit `nodejs_compat`
         // population and the explicit populate flag, matching Cloudflare's
@@ -332,5 +338,44 @@ pub fn worker_compat(metadata: &serde_json::Value) -> js::Compat {
         nodejs_process_env: (has_flag("nodejs_compat")
             || has_flag("nodejs_compat_populate_process_env"))
             && !has_flag("nodejs_compat_do_not_populate_process_env"),
+    }
+}
+
+#[cfg(test)]
+mod compat_tests {
+    use super::*;
+
+    fn metadata(date: Option<&str>, flags: &[&str]) -> serde_json::Value {
+        let mut metadata = serde_json::Map::new();
+        if let Some(date) = date {
+            metadata.insert("compatibility_date".into(), serde_json::json!(date));
+        }
+        if !flags.is_empty() {
+            metadata.insert("compatibility_flags".into(), serde_json::json!(flags));
+        }
+        serde_json::Value::Object(metadata)
+    }
+
+    #[test]
+    fn binary_type_default_follows_date_flags_and_absence() {
+        let binary_type = |date: Option<&str>, flags: &[&str]| {
+            worker_compat(&metadata(date, flags)).websocket_standard_binary_type
+        };
+        // The implied date is exclusive: the day before keeps ArrayBuffer.
+        assert!(!binary_type(Some("2026-03-16"), &[]));
+        assert!(binary_type(Some("2026-03-17"), &[]));
+        // No compatibility_date behaves as workerd's default (the newest).
+        assert!(binary_type(None, &[]));
+        // Explicit flags win in both directions, and the opt-out wins even
+        // when the date would imply the flag.
+        assert!(binary_type(
+            Some("2026-01-01"),
+            &["websocket_standard_binary_type"]
+        ));
+        assert!(!binary_type(
+            Some("2026-11-01"),
+            &["no_websocket_standard_binary_type"]
+        ));
+        assert!(!binary_type(None, &["no_websocket_standard_binary_type"]));
     }
 }

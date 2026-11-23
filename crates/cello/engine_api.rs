@@ -434,15 +434,44 @@ impl std::error::Error for FailedInTurn {
     }
 }
 
+/// Which shape a Durable Object handler's thrown value must be rebuilt as in
+/// the caller's isolate. Workerd rethrows the original value: an `Error`
+/// subclass keeps its class, a `DOMException` is still a `DOMException`, a
+/// non-Error object stays an object, and a primitive is wrapped in an
+/// `Error` with its text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CellHandlerKind {
+    Error,
+    Dom,
+    Object,
+    Primitive,
+}
+
+impl CellHandlerKind {
+    /// The wire spelling the harness switches on.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Dom => "dom",
+            Self::Object => "object",
+            Self::Primitive => "primitive",
+        }
+    }
+}
+
 /// A Durable Object handler's uncaught exception, carried across the cell
-/// boundary with the class name the handler threw. Workerd hands the caller
-/// the original error object (name, message and a caller-side stack), not a
-/// re-stringified host message; a cell event's failure keeps the two parts
-/// apart so the stub call can rebuild exactly that.
+/// boundary with the shape the handler threw. Workerd hands the caller the
+/// original value (name, class, message and a caller-side stack), not a
+/// re-stringified host message; a cell event's failure keeps the parts apart
+/// so the stub call can rebuild exactly that.
 #[derive(Clone, Debug)]
 pub struct CellHandlerError {
+    pub kind: CellHandlerKind,
     pub name: String,
     pub message: String,
+    /// A structured clone of a thrown non-Error object, so the caller gets
+    /// the object rather than an `Error` around it.
+    pub value: Option<Vec<u8>>,
 }
 
 impl std::fmt::Display for CellHandlerError {

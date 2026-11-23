@@ -1,15 +1,30 @@
 // Durable Object and WebSocket divergences fixed for Cello 0.2.9. Every route
-// answers JSON with the exact strings workerd 1.20261121.1 produces, so the
-// test asserts wire text, not internals.
+// answers JSON with the exact shape workerd 1.20261121.1 produces, so the
+// test asserts observable wire results, not internals.
 
-const attempt = async (fn) => {
+import { DurableObject } from "cloudflare:workers";
+
+const attempt = async (fn, describe) => {
   try {
     await fn();
     return { ok: true };
   } catch (error) {
-    return { name: error?.name ?? String(error), message: error?.message ?? String(error) };
+    return describe(error);
   }
 };
+
+const shape = (error) => ({
+  ctor: error === null || error === undefined
+    ? String(error)
+    : (error.constructor?.name ?? typeof error),
+  name: error?.name ?? null,
+  message: error?.message ?? null,
+  isDom: error instanceof DOMException,
+  isError: error instanceof Error,
+  remote: error !== null && typeof error === "object" ? error.remote : null,
+  stack: typeof error?.stack === "string" ? error.stack : null,
+  stackLines: typeof error?.stack === "string" ? error.stack.split("\n").length : null,
+});
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 5));
 
@@ -30,22 +45,22 @@ export class Plain {
     if (route === "/alarms") {
       const s = this.state.storage;
       const out = {
-        set: await attempt(() => s.setAlarm(Date.now() + 60_000)),
-        setString: await attempt(() => s.setAlarm("tomorrow")),
-        setZero: await attempt(() => s.setAlarm(0)),
-        setNaN: await attempt(() => s.setAlarm(NaN)),
+        set: await attempt(() => s.setAlarm(Date.now() + 60_000), shape),
+        setString: await attempt(() => s.setAlarm("tomorrow"), shape),
+        setZero: await attempt(() => s.setAlarm(0), shape),
+        setNaN: await attempt(() => s.setAlarm(NaN), shape),
       };
-      out.after = await attempt(() => s.deleteAlarm());
+      out.after = await attempt(() => s.deleteAlarm(), shape);
       return Response.json(out);
     }
     if (route === "/storage") {
       const s = this.state.storage;
       return Response.json({
-        undef: await attempt(() => s.put("undef", undefined)),
-        fn: await attempt(() => s.put("fn", () => 1)),
-        sym: await attempt(() => s.put("sym", Symbol("s"))),
-        proxy: await attempt(() => s.put("proxy", new Proxy({}, {}))),
-        date: await attempt(() => s.put("date", new Date(0))),
+        undef: await attempt(() => s.put("undef", undefined), shape),
+        fn: await attempt(() => s.put("fn", () => 1), shape),
+        sym: await attempt(() => s.put("sym", Symbol("s")), shape),
+        proxy: await attempt(() => s.put("proxy", new Proxy({}, {})), shape),
+        date: await attempt(() => s.put("date", new Date(0)), shape),
       });
     }
     if (route === "/ws-api") {
@@ -54,12 +69,15 @@ export class Plain {
       out.binaryType = new WebSocketPair()[1].binaryType;
       const pair = new WebSocketPair();
       this.state.acceptWebSocket(pair[1]);
-      out.acceptTwice = await attempt(() => this.state.acceptWebSocket(pair[1]));
-      out.autoNull = await attempt(() => this.state.setWebSocketAutoResponse(null));
-      out.autoUndefined = await attempt(() => this.state.setWebSocketAutoResponse());
+      out.acceptTwice = await attempt(
+        () => this.state.acceptWebSocket(pair[1]), shape);
+      out.autoNull = await attempt(
+        () => this.state.setWebSocketAutoResponse(null), shape);
+      out.autoUndefined = await attempt(
+        () => this.state.setWebSocketAutoResponse(), shape);
       const unaccepted = new WebSocketPair();
-      out.sendBeforeAccept = await attempt(() => unaccepted[1].send("x"));
-      out.sendBeforeAcceptClient = await attempt(() => unaccepted[0].send("x"));
+      out.sendBeforeAccept = await attempt(() => unaccepted[1].send("x"), shape);
+      out.sendBeforeAcceptClient = await attempt(() => unaccepted[0].send("x"), shape);
       return Response.json(out);
     }
     if (route === "/message-types") {
@@ -100,8 +118,40 @@ export class Thrower {
     const kind = new URL(request.url).pathname;
     if (kind === "/type") throw new TypeError("bad type");
     if (kind === "/string") throw "plain string";
-    if (kind === "/dom") throw new DOMException("boom", "AbortError");
+    if (kind === "/dom") throw new DOMException("aborted!", "AbortError");
+    if (kind === "/obj") throw { name: "ObjError", message: "obj msg" };
+    if (kind === "/num") throw 42;
+    if (kind === "/null") throw null;
+    if (kind === "/empty") throw new TypeError("");
     throw new Error("handler exploded");
+  }
+}
+
+export class RpcThrow extends DurableObject {
+  dom() { throw new DOMException("aborted!", "AbortError"); }
+  str() { throw "plain string"; }
+  obj() { throw { name: "ObjError", message: "obj msg" }; }
+  empty() { throw new TypeError(""); }
+}
+
+export class CtorAlarm {
+  constructor(state) {
+    this.state = state;
+    // Workerd's Initializing state allows this: the class may add alarm()
+    // later, so the check must not fire mid-constructor.
+    this.armed = state.storage.setAlarm(Date.now() + 60_000);
+  }
+  async fetch() {
+    const out = { threw: null };
+    try {
+      await this.armed;
+    } catch (error) {
+      out.threw = { name: error.name, message: error.message };
+    }
+    const alarm = await this.state.storage.getAlarm();
+    out.alarmType = typeof alarm;
+    out.alarmSet = alarm !== null;
+    return Response.json(out);
   }
 }
 
@@ -142,19 +192,23 @@ export default {
     if (route === "/message-types")
       return env.PLAIN.getByName("plain").fetch("https://do.test/message-types");
     if (route === "/sql") return env.SHAPER.getByName("shaper").fetch("https://do.test/sql");
+    if (route === "/alarm-ctor")
+      return env.CTOR.getByName("ctor").fetch("https://do.test/alarm-ctor");
     if (route === "/throw") {
       const stub = env.THROWER.getByName("thrower");
       const out = {};
-      for (const [label, kind] of [["error", ""], ["type", "/type"], ["string", "/string"], ["dom", "/dom"]]) {
-        const failure = await attempt(() => stub.fetch(`https://do.test${kind}`));
-        out[label] = {
-          name: failure.name,
-          message: failure.message,
-          hostFrames:
-            failure.message?.includes("rejected:") ||
-            failure.message?.includes(" <- ") ||
-            failure.message?.includes("<anonymous>"),
-        };
+      for (const [label, kind] of [["error", ""], ["type", "/type"], ["string", "/string"],
+        ["dom", "/dom"], ["obj", "/obj"], ["num", "/num"], ["null", "/null"], ["empty", "/empty"]]) {
+        out[label] = await attempt(
+          () => stub.fetch(`https://do.test${kind}`), shape);
+      }
+      return Response.json(out);
+    }
+    if (route === "/rpc-throw") {
+      const stub = env.RPC.getByName("rpc");
+      const out = {};
+      for (const method of ["dom", "str", "obj", "empty"]) {
+        out[method] = await attempt(() => stub[method](), shape);
       }
       return Response.json(out);
     }
@@ -162,8 +216,8 @@ export default {
       await LOG.delete("shape");
       await Q.send("shape-probe", { contentType: "text" });
       for (let i = 0; i < 200; i++) {
-        const shape = await LOG.get("shape", "json");
-        if (shape !== null) return Response.json(shape);
+        const recorded = await LOG.get("shape", "json");
+        if (recorded !== null) return Response.json(recorded);
         await new Promise((resolve) => setTimeout(resolve, 25));
       }
       return Response.json({ missing: true });

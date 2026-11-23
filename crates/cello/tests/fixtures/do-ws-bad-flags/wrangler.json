@@ -1,0 +1,7 @@
+{
+  "name": "do-ws-bad-flags",
+  "main": "worker.js",
+  "compatibility_date": "2026-11-01",
+  "compatibility_flags": ["websocket_standard_binary_type", "no_websocket_standard_binary_type"],
+  "no_bundle": true
+}

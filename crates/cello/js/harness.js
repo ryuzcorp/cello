@@ -2080,18 +2080,19 @@ class DurableObjectStorage {
     await __storage_sync(this._scope);
   }
   async setAlarm(t) {
+    // Captured synchronously, before the first await: a call from the
+    // constructor runs while the instance is not registered yet, and that is
+    // exactly workerd's Initializing state, where setAlarm is allowed
+    // because the class may still produce an alarm() handler.
+    const instance = __cell.instances[this._scope];
     this._assertTransactionActive("setAlarm");
     if (!this._transactionControl) await Promise.resolve();
     if (!this._flushPendingPuts()) return;
     if (this._state?._facetDepth > 0)
       throw new Error("Facets currently cannot set alarms.");
     // Workerd validates the argument, then the instant, then whether the
-    // class can ever receive the wake (worker.c++ assertCanSetAlarm). The
-    // handler check runs against the initialized instance only: a setAlarm
-    // in the constructor is allowed, exactly like workerd's Initializing
-    // state, because the class may add the handler after the ctor.
+    // class can ever receive the wake (worker.c++ assertCanSetAlarm).
     const at = __alarmTime(t);
-    const instance = __cell.instances[this._scope];
     if (instance !== undefined && typeof instance.alarm !== "function")
       throw new TypeError(
         "Your Durable Object class must have an alarm() handler in order " +
@@ -2446,22 +2447,65 @@ const __durableObjectRoutingError = (error) => {
   }
 };
 // A Durable Object handler's uncaught exception reaches a stub caller as the
-// error the handler threw, the way workerd propagates it. The host carries
-// the class name and message apart; a standard error class is rebuilt as
-// itself, and anything else keeps its name on an Error.
+// value the handler threw, the way workerd propagates it: a standard error
+// class is rebuilt as itself, a DOMException stays one, a non-Error object
+// crosses by value, and a primitive becomes an Error with its text. Every
+// object answer carries workerd's own `remote` marker, and an error's stack
+// is the first line only -- no Cello frames reach the guest.
 const __cellErrorCtors = Object.freeze({
   Error, TypeError, RangeError, SyntaxError, ReferenceError, EvalError,
   URIError, AggregateError,
 });
+const __remoteStackLine = (name, message) =>
+  message === "" || message === undefined ? String(name) : `${name}: ${message}`;
+// The caller's own frames, without harness frames: workerd's remote stack is
+// the guest's call site, and an internal `<anonymous>:...` line would leak the
+// host's layout to the guest.
+const __callerFrames = () => {
+  const stack = new Error().stack;
+  if (typeof stack !== "string") return "";
+  const frames = stack.split("\n").slice(1)
+    .filter((line) => !line.includes("<anonymous>"));
+  return frames.length === 0 ? "" : "\n" + frames.join("\n");
+};
 const __cellHandlerThrow = (details) => {
   const name = String(details?.name ?? "Error");
-  const message = String(details?.message ?? "");
-  const ctor = __primHasOwn(__cellErrorCtors, name)
-    ? __cellErrorCtors[name] : undefined;
-  if (ctor !== undefined) return new ctor(message);
-  const error = new Error(message);
-  error.name = name;
-  return error;
+  const message = details?.message === undefined ? "" : String(details.message);
+  let value;
+  switch (details?.kind) {
+    case "dom":
+      value = new __primDOMException(message, name);
+      break;
+    case "object":
+      try {
+        value = __sc_decode(new Uint8Array(details.value ?? []));
+      } catch {
+        value = new Error(message);
+        value.name = name;
+      }
+      break;
+    case "primitive":
+      value = new Error(message);
+      break;
+    default: {
+      const ctor = __primHasOwn(__cellErrorCtors, name)
+        ? __cellErrorCtors[name] : undefined;
+      if (ctor !== undefined) {
+        value = new ctor(message);
+      } else {
+        value = new Error(message);
+        value.name = name;
+      }
+    }
+  }
+  if (value !== null && typeof value === "object") {
+    __primDefineProp(value, "remote", {
+      value: true, enumerable: true, configurable: true, writable: true,
+    });
+    if (value instanceof Error)
+      value.stack = __remoteStackLine(value.name, value.message);
+  }
+  return value;
 };
 // A cell's input gate as the isolate sees it, for the one delivery
 // point that is inside the isolate rather than in front of it: an
@@ -6718,16 +6762,33 @@ const __rpcOut = (value, lift) => {
 // (V8 serializes Error natively), custom own properties beside it. The
 // tag is written host-side with the other envelope tags.
 const __rpcErrOut = (error) => {
-  // `name` rides in the props: V8 only round-trips the standard
-  // Error subclass names, and e.g. DataCloneError must survive.
-  const props = error instanceof Error
-    ? { ...error, name: error.name } : {};
+  // Workerd rethrows the callee's value: an Error subclass keeps its class,
+  // a DOMException stays one, a non-Error object stays an object, and a
+  // primitive becomes an Error with its text. `name` rides in the props
+  // because V8 only round-trips the standard Error subclass names.
+  const isDom = error instanceof Error && error instanceof __primDOMException;
+  let value = error;
+  let meta;
+  if (isDom) {
+    meta = { kind: "dom" };
+  } else if (error instanceof Error) {
+    meta = { kind: "error" };
+  } else if (error !== null && typeof error === "object") {
+    meta = { kind: "object" };
+  } else {
+    value = new Error(String(error));
+    meta = { kind: "primitive" };
+  }
+  const props = value instanceof Error
+    ? { ...value, name: value.name } : {};
   let sc;
   try {
-    sc = __sc_encode([error, props]);
+    sc = __sc_encode([value, props, meta]);
   } catch {
     const error_ = new Error(String(error?.message ?? error));
-    sc = __sc_encode([error_, { name: String(error?.name ?? "Error") }]);
+    sc = __sc_encode([
+      error_, { name: String(error?.name ?? "Error") }, { kind: "primitive" },
+    ]);
   }
   return __bytes_tagged(0, sc);
 };
@@ -6769,15 +6830,25 @@ const __isPlainRpcResult = (v) =>
 const __rpcDes = (bytes) => {
   const [tag, decoded] = __rpc_decode_bytes(bytes);
   if (tag === 0) {
-    const [error, props] = decoded;
-    if (error instanceof Error) {
-      Object.assign(error, props);
-      error.remote = true;
-      const local = new Error().stack;
-      error.stack = error.name + ": " + error.message +
-        local.slice(local.indexOf("\n"));
+    const [value, props, meta] = decoded;
+    let thrown = value;
+    if (meta !== undefined && meta.kind === "dom") {
+      // V8 clones the Error base, so the class comes back from the meta and
+      // the DOMException name from the props.
+      thrown = new __primDOMException(
+        value?.message ?? "", props?.name ?? value?.name ?? "Error");
+      Object.assign(thrown, props);
+    } else if (value instanceof Error) {
+      Object.assign(value, props);
     }
-    throw error;
+    if (thrown !== null && typeof thrown === "object") {
+      thrown.remote = true;
+      if (thrown instanceof Error) {
+        thrown.stack = __remoteStackLine(thrown.name, thrown.message) +
+          __callerFrames();
+      }
+    }
+    throw thrown;
   }
   {
     // A pure-data reply crosses as a bare clone with no table to revive:
@@ -7923,21 +7994,29 @@ __cello.__dispatchEntrypointRpc =
 // WebSocket: the host holds the socket; these deliver events into the DO.
 // `ws` is a lightweight stub whose send/close route back to the host task
 // by wsId -- so the isolate can be hibernated between messages.
-const __wsStub = __cello.__wsStub = (wsId) => ({
-  _hibernatable: true,
-  // Workerd's hibernated WebSocket reports the same standard default; a
-  // binary message still reaches `webSocketMessage` as an ArrayBuffer,
-  // whatever this says.
-  get binaryType() { return "blob"; },
-  set binaryType(_) {},
-  send: (data) => {
-    const bytes = __hostChunk(
-      data, "WebSocket.send accepts a string, ArrayBuffer, or view");
-    if (bytes !== null) __ws_send_binary(wsId, bytes);
-    else __ws_send(wsId, String(data));
-  },
-  close: (code = 1000, reason = "") => __ws_close(wsId, code, reason),
-});
+const __wsStub = __cello.__wsStub = (wsId) => {
+  // A revived socket reports the same default as a fresh one (the compat
+  // date decides), and the setter takes effect on this handle. A binary
+  // message still reaches `webSocketMessage` as an ArrayBuffer, whatever
+  // this says.
+  let binaryType = __cell.compat?.websocketStandardBinaryType
+    ? "blob"
+    : "arraybuffer";
+  return {
+    _hibernatable: true,
+    get binaryType() { return binaryType; },
+    set binaryType(value) {
+      if (value === "blob" || value === "arraybuffer") binaryType = value;
+    },
+    send: (data) => {
+      const bytes = __hostChunk(
+        data, "WebSocket.send accepts a string, ArrayBuffer, or view");
+      if (bytes !== null) __ws_send_binary(wsId, bytes);
+      else __ws_send(wsId, String(data));
+    },
+    close: (code = 1000, reason = "") => __ws_close(wsId, code, reason),
+  };
+};
 __cello.__wsOpen = async (scope, wsId, protocol) => {
   const actorEvent = __beginActorEvent(scope);
   // Socket events are invocations too: a stub the handler revives dies
@@ -12375,6 +12454,9 @@ if (!globalThis.DOMException) {
     });
   }
 }
+// The realm's DOMException, captured before tenant code can replace the
+// global: error classification must not follow a Worker's own global.
+const __primDOMException = globalThis.DOMException;
 if (!globalThis.AbortSignal) {
   const __abortBrand = Symbol("abortSignal");
   globalThis.AbortSignal = class AbortSignal extends EventTarget {

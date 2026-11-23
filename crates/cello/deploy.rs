@@ -3755,6 +3755,19 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
     }
     if let Some(flags) = object.get("compatibility_flags") {
         metadata.insert("compatibility_flags".into(), flags.clone());
+        // Workerd refuses a config that enables and disables the same
+        // behaviour, instead of silently picking the enable.
+        let has = |name: &str| {
+            flags
+                .as_array()
+                .is_some_and(|flags| flags.iter().any(|flag| flag.as_str() == Some(name)))
+        };
+        if has("websocket_standard_binary_type") && has("no_websocket_standard_binary_type") {
+            bail!(
+                "Compatibility flags are mutually contradictory: \
+                 websocket_standard_binary_type vs no_websocket_standard_binary_type"
+            );
+        }
     }
     metadata.insert("bindings".into(), Value::Array(bindings));
     if !queue_consumers.is_empty() {
