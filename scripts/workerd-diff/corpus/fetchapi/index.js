@@ -1,5 +1,7 @@
 // Fetch API object-model probes. Every route returns a 200 JSON transcript of
 // what the runtime observed, so the differential harness can compare them.
+import { DurableObject } from "cloudflare:workers";
+
 
 const text = (body) => new Response(body, { headers: { "content-type": "text/plain; charset=utf-8" } });
 const tag = (value) => Object.prototype.toString.call(value);
@@ -1181,7 +1183,52 @@ const routes = {
     ];
   },
 
+  // A zero-length buffered body on a null-body status: workerd accepts it and
+  // then reports no body at all (`body === null`) and infers no content-type.
+  // The hop through a Durable Object proves the caller sees the same shape,
+  // because the object's Response travels through the service boundary.
+  "/issue/null-body-zero-length": async (request, url, env) => {
+    const build = async (body, init = {}) => {
+      try {
+        const response = new Response(body, { status: 204, ...init });
+        return {
+          status: response.status,
+          bodyIsNull: response.body === null,
+          headers: [...response.headers],
+          text: await response.text(),
+          bodyUsed: response.bodyUsed,
+        };
+      } catch (error) {
+        return { threw: error.name, message: error.message };
+      }
+    };
+    const out = {
+      emptyString: await build(""),
+      emptyBytes: await build(new Uint8Array(0)),
+      emptyBlob: await build(new Blob([])),
+      explicitType: await build("", { headers: { "content-type": "application/custom" } }),
+      emptyString304: await build("", { status: 304 }),
+      nonEmpty: await build("x"),
+    };
+    const stub = env.EMPTY_BODY.get(env.EMPTY_BODY.idFromName("only"));
+    const hop = await stub.fetch("https://do.test/empty");
+    out.hop = {
+      status: hop.status,
+      bodyIsNull: hop.body === null,
+      headers: [...hop.headers],
+      text: await hop.text(),
+    };
+    return out;
+  },
+
 };
+
+export class NullBodyObject extends DurableObject {
+  async fetch() {
+    return new Response("", { status: 204 });
+  }
+}
+
 
 export default {
   async fetch(request, env) {

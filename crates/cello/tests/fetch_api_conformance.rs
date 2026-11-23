@@ -533,6 +533,47 @@ fn response_status_validation_matches_workerd() {
     );
 }
 
+// #165: a zero-length buffered body on a null-body status is no body at all.
+// Before this it kept a non-null body and the #159 default-type rule added
+// `content-type: text/plain;charset=UTF-8`, which workerd never does.
+#[test]
+fn null_body_zero_length_body_becomes_null() {
+    let _serial = serial();
+    let booted = boot("cello-fetch-api-null-body-empty-");
+    let out = route(&booted.node, "/response/null-body-zero-length");
+    for (case, status) in [
+        ("emptyString", 204),
+        ("emptyBytes", 204),
+        ("emptyBlob", 204),
+        ("emptyString304", 304),
+    ] {
+        let response = &out[case];
+        assert_eq!(response["status"], status, "#165 {case}: {response}");
+        assert_eq!(
+            response["bodyIsNull"], true,
+            "#165 {case}: a zero-length body is no body: {response}"
+        );
+        assert_eq!(
+            response["headers"],
+            serde_json::json!([]),
+            "#165 {case}: no content-type is inferred: {response}"
+        );
+        assert_eq!(response["text"], "", "#165 {case}: {response}");
+        assert_eq!(response["bodyUsed"], false, "#165 {case}: {response}");
+    }
+    assert_eq!(
+        out["explicitType"]["headers"],
+        serde_json::json!([["content-type", "application/custom"]]),
+        "#165: an explicit content-type is kept"
+    );
+    assert_eq!(out["explicitType"]["bodyIsNull"], true);
+    assert_outcome(
+        &out["nonEmpty"],
+        "TypeError: Response with null body status (101, 204, 205, or 304) cannot have a body.",
+        "#165: a non-empty body is still refused",
+    );
+}
+
 // #160 / #175 / #176 / #177 / #178 / #184 / #190.
 #[test]
 fn request_options_match_workerd() {

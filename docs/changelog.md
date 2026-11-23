@@ -9,8 +9,9 @@ tee-skew conformance test no longer assumes which of a tee's copies the skew
 budget ends. A third change is breaking: a Worker can no longer generate code
 at run time (#194), described below. The differential gate gained six cases
 from those fixes and fourteen Request/body cases from the changes below,
-plus 25 binding cases, six Web Crypto cases and 23 Durable Object and
-WebSocket cases (see below), 116 in total. No configuration or
+plus 25 binding cases, six Web Crypto cases, 23 Durable Object and
+WebSocket cases and 66 Fetch API cases (see below), 182 in total. No
+configuration or
 bucket-format changes; the development store gains two nullable
 columns, which is backward compatible (see below). The `eval`,
 `Function` and wasm runtime-compilation changes are listed after the stream
@@ -355,7 +356,10 @@ calls).
   `101` is allowed only alongside a `WebSocket` (and a `WebSocket` only with a
   `101`), a null-body status (`101`, `204`, `205`, `304`) refuses a non-empty
   or streaming body, and a C0 control in `statusText` is `TypeError: Invalid
-  statusText`.
+  statusText`. A zero-length buffered body on a null-body status (an empty
+  string, byte array or `Blob`) is accepted and then reported as no body at
+  all, as workerd does: `body` is `null`, the read is empty, and no
+  `content-type` is inferred. An explicit one is kept.
 - **An incoming request's headers are immutable** (#169). `set`, `append` and
   `delete` on `request.headers` throw `TypeError: Can't modify immutable
   headers.` instead of silently doing nothing, and `Request.prototype.headers`

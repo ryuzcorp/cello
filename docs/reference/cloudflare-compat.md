@@ -77,8 +77,10 @@ use. An unsupported feature that stays silent is a defect.
   `content-type: text/plain;charset=UTF-8` unless the init names one. Bytes,
   `Blob`, `FormData`, `URLSearchParams` and stream bodies keep their own rules.
 - `Response` validates its status (`200`-`599`, except `101` with a
-  `WebSocket`), refuses a body on a null-body status (`101`, `204`, `205`,
-  `304`) unless it is empty, and refuses a C0 control in `statusText`.
+  `WebSocket`), refuses a non-empty or streaming body on a null-body status
+  (`101`, `204`, `205`, `304`), and refuses a C0 control in `statusText`. An
+  accepted zero-length buffered body there becomes no body at all: `body` is
+  `null`, `text()` is empty and no `content-type` is inferred, as in workerd.
 - `Response.blob().type` is the parsed and re-serialized `content-type`;
   `Blob.type` on a user-built `Blob` is the raw lower-cased string, as in
   workerd.

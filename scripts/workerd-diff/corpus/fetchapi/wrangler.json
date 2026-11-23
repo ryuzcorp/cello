@@ -2,5 +2,7 @@
   "name": "fetchapi",
   "main": "index.js",
   "compatibility_date": "2026-11-01",
-  "no_bundle": true
+  "no_bundle": true,
+  "durable_objects": { "bindings": [{ "name": "EMPTY_BODY", "class_name": "NullBodyObject" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["NullBodyObject"] }]
 }
