@@ -271,9 +271,11 @@ Durable Object and WebSocket fixes:
   `"arraybuffer"`; setting it switches the very next message. This is
   workerd's `websocket_standard_binary_type`, implied from compatibility date
   2026-03-17; `websocket_standard_binary_type` opts in early and
-  `no_websocket_standard_binary_type` opts out. Hibernation is unchanged:
-  `webSocketMessage(ws, message)` always receives an `ArrayBuffer`, whatever
-  the socket's `binaryType`.
+  `no_websocket_standard_binary_type` opts out, and a Worker that sets both
+  flags is refused at startup. A deployment with no `compatibility_date`
+  gets the standard default, as workerd's newest-date default does.
+  Hibernation is unchanged: `webSocketMessage(ws, message)` always receives
+  an `ArrayBuffer`, whatever the socket's `binaryType`.
 - **`setAlarm()` validates like workerd** (#149). A class with no `alarm()`
   handler, a non-Date/number argument, a non-finite instant, and a time at or
   before the Unix epoch each throw workerd's `TypeError`; a call in the
@@ -281,10 +283,13 @@ Durable Object and WebSocket fixes:
 - **`send()` before `accept()` throws** (#150). An inbound socket that neither
   `accept()` nor `state.acceptWebSocket()` claimed no longer accepts a frame
   and drops it silently.
-- **A stub rejection is the handler's error** (#151). `stub.fetch()` rejects
-  with the handler's own error name and message (a `TypeError` stays a
-  `TypeError`), with the caller's stack, instead of `rejected: Error: …` plus
-  Cello host frames.
+- **A stub rejection is the value the handler threw** (#151). Both
+  `stub.fetch()` and stub RPC reject with the handler's own value: an
+  `Error` subclass keeps its class, a `DOMException` stays a `DOMException`,
+  a thrown object stays an object, and a primitive becomes an `Error` with
+  its text. The error carries workerd's own `remote` marker, and its `stack`
+  is the first line (plus the caller's frames over RPC), so no
+  `rejected: Error: …` text or Cello host frame reaches the guest.
 - **`put(key, undefined)` is refused and clone failures are
   `DataCloneError`** (#181). A single put no longer writes nothing for
   `undefined` and leaves an older value behind; a function, symbol, or proxy
@@ -298,15 +303,21 @@ Durable Object and WebSocket fixes:
   spread, `JSON.stringify`, and `structuredClone` of a batch or message see
   only `queue`/`messages`/`metadata` and
   `id`/`timestamp`/`body`/`attempts`.
-- **A boolean SQL bind stores the text `true`/`false`** (#154).
 - **A SQL cursor has no own enumerable fields** (#191). `Object.keys(cursor)`
   is empty and its internals no longer leak. Its `rowsRead`/`rowsWritten`
   still count Cello's DML rows rather than libsql's b-tree rows, so a DDL
   statement reports 0/0 where workerd reports 1/2; see
   [Durable Objects](../services/durable-objects.md).
 
-The differential gate gained 19 cases across the `do`, `ws`, `ws-hib`, and
-`queues` fixtures, including a raw-frame WebSocket probe.
+The differential gate gained 21 cases across the `do`, `ws`, `ws-legacy`,
+`ws-hib`, and `queues` fixtures, including a raw-frame WebSocket probe.
+
+One behaviour is deliberately **not** changed: a boolean bound into Durable
+Object SQL is still stored as INTEGER `1`/`0`, not workerd's TEXT
+`'true'`/`'false'`. Existing rows already hold integers, and mixing the two
+types would make `if (row.flag)` truthy for a new `'false'` while an old `0`
+stayed falsy, with no migration able to rewrite a stored value's type. See
+[Durable Objects](../services/durable-objects.md).
 
 ## v0.2.8
 

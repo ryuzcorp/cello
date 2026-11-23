@@ -1,0 +1,6 @@
+{
+  "name": "do-ws-legacy",
+  "main": "worker.js",
+  "compatibility_date": "2026-01-01",
+  "no_bundle": true
+}

@@ -269,9 +269,10 @@ The `tail` and `email` handlers are unavailable.
 ### [WebSockets](https://developers.cloudflare.com/workers/runtime-apis/websockets/)
 
 - `binaryType` defaults to `"blob"` for a compatibility date on or after
-  2026-03-17, so a binary message arrives as a `Blob`; an older date keeps
-  `"arraybuffer"`, and `websocket_standard_binary_type` /
-  `no_websocket_standard_binary_type` forces either. Setting
+  2026-03-17 and for a deployment with no `compatibility_date`, so a binary
+  message arrives as a `Blob`; an older date keeps `"arraybuffer"`, and
+  `websocket_standard_binary_type` / `no_websocket_standard_binary_type`
+  forces either. Setting both flags refuses startup. Setting
   `"arraybuffer"` switches the next message. Hibernation does not follow it:
   `webSocketMessage(ws, message)` always receives an `ArrayBuffer`.
 - `send()` on a socket that neither `accept()` nor

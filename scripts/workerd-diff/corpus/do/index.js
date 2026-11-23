@@ -20,8 +20,8 @@ const errorInfo = (error) => ({
   name: error?.name ?? String(error),
   message: error?.message ?? String(error),
 });
-const attempt = async (fn) => {
-  try { return { ok: await fn() }; } catch (error) { return { error: errorInfo(error) }; }
+const attempt = async (fn, describe = errorInfo) => {
+  try { return { ok: await fn() }; } catch (error) { return { error: describe(error) }; }
 };
 
 export class Timer {
@@ -54,7 +54,15 @@ export class Timer {
 }
 
 export class Thrower {
-  async fetch() {
+  async fetch(request) {
+    const kind = new URL(request.url).pathname;
+    if (kind === "/type") throw new TypeError("bad type");
+    if (kind === "/string") throw "plain string";
+    if (kind === "/dom") throw new DOMException("aborted!", "AbortError");
+    if (kind === "/obj") throw { name: "ObjError", message: "obj msg" };
+    if (kind === "/num") throw 42;
+    if (kind === "/null") throw null;
+    if (kind === "/empty") throw new TypeError("");
     throw new Error("handler exploded");
   }
 }
@@ -164,10 +172,8 @@ export class Probe {
         sql.exec("DROP TABLE IF EXISTS t2");
         sql.exec("CREATE TABLE t2 (i INTEGER, r REAL, t TEXT, b BLOB, n TEXT)");
         const out = {};
-        out.bindBoolean = await attempt(() => {
-          sql.exec("INSERT INTO t2 (i) VALUES (?)", true);
-          return [...sql.exec("SELECT typeof(i) AS type, i FROM t2 ORDER BY rowid DESC LIMIT 1")];
-        });
+        // A boolean bind is a deliberate Cello deviation (INTEGER 1/0, see
+        // cloudflare-compat.md), so it is not compared with workerd here.
         out.bindNull = await attempt(() => {
           sql.exec("INSERT INTO t2 (t) VALUES (?)", null);
           return [...sql.exec("SELECT t FROM t2 ORDER BY rowid DESC LIMIT 1")];
@@ -354,11 +360,28 @@ const routes = {
   },
   async "/thrower"() {
     const stub = THROWER.getByName("thrower");
+    const failure = (error) => {
+      // The value workerd rethrows: class, `remote`, and a first-line stack.
+      const stack = typeof error?.stack === "string"
+        ? error.stack.split("\n")[0] : null;
+      return {
+        ctor: error === null || error === undefined
+          ? String(error) : (error.constructor?.name ?? typeof error),
+        name: error?.name ?? null,
+        message: error?.message ?? null,
+        isDom: error instanceof DOMException,
+        isError: error instanceof Error,
+        remote: error !== null && typeof error === "object" ? error.remote : null,
+        stack,
+      };
+    };
     const out = {};
-    out.fetch = await attempt(async () => {
-      const response = await stub.fetch("https://do.test/");
-      return { status: response.status, body: await response.text() };
-    });
+    for (const kind of ["", "/type", "/string", "/dom", "/obj", "/num", "/null", "/empty"]) {
+      out[kind || "error"] = await attempt(async () => {
+        const response = await stub.fetch(`https://do.test${kind}`);
+        return { status: response.status, body: await response.text() };
+      }, failure);
+    }
     out.rpc = await attempt(async () => JSON.stringify(await stub.missing()));
     return report(out);
   },

@@ -63,6 +63,36 @@ const routes = {
     }
     return report({ seen: null, timedOut: true });
   },
+  async "/ack"() {
+    await LOG.delete("acked");
+    await Q.send("ack-probe", { contentType: "text" });
+    for (let i = 0; i < 600; i++) {
+      const seen = await LOG.get("acked", "json");
+      if (seen !== null) return report({ seen });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    return report({ seen: null, timedOut: true });
+  },
+  async "/retry-all"() {
+    await LOG.delete("retry-all");
+    await Q.send("retry-all", { contentType: "text" });
+    for (let i = 0; i < 600; i++) {
+      const seen = await LOG.get("retry-all", "json");
+      if (Array.isArray(seen) && seen.length >= 2) {
+        // Only the first redelivery's attempt count and shape: how many
+        // retries land inside the poll window is each runtime's own pacing,
+        // so the transcript takes the first two deliveries and nothing
+        // wall-clock dependent.
+        return report({
+          attempts: seen.slice(0, 2).map((entry) => entry.messages[0].attempts),
+          keys: seen[0].messages[0].keys,
+          batchKeys: seen[0].batchKeys,
+        });
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    return report({ seen: await LOG.get("retry-all", "json"), timedOut: true });
+  },
   async "/ack-retry"() {
     await LOG.delete("retried");
     await Q.send("retry-me", { contentType: "text" });
@@ -122,6 +152,16 @@ export default {
     if (batch.messages.some((m) => m.body === "shape-probe")) {
       await record("shape", shape);
       batch.ackAll();
+      return;
+    }
+    if (batch.messages.some((m) => m.body === "ack-probe")) {
+      await record("acked", shape);
+      for (const message of batch.messages) message.ack();
+      return;
+    }
+    if (batch.messages.some((m) => m.body === "retry-all")) {
+      await record("retry-all", shape);
+      batch.retryAll({ delaySeconds: 0 });
       return;
     }
     if (batch.messages.some((m) => m.body === "retry-me")) {

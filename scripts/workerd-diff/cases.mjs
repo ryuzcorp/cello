@@ -138,5 +138,8 @@ export const cases = [
   { name: "ws-pair", fixture: "ws", path: "/pair" },
   { name: "ws-upgrade", fixture: "ws", websocket: "/ws" },
   { name: "ws-hibernation", fixture: "ws-hib", websocket: { path: "/ws", close: false } },
+  { name: "ws-legacy-pair", fixture: "ws-legacy", path: "/pair" },
   { name: "queues-shape", fixture: "queues", path: "/shape" },
+  { name: "queues-ack", fixture: "queues", path: "/ack" },
+  { name: "queues-retry-all", fixture: "queues", path: "/retry-all" },
 ];

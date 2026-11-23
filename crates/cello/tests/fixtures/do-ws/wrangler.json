@@ -13,10 +13,12 @@
       { "name": "PLAIN", "class_name": "Plain" },
       { "name": "TIMER", "class_name": "Timer" },
       { "name": "THROWER", "class_name": "Thrower" },
+      { "name": "RPC", "class_name": "RpcThrow" },
+      { "name": "CTOR", "class_name": "CtorAlarm" },
       { "name": "SHAPER", "class_name": "Shaper" }
     ]
   },
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["Plain", "Timer", "Thrower", "Shaper"] }
+    { "tag": "v1", "new_sqlite_classes": ["Plain", "Timer", "Thrower", "RpcThrow", "CtorAlarm", "Shaper"] }
   ]
 }

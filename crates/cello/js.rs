@@ -2244,35 +2244,91 @@ fn reject_reason(tc: &mut v8::PinScope, p: v8::Local<v8::Promise>) -> String {
     }
 }
 
-/// A rejected Durable Object handler, split into the name and message a
-/// caller sees. Workerd rethrows the handler's own error object, so a
-/// `TypeError` stays a `TypeError` and the message carries no host framing;
-/// V8 gives a thrown non-object only a string, which workerd reports as an
-/// `Error` with that text.
+/// A rejected Durable Object handler, split into what the caller must rebuild.
+/// Workerd rethrows the handler's own value: an `Error` subclass keeps its
+/// class, a `DOMException` stays one, a non-Error object stays an object, and
+/// a primitive becomes an `Error` with its text.
 fn handler_rejection(
     tc: &mut v8::PinScope,
     p: v8::Local<v8::Promise>,
 ) -> crate::engine_api::CellHandlerError {
-    let r = p.result(tc);
-    let string_field = |object: &v8::Local<v8::Object>, key: &str| -> Option<String> {
+    use crate::engine_api::{CellHandlerError, CellHandlerKind};
+    // An empty message is a real message: workerd preserves it.
+    fn text_field(
+        tc: &mut v8::PinScope,
+        object: &v8::Local<v8::Object>,
+        key: &str,
+    ) -> Option<String> {
         let key = v8::String::new(tc, key)?;
         let value = object.get(tc, key.into())?;
-        if value.is_undefined() || value.is_null() {
+        if value.is_undefined() {
             return None;
         }
-        let text = value.to_rust_string_lossy(tc);
-        (!text.is_empty()).then_some(text)
-    };
-    let object = r.to_object(tc);
-    let name = object
-        .as_ref()
-        .and_then(|object| string_field(object, "name"))
-        .unwrap_or_else(|| "Error".to_string());
-    let message = object
-        .as_ref()
-        .and_then(|object| string_field(object, "message"))
-        .unwrap_or_else(|| r.to_rust_string_lossy(tc));
-    crate::engine_api::CellHandlerError { name, message }
+        Some(value.to_rust_string_lossy(tc))
+    }
+    let r = p.result(tc);
+    let is_dom = r
+        .to_object(tc)
+        .and_then(|object| {
+            let global = tc.get_current_context().global(tc);
+            let key = v8::String::new(tc, "DOMException")?;
+            let ctor: v8::Local<v8::Object> = global.get(tc, key.into())?.try_into().ok()?;
+            object.instance_of(tc, ctor)
+        })
+        .unwrap_or(false);
+    if is_dom || r.is_native_error() {
+        let default_name = if is_dom { "DOMException" } else { "Error" };
+        let (name, message) = match r.to_object(tc) {
+            Some(object) => (
+                text_field(tc, &object, "name").unwrap_or_else(|| default_name.to_string()),
+                text_field(tc, &object, "message").unwrap_or_default(),
+            ),
+            None => (default_name.to_string(), String::new()),
+        };
+        return CellHandlerError {
+            kind: if is_dom {
+                CellHandlerKind::Dom
+            } else {
+                CellHandlerKind::Error
+            },
+            name,
+            message,
+            value: None,
+        };
+    }
+    if r.is_object() || r.is_function() {
+        // A thrown non-Error object crosses by value. The serializer may
+        // refuse (a function inside it, a Proxy), so it runs under its own
+        // TryCatch and the pending exception is discarded.
+        let bytes = {
+            let try_catch = std::pin::pin!(v8::TryCatch::new(tc));
+            let try_catch = &mut try_catch.init();
+            storage_ops::serialize_storage_value(try_catch, r)
+        };
+        if let Some(bytes) = bytes {
+            let (name, message) = match r.to_object(tc) {
+                Some(object) => (
+                    text_field(tc, &object, "name").unwrap_or_default(),
+                    text_field(tc, &object, "message").unwrap_or_default(),
+                ),
+                None => (String::new(), String::new()),
+            };
+            return CellHandlerError {
+                kind: CellHandlerKind::Object,
+                name,
+                message,
+                value: Some(bytes),
+            };
+        }
+    }
+    // A primitive (or an object no clone can carry) is an `Error` whose
+    // message is the value's text, exactly as workerd wraps it.
+    CellHandlerError {
+        kind: CellHandlerKind::Primitive,
+        name: "Error".to_string(),
+        message: r.to_rust_string_lossy(tc),
+        value: None,
+    }
 }
 
 pub struct Engine;
@@ -10287,8 +10343,10 @@ fn op_do_call_impl(
             Ok(Err(e)) => match crate::engine_api::cell_handler_error(&e) {
                 Some(handler) => Ok(serde_json::json!({
                     "__celloCellError": {
+                        "kind": handler.kind.as_str(),
                         "name": handler.name,
                         "message": handler.message,
+                        "value": handler.value,
                     },
                 })
                 .to_string()),
