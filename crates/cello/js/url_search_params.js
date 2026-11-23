@@ -94,6 +94,13 @@ class URLSearchParams {
   #params = [];
   _url = null; // live-bound URL, if any
 
+  static {
+    // Genuine-instance brand for the clone registry.
+    __cello.__isUrlSearchParamsInstance = (value) => {
+      try { return #params in value; } catch { return false; }
+    };
+  }
+
   constructor(init) {
     if (init === undefined || init === null) return;
     if (typeof init === 'string') {

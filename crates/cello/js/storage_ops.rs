@@ -1148,8 +1148,13 @@ impl v8::ValueDeserializerImpl for StorageValueDelegate {}
 struct TransientCloneDelegate<'a> {
     wasm_modules: std::rc::Rc<RefCell<Vec<v8::CompiledWasmModule>>>,
     shared_buffers: std::rc::Rc<RefCell<Vec<v8::SharedRef<v8::BackingStore>>>>,
-    host_object_brand: v8::Local<'a, v8::Symbol>,
-    deserializers: Option<v8::Local<'a, v8::Object>>,
+    /// Module-private JS predicates. They live in a closure in `harness.js`
+    /// and are passed straight into this op, never stored on a prototype, so
+    /// a guest cannot make an object look like a host object or supply the
+    /// function that serializes one.
+    is_host_object: v8::Local<'a, v8::Function>,
+    write_host_object: v8::Local<'a, v8::Function>,
+    revive_host_object: Option<v8::Local<'a, v8::Function>>,
 }
 
 impl v8::ValueSerializerImpl for TransientCloneDelegate<'_> {
@@ -1189,7 +1194,10 @@ impl v8::ValueSerializerImpl for TransientCloneDelegate<'_> {
         scope: &mut v8::PinScope<'s, '_>,
         object: v8::Local<'s, v8::Object>,
     ) -> Option<bool> {
-        object.has(scope, self.host_object_brand.into())
+        let receiver = v8::undefined(scope).into();
+        self.is_host_object
+            .call(scope, receiver, &[object.into()])
+            .map(|value| value.is_true())
     }
 
     fn write_host_object<'s>(
@@ -1198,13 +1206,10 @@ impl v8::ValueSerializerImpl for TransientCloneDelegate<'_> {
         object: v8::Local<'s, v8::Object>,
         serializer: &dyn v8::ValueSerializerHelper,
     ) -> Option<bool> {
-        let value = object.get(scope, self.host_object_brand.into())?;
-        let Ok(serialize) = value.try_cast::<v8::Function>() else {
-            let message = v8::String::new(scope, "Unsupported object type").unwrap();
-            self.throw_data_clone_error(scope, message);
-            return None;
-        };
-        let data = serialize.call(scope, object.into(), &[])?;
+        let receiver = v8::undefined(scope).into();
+        let data = self
+            .write_host_object
+            .call(scope, receiver, &[object.into()])?;
         serializer.write_uint32(u32::MAX);
         serializer.write_value(scope.get_current_context(), data)
     }
@@ -1221,15 +1226,7 @@ impl v8::ValueDeserializerImpl for TransientCloneDelegate<'_> {
             return None;
         }
         let data = deserializer.read_value(scope.get_current_context())?;
-        let object = data.to_object(scope)?;
-        let key = v8::String::new(scope, "type").unwrap();
-        let clone_type = object.get(scope, key.into())?;
-        let revive = self.deserializers?.get(scope, clone_type)?;
-        let Ok(revive) = revive.try_cast::<v8::Function>() else {
-            let message = v8::String::new(scope, "Unsupported clone data type").unwrap();
-            scope.throw_exception(v8::Exception::error(scope, message));
-            return None;
-        };
+        let revive = self.revive_host_object?;
         let receiver = v8::null(scope).into();
         let allow = std::pin::pin!(v8::AllowJavascriptExecutionScope::new(scope));
         let scope = &mut allow.init();
@@ -1404,21 +1401,29 @@ pub(super) fn op_structured_clone(
     let tc = std::pin::pin!(v8::TryCatch::new(scope));
     let scope = &mut tc.init();
     let context = scope.get_current_context();
-    let Ok(host_object_brand) = args.get(1).try_cast::<v8::Symbol>() else {
-        let message = v8::String::new(scope, "structured clone host brand is invalid").unwrap();
+    let Ok(is_host_object) = args.get(1).try_cast::<v8::Function>() else {
+        let message =
+            v8::String::new(scope, "structured clone host classifier is invalid").unwrap();
         scope.throw_exception(v8::Exception::type_error(scope, message));
         return;
     };
-    let Ok(deserializers) = args.get(2).try_cast::<v8::Object>() else {
-        let message = v8::String::new(scope, "structured clone deserializers are invalid").unwrap();
+    let Ok(write_host_object) = args.get(2).try_cast::<v8::Function>() else {
+        let message =
+            v8::String::new(scope, "structured clone host serializer is invalid").unwrap();
+        scope.throw_exception(v8::Exception::type_error(scope, message));
+        return;
+    };
+    let Ok(revive_host_object) = args.get(3).try_cast::<v8::Function>() else {
+        let message = v8::String::new(scope, "structured clone host reviver is invalid").unwrap();
         scope.throw_exception(v8::Exception::type_error(scope, message));
         return;
     };
     let delegate = TransientCloneDelegate {
         wasm_modules: Default::default(),
         shared_buffers: Default::default(),
-        host_object_brand,
-        deserializers: None,
+        is_host_object,
+        write_host_object,
+        revive_host_object: None,
     };
     let bytes = {
         let serializer = v8::ValueSerializer::new(scope, Box::new(delegate.clone()));
@@ -1441,7 +1446,7 @@ pub(super) fn op_structured_clone(
     let deserializer = v8::ValueDeserializer::new(
         scope,
         Box::new(TransientCloneDelegate {
-            deserializers: Some(deserializers),
+            revive_host_object: Some(revive_host_object),
             ..delegate
         }),
         &bytes,

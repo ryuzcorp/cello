@@ -207,7 +207,15 @@ algorithm does not define is refused at import instead of stored on the key.
   `new CryptoKey()` throws `TypeError: Illegal constructor`, a forged
   `Object.create(CryptoKey.prototype)` is not a `CryptoKey`, and the
   properties are frozen copies, so mutating `key.algorithm.hash` cannot
-  change what `sign()` hashes with.
+  change what `sign()` hashes with. `structuredClone()` refuses a
+  `CryptoKey` with workerd's `DataCloneError: Could not serialize object of
+  type "CryptoKey". This type does not support serialization.` The clone
+  registry is module-private rather than a symbol on each prototype, so no
+  guest code can call a serializer and a prototype-only forgery is cloned as
+  plain data. `CryptoKey.call()` throws `Illegal constructor`, like workerd.
+  `node:crypto`'s `KeyObject.export()` refuses a non-extractable key with
+  workerd's `TypeError: Unable to export non-extractable key` (Node itself
+  exports it with a DEP0204 warning).
 - **Web Crypto argument validation matches workerd** (#198). An absent or
   `null` algorithm, a non-`CryptoKey` key, a non-`BufferSource` data,
   signature or IV, an absent `iv`/`counter`, a non-integer

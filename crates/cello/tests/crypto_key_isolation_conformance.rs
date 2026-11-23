@@ -197,16 +197,33 @@ fn crypto_key_state_lives_in_internal_slots() {
         ])),
         "unexpected CryptoKey own names: {isolation}"
     );
-    let constructor = isolation.get("constructor").expect("constructor probe");
     assert_eq!(
-        constructor.get("ok").and_then(|v| v.as_bool()),
-        Some(false),
-        "guest `new CryptoKey()` returned a key: {isolation}"
+        isolation.get("symbolFunctions"),
+        Some(&serde_json::json!([])),
+        "a prototype symbol is callable as a serializer: {isolation}"
+    );
+    for probe in ["constructor", "constructorCall"] {
+        let result = isolation.get(probe).expect(probe);
+        assert_eq!(
+            result.get("ok").and_then(|v| v.as_bool()),
+            Some(false),
+            "{probe} returned a key: {isolation}"
+        );
+        assert_eq!(
+            error(result.get("error").expect("error object")),
+            ("TypeError", "Illegal constructor"),
+            "{probe} must throw"
+        );
+    }
+    assert_eq!(
+        isolation.get("constructorLength").and_then(|v| v.as_u64()),
+        Some(0),
+        "CryptoKey.length: {isolation}"
     );
     assert_eq!(
-        error(constructor.get("error").expect("error object")),
-        ("TypeError", "Illegal constructor"),
-        "guest `new CryptoKey()` must throw"
+        isolation.get("constructorTag").and_then(|v| v.as_str()),
+        Some("[object CryptoKey]"),
+        "CryptoKey tag: {isolation}"
     );
     for (probe, method) in [("forgedSign", "sign"), ("forgedWrap", "wrapKey")] {
         let result = isolation.get(probe).expect(probe);
@@ -243,6 +260,64 @@ fn crypto_key_state_lives_in_internal_slots() {
         "a verify-only key signed: {isolation}"
     );
 
+    // structuredClone never mints a host object from guest data.
+    let clone_key = isolation.get("cloneKey").expect("clone key probe");
+    assert_eq!(clone_key.get("ok").and_then(|v| v.as_bool()), Some(false));
+    assert_eq!(
+        error(clone_key.get("error").expect("error object")),
+        (
+            "DataCloneError",
+            "Could not serialize object of type \"CryptoKey\". This type does not support serialization."
+        ),
+        "CryptoKey was cloned: {isolation}"
+    );
+    let clone_proto = isolation
+        .get("cloneProto")
+        .and_then(|v| v.get("value"))
+        .expect("clone proto probe");
+    assert_eq!(
+        clone_proto.get("isKey").and_then(|v| v.as_bool()),
+        Some(false),
+        "a prototype-only forgery revived as a CryptoKey: {isolation}"
+    );
+    assert_eq!(
+        clone_proto.get("tag").and_then(|v| v.as_str()),
+        Some("[object Object]")
+    );
+    let clone_forged = isolation
+        .get("cloneForged")
+        .and_then(|v| v.get("value"))
+        .expect("clone forged probe");
+    assert_eq!(
+        clone_forged.get("isKey").and_then(|v| v.as_bool()),
+        Some(false),
+        "key-shaped data revived as a CryptoKey: {isolation}"
+    );
+    let forged_blob = isolation
+        .get("cloneForgedBlob")
+        .and_then(|v| v.get("value"))
+        .expect("forged blob probe");
+    assert_eq!(
+        forged_blob.get("isBlob").and_then(|v| v.as_bool()),
+        Some(false),
+        "a Blob prototype-only forgery revived as a Blob: {isolation}"
+    );
+    let forged_request = isolation
+        .get("cloneForgedRequest")
+        .and_then(|v| v.get("value"))
+        .expect("forged request probe");
+    assert_eq!(
+        forged_request.get("isRequest").and_then(|v| v.as_bool()),
+        Some(false),
+        "a Request prototype-only forgery revived as a Request: {isolation}"
+    );
+    let key_object = isolation.get("keyObjectExport").expect("KeyObject probe");
+    assert_eq!(
+        error(key_object.get("error").expect("error object")),
+        ("TypeError", "Unable to export non-extractable key"),
+        "KeyObject.from(non-extractable).export() succeeded: {isolation}"
+    );
+
     // Cello-only shape: the properties are frozen copies and operations read
     // slots, so a mutation attempt cannot change a signature.
     let strict = json(&node.public, "/isolation-strict");
@@ -268,7 +343,7 @@ fn crypto_key_state_lives_in_internal_slots() {
         "the usages copy is not frozen: {strict}"
     );
     assert_eq!(
-        strict.get("usernameAfterPush"),
+        strict.get("usagesAfterPush"),
         Some(&serde_json::json!(["sign"])),
         "usages changed: {strict}"
     );
@@ -296,18 +371,30 @@ fn crypto_key_state_lives_in_internal_slots() {
         Some(true)
     );
 
-    // A clone revives through the internal factory and keeps enforcing usages.
+    // The clone registry leaves no symbol to steal, and copying a real
+    // Blob's constructor brand cannot revive a Blob.
     assert_eq!(
-        strict.get("cloneUsages"),
-        Some(&serde_json::json!(["verify"])),
-        "clone lost usages: {strict}"
+        strict.get("legacySymbol"),
+        Some(&serde_json::json!(["undefined", "undefined", "undefined"])),
+        "a clone brand symbol is installed on a prototype: {strict}"
     );
-    let clone_sign = strict.get("cloneSign").expect("clone sign probe");
-    assert_eq!(clone_sign.get("ok").and_then(|v| v.as_bool()), Some(false));
-    let (name, message) = error(&clone_sign["error"]);
-    assert_eq!(name, "InvalidAccessError", "clone sign: {strict}");
     assert_eq!(
-        message,
-        "Requested key usage \"sign\" does not match any usage listed in this CryptoKey."
+        strict.get("callableSymbols"),
+        Some(&serde_json::json!([])),
+        "a prototype symbol was callable: {strict}"
+    );
+    let copied_blob = strict
+        .get("copiedBlobBrand")
+        .expect("copied blob brand probe");
+    assert_eq!(
+        copied_blob.get("isBlob").and_then(|v| v.as_bool()),
+        Some(false),
+        "a forged Blob with a copied brand revived: {strict}"
+    );
+    let strict_clone = strict.get("cloneKey").expect("clone key probe");
+    assert_eq!(
+        strict_clone.get("ok").and_then(|v| v.as_bool()),
+        Some(false),
+        "CryptoKey was cloned: {strict}"
     );
 }

@@ -414,6 +414,9 @@ during JavaScript execution.
   `p`/`parallelization` 1, `maxmem` 32 MiB).
 - `KeyObject.toCryptoKey()` applies the requested algorithm,
   extractability, and usages to an asymmetric key.
+- `KeyObject.export()` refuses a non-extractable key
+  (`TypeError: Unable to export non-extractable key`), matching workerd. Node
+  exports the material with a `DEP0204` deprecation warning instead.
 - `node:zlib` implements only the synchronous gzip and deflate functions.
 - `node:fs` provides `access`, `mkdir`, `realpath`, `stat`, `lstat`,
   `readFile`, `writeFile`, `writeFileSync`, `appendFile`,
