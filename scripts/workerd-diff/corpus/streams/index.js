@@ -163,6 +163,204 @@ const routes = {
     return report({ order, done: await writer.closed.then(() => "closed", (error) => errorInfo(error)) });
   },
 
+  async "/writable-close-states"() {
+    // Issue #132: workerd names every state of a second close() itself.
+    // closed -> "This WritableStream has been closed."; a close already in
+    // flight -> "Cannot close a writer that is already being closed";
+    // errored and erroring -> the stream's stored error (issue #129).
+    // `flip` is a bounded microtask drain, never wall time: it lets a
+    // queued close reach the sink so the state is provably 'closing'.
+    const flip = async () => {
+      for (let i = 0; i < 16; i++) await null;
+    };
+    const out = {};
+
+    const closedStream = new WritableStream({});
+    const closedWriter = closedStream.getWriter();
+    await closedWriter.close();
+    out.closed = {
+      second: await closedWriter.close().then(() => "ok", errorInfo),
+      third: await closedWriter.close().then(() => "ok", errorInfo),
+    };
+
+    let releaseClose;
+    const closingStream = new WritableStream({ close: () => new Promise((resolve) => (releaseClose = resolve)) });
+    const closingWriter = closingStream.getWriter();
+    const firstClose = closingWriter.close();
+    await flip();
+    out.closing = {
+      second: await closingWriter.close().then(() => "ok", errorInfo),
+      third: await closingWriter.close().then(() => "ok", errorInfo),
+    };
+    releaseClose();
+    out.closing.first = await firstClose.then(() => "ok", errorInfo);
+
+    const erroredStream = new WritableStream({ write() { throw new Error("sink"); } });
+    const erroredWriter = erroredStream.getWriter();
+    out.errored = {
+      write: await erroredWriter.write("x").then(() => "ok", errorInfo),
+      close: await erroredWriter.close().then(() => "ok", errorInfo),
+      closeAgain: await erroredWriter.close().then(() => "ok", errorInfo),
+    };
+
+    // 'erroring': controller.error() while a write is in flight parks the
+    // stream; close() then queues behind the write and rejects with the
+    // stored error once the write settles.
+    let releaseWrite;
+    let controller;
+    const erroringStream = new WritableStream({
+      start: (c) => (controller = c),
+      write: () => new Promise((resolve) => (releaseWrite = resolve)),
+    });
+    const erroringWriter = erroringStream.getWriter();
+    const inFlightWrite = erroringWriter.write("x").then(() => "ok", errorInfo);
+    await flip();
+    controller.error(new Error("boom"));
+    await flip();
+    const pendingClose = erroringWriter.close().then(() => "ok", errorInfo);
+    releaseWrite();
+    out.erroring = { close: await pendingClose, write: await inFlightWrite };
+
+    return report(out);
+  },
+
+  async "/writable-abort-states"() {
+    // Issue #133: workerd resolves abort() on a stream that already errored
+    // and gives every abort() call its own promise, while all of them
+    // follow the request's one abort. Aborting while the stream is still
+    // erroring rejects with the stored error.
+    const flip = async () => {
+      for (let i = 0; i < 16; i++) await null;
+    };
+    const out = {};
+
+    const writableStream = new WritableStream({});
+    const writableWriter = writableStream.getWriter();
+    const first = writableWriter.abort(new Error("why"));
+    const second = writableWriter.abort(new Error("again"));
+    out.writable = {
+      same: first === second,
+      first: await first.then(() => "ok", errorInfo),
+      second: await second.then(() => "ok", errorInfo),
+      third: await writableWriter.abort(new Error("third")).then(() => "ok", errorInfo),
+      closed: await writableWriter.closed.then(() => "closed", errorInfo),
+    };
+
+    const erroredStream = new WritableStream({ write() { throw new Error("sink"); } });
+    const erroredWriter = erroredStream.getWriter();
+    out.errored = {
+      write: await erroredWriter.write("x").then(() => "ok", errorInfo),
+      abort: await erroredWriter.abort(new Error("why")).then(() => "ok", errorInfo),
+      again: await erroredWriter.abort(new Error("again")).then(() => "ok", errorInfo),
+      closed: await erroredWriter.closed.then(() => "closed", errorInfo),
+    };
+
+    const closedStream = new WritableStream({});
+    const closedWriter = closedStream.getWriter();
+    await closedWriter.close();
+    const closedFirst = closedWriter.abort(new Error("why"));
+    const closedSecond = closedWriter.abort(new Error("again"));
+    out.closed = {
+      same: closedFirst === closedSecond,
+      first: await closedFirst.then(() => "ok", errorInfo),
+      second: await closedSecond.then(() => "ok", errorInfo),
+    };
+
+    // A TransformStream whose readable a consumer cancelled: the writable
+    // errored with the cancel reason (issue #129), and abort() on it
+    // resolves rather than replaying that reason.
+    const transformed = new TransformStream();
+    const transformWriter = transformed.writable.getWriter();
+    await transformed.readable.getReader().cancel("stop");
+    out.transformCancel = {
+      abort: await transformWriter.abort(new Error("why")).then(() => "ok", errorInfo),
+      closed: await transformWriter.closed.then(() => "closed", errorInfo),
+    };
+
+    // A sink abort that throws rejects this call only; the stream stays
+    // errored and writer.closed carries the reason.
+    const throwingStream = new WritableStream({ abort() { throw new Error("nope"); } });
+    const throwingWriter = throwingStream.getWriter();
+    out.sinkAbortThrows = {
+      abort: await throwingWriter.abort(new Error("why")).then(() => "ok", errorInfo),
+      again: await throwingWriter.abort(new Error("again")).then(() => "ok", errorInfo),
+      closed: await throwingWriter.closed.then(() => "closed", errorInfo),
+    };
+
+    // Aborting while 'erroring' rejects both calls with the stored error and
+    // does not run the sink abort, which is what workerd does.
+    let releaseWrite;
+    let controller;
+    let sinkAbort = "not-run";
+    const erroringStream = new WritableStream({
+      start: (c) => (controller = c),
+      write: () => new Promise((resolve) => (releaseWrite = resolve)),
+      abort: () => (sinkAbort = "ran"),
+    });
+    const erroringWriter = erroringStream.getWriter();
+    const inFlightWrite = erroringWriter.write("x").then(() => "ok", errorInfo);
+    await flip();
+    controller.error(new Error("boom"));
+    await flip();
+    const aborting = erroringWriter.abort(new Error("why"));
+    const abortingAgain = erroringWriter.abort(new Error("again"));
+    releaseWrite();
+    out.erroring = {
+      same: aborting === abortingAgain,
+      abort: await aborting.then(() => "ok", errorInfo),
+      again: await abortingAgain.then(() => "ok", errorInfo),
+      write: await inFlightWrite,
+      sinkAbort,
+    };
+
+    return report(out);
+  },
+
+  async "/writable-write-states"() {
+    // The write() side of issue #132: workerd's messages name the state,
+    // and its closing-stream message says "ReadableStream".
+    const flip = async () => {
+      for (let i = 0; i < 16; i++) await null;
+    };
+    const out = {};
+
+    const closedStream = new WritableStream({});
+    const closedWriter = closedStream.getWriter();
+    await closedWriter.close();
+    out.closed = await closedWriter.write("x").then(() => "ok", errorInfo);
+
+    let releaseClose;
+    const closingStream = new WritableStream({ close: () => new Promise((resolve) => (releaseClose = resolve)) });
+    const closingWriter = closingStream.getWriter();
+    const pendingClose = closingWriter.close();
+    await flip();
+    out.closing = await closingWriter.write("x").then(() => "ok", errorInfo);
+    releaseClose();
+    await pendingClose;
+
+    const erroredStream = new WritableStream({ write() { throw new Error("sink"); } });
+    const erroredWriter = erroredStream.getWriter();
+    out.errored = await erroredWriter.write("x").then(() => "ok", errorInfo);
+
+    let releaseWrite;
+    let controller;
+    const erroringStream = new WritableStream({
+      start: (c) => (controller = c),
+      write: () => new Promise((resolve) => (releaseWrite = resolve)),
+    });
+    const erroringWriter = erroringStream.getWriter();
+    const inFlightWrite = erroringWriter.write("x").then(() => "ok", errorInfo);
+    await flip();
+    controller.error(new Error("boom"));
+    await flip();
+    const blockedWrite = erroringWriter.write("y").then(() => "ok", errorInfo);
+    releaseWrite();
+    out.erroring = await blockedWrite;
+    await inFlightWrite;
+
+    return report(out);
+  },
+
   async "/writable-backpressure"() {
     const order = [];
     let release;

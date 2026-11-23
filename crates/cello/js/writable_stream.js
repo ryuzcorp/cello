@@ -5,11 +5,15 @@
 // write/close is in flight (or before start settles) parks the stream in
 // 'erroring'; the in-flight operation completes normally, then
 // _finishErroring rejects the queued writes in order, runs the sink
-// abort, and rejects close/closed. Three deliberate Workerd deviations
-// from the current spec text: abort() on an errored stream rejects with
-// the stored error (spec resolves), repeated abort() calls return the
-// same promise even after it settles, and close() on an errored stream
-// rejects with the stored error (spec rejects with a fresh TypeError).
+// abort, and rejects close/closed. One deliberate Workerd deviation from
+// the current spec text: close() on an errored stream rejects with the
+// stored error (spec rejects with a fresh TypeError). Everything else
+// here is measured workerd 1.20261121.1 behaviour, not spec text: abort()
+// on an errored stream resolves (spec resolves too; this file used to
+// reject), every abort() call gets its own promise although all of them
+// follow the request's single abort (spec returns the same promise
+// again), and the close()/write() rejections name each state the way
+// workerd's messages do.
 
 // Brand-check sentinel for internal construction.
 const _wsc_brand = Symbol("WritableStreamController");
@@ -22,6 +26,17 @@ const _wsc_brand = Symbol("WritableStreamController");
 // shadows a public property must not be able to make abort()/cancel throw
 // before the sink's abort algorithm runs.
 const _unblockWriteHooks = new WeakMap();
+
+// A fresh promise following `p`'s outcome. Workerd hands every abort() call
+// its own promise instead of returning the request's promise again, while
+// all of them settle alike (#133, measured on 1.20261121.1). The no-op
+// rejection sink keeps a dropped call from firing the unhandled-rejection
+// hook, the same reason the abort request carries one.
+function _followAbort(p) {
+  const follower = p.then((value) => value);
+  follower.catch(() => {});
+  return follower;
+}
 
 class WritableStreamDefaultController {
   #stream;
@@ -315,9 +330,15 @@ class WritableStream {
     }
     if (this._state === 'errored')
       return Promise.reject(this._storedError);
-    if (this._closing() || this._state === 'closed')
+    // Workerd names each state separately here (#132), and its message
+    // for a closing stream says "ReadableStream": measured on
+    // 1.20261121.1, not a typo of ours.
+    if (this._state === 'closed')
       return Promise.reject(new TypeError(
-        "Cannot write to a closing/closed stream"));
+        "This WritableStream has been closed."));
+    if (this._closing())
+      return Promise.reject(new TypeError(
+        "This ReadableStream is closed."));
     if (this._state === 'erroring')
       return Promise.reject(this._storedError);
     return new Promise((resolve, reject) => {
@@ -333,15 +354,16 @@ class WritableStream {
     // (the spec text rejects with a fresh TypeError), the reason
     // writer.closed already reports. A producer whose consumer cancelled
     // the readable therefore observes the cancel reason instead of a
-    // generic message (#129).
+    // generic message (#129). The other two states have their own
+    // workerd messages (#132), measured on 1.20261121.1.
     if (this._state === 'errored')
       return Promise.reject(this._storedError);
     if (this._state === 'closed')
       return Promise.reject(new TypeError(
-        "Stream already closed/errored"));
+        "This WritableStream has been closed."));
     if (this._closing())
       return Promise.reject(new TypeError(
-        "Stream already closing"));
+        "Cannot close a writer that is already being closed"));
     return new Promise((resolve, reject) => {
       this._closeRequest = { resolve, reject };
       if (this._backpressure &&
@@ -352,15 +374,20 @@ class WritableStream {
   }
 
   _abort(reason) {
-    // Workerd: repeated abort() returns the same promise,
-    // settled or not.
-    if (this._abortPromise) return this._abortPromise;
+    // Workerd: every abort() call gets its own promise, and all of them
+    // follow the request's single abort, settled or not (#133).
+    if (this._abortPromise) return _followAbort(this._abortPromise);
     if (this._state === 'closed')
       return Promise.resolve();
-    // Workerd deviation from the current spec: aborting an
-    // errored stream rejects with the stored error.
+    // Workerd resolves abort() on a stream that already errored: the
+    // error reached every consumer already, so aborting changes nothing
+    // (the spec text resolves too; this path used to reject with the
+    // stored error, which the old header misrecorded as workerd's).
+    // Aborting while the stream is still *erroring* rejects with the
+    // stored error from _finishErroring: the request is recorded before
+    // the state settles.
     if (this._state === 'errored')
-      return Promise.reject(this._storedError);
+      return Promise.resolve();
     // Fire the controller's AbortSignal so sinks watching
     // controller.signal can cancel in-flight work.
     if (this._signalAbort) this._signalAbort(reason);
