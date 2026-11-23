@@ -222,6 +222,26 @@ pub(crate) fn run(request: &serde_json::Value) -> Result<serde_json::Value> {
             }
             Ok(serde_json::Value::Array(results))
         }
+        Some("refusal") => {
+            let now = integer(request, "now")?;
+            let prior = match (
+                optional_integer(request, "priorCount")?,
+                optional_integer(request, "priorAt")?,
+            ) {
+                (Some(count), Some(at)) => Some(cello_logic::queue::RefusalStreak {
+                    count: u16::try_from(count)
+                        .map_err(|_| anyhow!("Queue refusal streak is out of range"))?,
+                    at,
+                }),
+                _ => None,
+            };
+            let refusal = cello_logic::queue::refuse_batch(now, prior);
+            Ok(serde_json::json!({
+                "count": refusal.streak.count,
+                "at": refusal.streak.at,
+                "delayMs": refusal.delay_ms,
+            }))
+        }
         Some("batch") => {
             let now = integer(request, "now")?;
             let max_batch_size = usize::try_from(integer(request, "maxBatchSize")?)

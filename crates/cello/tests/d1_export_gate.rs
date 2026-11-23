@@ -413,9 +413,10 @@ fn d1_export_is_operator_only() {
         "{queue_rpc}"
     );
 
-    // Host-driven settlement stays open: a body with no lease 409s instead
-    // of 403ing.
+    // Host-driven settlement and the refusal release stay open: a body with
+    // no lease 409s instead of 403ing, on both routes.
     let settle = get_json(&node, "/queue-settle-open");
     assert_eq!(settle["ok"], true, "{settle}");
     assert_eq!(settle["result"]["status"], 409, "{settle}");
+    assert_eq!(settle["result"]["refuseStatus"], 409, "{settle}");
 }

@@ -1,0 +1,32 @@
+{
+  "name": "queue-refusal",
+  "main": "worker.js",
+  "compatibility_date": "2026-02-12",
+  "no_bundle": true,
+  "queues": {
+    "producers": [
+      { "binding": "Q_SRC", "queue": "refuse-src" },
+      { "binding": "Q_DST", "queue": "refuse-dst" },
+      { "binding": "Q_RETRY", "queue": "retry-src" },
+      { "binding": "Q_RETRY_DST", "queue": "retry-dst" }
+    ],
+    "consumers": [
+      {
+        "queue": "refuse-src",
+        "max_batch_size": 40,
+        "max_batch_timeout": 5,
+        "max_retries": 0,
+        "retry_delay": 0,
+        "dead_letter_queue": "refuse-dst"
+      },
+      {
+        "queue": "retry-src",
+        "max_batch_size": 10,
+        "max_batch_timeout": 0,
+        "max_retries": 1,
+        "retry_delay": 0,
+        "dead_letter_queue": "retry-dst"
+      }
+    ]
+  }
+}

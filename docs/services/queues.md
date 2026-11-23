@@ -86,6 +86,8 @@ A `queues.consumers` entry names the `queue`. Only one script can consume a queu
 
 Cello does not guarantee a delivery order, and it delivers a message at least once. `message.id` stays the same across a redelivery, so use it as an idempotency key. A handler that never settles its batch holds the lease until the lease expires, and Cello counts that as one failed delivery. Cello adds no exponential backoff to a retry: compute the delay from `message.attempts`. A message that passes `max_retries` moves to the `dead_letter_queue`, or Cello deletes it when the consumer names none.
 
+A batch the consumer isolate cannot hold -- one whose message bodies do not fit the isolate's `ArrayBuffer` budget, or one that finds no stateless slot to run in -- is refused before the handler runs. That refusal is not a delivery: Cello releases the lease without spending an attempt, so `message.attempts` counts only deliveries the consumer actually ran, and a refused message never moves towards `max_retries` or the dead-letter queue. The refused batch is retried after a backoff that doubles with consecutive refusals (one second up to five) and starts over after a quiet spell, so an isolate short of memory is not dispatched to in a loop. A handler that throws, a `retry()`, and a lease that expires unsettled still spend an attempt. See [memory per isolate](../reference/limits.md#cap-memory-per-isolate) for the budget that causes the refusal.
+
 ## Handle the differences from Cloudflare
 
 | Area | Cello behavior |

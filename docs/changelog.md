@@ -41,6 +41,27 @@ beyond the new `CELLO_HTTP_STREAM_IDLE_S` knob.
   non-positive or malformed value stops the node instead of silently
   disabling the bound.
 
+A Queue batch that a full consumer isolate refuses no longer spends a
+delivery attempt. Under `CELLO_V8_EXTERNAL_LIMIT_MB` pressure the broker
+counted each refusal as a delivery the consumer never ran, so a message
+walked towards `max_retries` and the dead-letter queue untouched by
+application code. The batch is now released with the settlement's own fence
+and retried after a bounded backoff. No configuration, data, or bucket-format
+changes: the refusal streak lives in the queue cell's existing metadata table.
+
+- **A budget-refused Queue batch is released without spending an attempt**
+  (#110). A dispatch whose batch does not fit the consumer isolate's
+  `ArrayBuffer` budget — or that finds no stateless slot to run in — never
+  executes a line of the handler, so it is no longer a failed delivery. The
+  host reports the refusal back to the queue cell, which clears the lease in
+  one transaction, leaves `attempts` untouched, and makes the rows visible
+  again after a delay that doubles per consecutive refusal (one second up to
+  five) and starts over after 30 quiet seconds. That backoff is what keeps a
+  full isolate from being dispatched to in a loop, and it puts the refused
+  rows behind whatever is already waiting. A handler that throws,
+  `message.retry()`, `batch.retryAll()`, and a lease that expires unsettled
+  still spend an attempt. If the release itself is lost, the lease expires
+  and spends the attempt exactly as before, so no message is lost.
 ## v0.2.7
 
 Five stream and body divergences from workerd are fixed, all found by the

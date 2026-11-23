@@ -5,8 +5,9 @@
 //! A queue is one reserved cell. The cell owns SQL and dispatch, while this
 //! module owns the values and transitions that another caller must reproduce:
 //! the stable address, the public bounds, the alarm deadline, concurrency
-//! admission, retry timing, lease-generation advancement, settlement fencing,
-//! purge classification, and deploy-time configuration validation.
+//! admission, retry timing, the release of a batch a consumer isolate refused,
+//! lease-generation advancement, settlement fencing, purge classification,
+//! and deploy-time configuration validation.
 //!
 //! The lease generation travels in [`PlannedLease`]. A caller cannot select a
 //! row and then forget to advance its generation, because this module never
@@ -126,6 +127,73 @@ pub fn expire_lease(
         ExpiredLeaseAction::RetryAt(retry_at(now, None, configured_delay_seconds))
     };
     ExpiredLease { attempt, action }
+}
+
+/// The delay a batch refused for want of isolate capacity waits before its
+/// rows are visible again. It doubles per consecutive refusal up to
+/// [`REFUSAL_MAX_DELAY_MS`].
+pub const REFUSAL_BASE_DELAY_MS: Ms = 1_000;
+
+/// The longest such delay. A refusal is not the consumer's failure, so a
+/// squeeze that outlasts the growth must not park the batch for minutes after
+/// the isolate has room again.
+pub const REFUSAL_MAX_DELAY_MS: Ms = 5_000;
+
+/// A refusal gap this long means the pressure is gone: the next refusal waits
+/// the base delay again instead of resuming at the ceiling.
+pub const REFUSAL_RESET_MS: Ms = 30_000;
+
+/// The persisted refusal streak: consecutive refusals, and when the last one
+/// happened.
+///
+/// It is broker state, not per-message state. One queue has one consumer
+/// script, so a refusal says something about that script's isolates rather
+/// than about the batch, and a shared streak means one signal of pressure
+/// instead of one row update per message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RefusalStreak {
+    pub count: u16,
+    pub at: Ms,
+}
+
+/// One refusal's outcome: the streak to persist and how long every row of the
+/// refused batch must stay invisible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Refusal {
+    pub streak: RefusalStreak,
+    pub delay_ms: Ms,
+}
+
+/// Plan the release of a batch whose consumer isolate refused it.
+///
+/// A refusal is not a delivery: the isolate could not materialize the batch
+/// (its backing-store budget was full, or no stateless slot admitted the
+/// event), so no line of the consumer ran and no attempt may be spent. The
+/// rows return to ordinary queue state after a delay that grows with
+/// consecutive refusals and stops at [`REFUSAL_MAX_DELAY_MS`]: an immediate
+/// release would redeliver into the same full isolate in a loop, and an
+/// unbounded growth would cost more latency than the attempt it saves.
+///
+/// A gap of [`REFUSAL_RESET_MS`] between refusals starts the delay over. That
+/// is what lets the streak decay without a success signal: the broker never
+/// observes a successful delivery directly, and threading one through every
+/// settlement would put a metadata write on the hot path to correct a delay
+/// that is already bounded.
+pub fn refuse_batch(now: Ms, prior: Option<RefusalStreak>) -> Refusal {
+    let count = match prior {
+        Some(prior) if now.saturating_sub(prior.at) < REFUSAL_RESET_MS && prior.count > 0 => {
+            prior.count.saturating_add(1)
+        }
+        _ => 1,
+    };
+    let doublings = u32::from(count.saturating_sub(1)).min(16);
+    let delay_ms = REFUSAL_BASE_DELAY_MS
+        .saturating_mul(1i64 << doublings)
+        .min(REFUSAL_MAX_DELAY_MS);
+    Refusal {
+        streak: RefusalStreak { count, at: now },
+        delay_ms,
+    }
 }
 
 /// The fixed lifetime of one persisted Queue lease.
@@ -362,4 +430,76 @@ pub fn validate_config(config: &QueueConfig) -> Result<(), ConfigError> {
         return Err(fail("retry_delay", "must be between 0 and 86400 seconds"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NOW: Ms = 1_800_000_000_000;
+
+    /// The first refusal waits the base delay, and the streak records it, so a
+    /// released batch is never redelivered in the same instant.
+    #[test]
+    fn first_refusal_waits_the_base_delay() {
+        let refusal = refuse_batch(NOW, None);
+        assert_eq!(refusal.delay_ms, REFUSAL_BASE_DELAY_MS);
+        assert_eq!(refusal.streak, RefusalStreak { count: 1, at: NOW });
+    }
+
+    /// Consecutive refusals double the wait, so a full isolate is not
+    /// dispatched to on every alarm.
+    #[test]
+    fn consecutive_refusals_double_until_the_ceiling() {
+        let mut streak = None;
+        let mut delays = Vec::new();
+        for step in 0..6 {
+            let refusal = refuse_batch(NOW + step, streak);
+            delays.push(refusal.delay_ms);
+            streak = Some(refusal.streak);
+        }
+        assert_eq!(
+            delays,
+            vec![
+                1_000,
+                2_000,
+                4_000,
+                REFUSAL_MAX_DELAY_MS,
+                REFUSAL_MAX_DELAY_MS,
+                REFUSAL_MAX_DELAY_MS
+            ]
+        );
+    }
+
+    /// A quiet spell starts the delay over: a stale ceiling would charge a
+    /// fresh, isolated refusal the longest wait.
+    #[test]
+    fn a_gap_starts_the_delay_over() {
+        let pressure: Option<RefusalStreak> = Some(RefusalStreak { count: 40, at: NOW });
+        let refusal = refuse_batch(NOW + REFUSAL_RESET_MS, pressure);
+        assert_eq!(refusal.streak.count, 1);
+        assert_eq!(refusal.delay_ms, REFUSAL_BASE_DELAY_MS);
+    }
+
+    /// A streak at the window boundary still counts as consecutive, and a
+    /// saturated counter cannot wrap into a short delay.
+    #[test]
+    fn a_saturated_streak_keeps_the_ceiling() {
+        let pressure = RefusalStreak {
+            count: u16::MAX,
+            at: NOW,
+        };
+        let refusal = refuse_batch(NOW + REFUSAL_RESET_MS - 1, Some(pressure));
+        assert_eq!(refusal.streak.count, u16::MAX);
+        assert_eq!(refusal.delay_ms, REFUSAL_MAX_DELAY_MS);
+    }
+
+    /// A prior streak of zero is not a refusal: it must not start at the
+    /// second rung of the ladder.
+    #[test]
+    fn a_zero_streak_is_a_first_refusal() {
+        let refusal = refuse_batch(NOW, Some(RefusalStreak { count: 0, at: NOW }));
+        assert_eq!(refusal.streak.count, 1);
+        assert_eq!(refusal.delay_ms, REFUSAL_BASE_DELAY_MS);
+    }
 }

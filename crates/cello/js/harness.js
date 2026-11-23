@@ -9217,6 +9217,57 @@ class __QueueCell {
     return matches ? rows : null;
   }
 
+  _refusalStreak(now) {
+    const count = Number(this._meta("refusal_count") ?? "0");
+    const at = Number(this._meta("refusal_at") ?? "0");
+    return __queuePolicy({
+      op: "refusal",
+      now,
+      priorCount: Number.isSafeInteger(count) && count > 0 ? count : null,
+      priorAt: Number.isSafeInteger(at) && at > 0 ? at : null,
+    });
+  }
+
+  // A batch its consumer isolate refused for want of capacity was never
+  // delivered: the isolate could not materialize the message bodies, so no
+  // line of the handler ran. Releasing the lease therefore must not spend an
+  // attempt -- charging it would walk a message towards `max_retries` and the
+  // dead-letter queue while the consumer never saw it.
+  //
+  // The rows return to ordinary queue state after a backoff that grows with
+  // consecutive refusals: an immediate release would redeliver into the same
+  // full isolate on the next alarm, and the delay also puts the refused rows
+  // behind whatever is already waiting. The fence is the settlement's own, so
+  // a release that lost a race with a new lease clears nothing.
+  async _releaseRefused(body) {
+    const rows = this._matchingLease(body);
+    if (rows === null) return false;
+    const now = Date.now();
+    const refusal = this._refusalStreak(now);
+    const visibleAt = now + refusal.delayMs;
+    const sql = this._open();
+    this.ctx.storage.transactionSync(() => {
+      for (const row of rows) {
+        sql.exec(
+          `UPDATE ${__QUEUE_MESSAGES}
+              SET lease_id = NULL, leased_until = NULL, visible_at = ?
+            WHERE seq = ? AND lease_id = ? AND lease_generation = ?`,
+          visibleAt,
+          row.seq,
+          body.leaseId,
+          row.lease_generation,
+        );
+      }
+      // One transaction with the release: a stop before it commits leaves the
+      // lease to expire as before, so no attempt is spent twice and no lease
+      // is lost.
+      this._setMeta("refusal_count", refusal.count);
+      this._setMeta("refusal_at", now);
+    });
+    await this._rearm(now);
+    return true;
+  }
+
   async _settle(body) {
     const rows = this._matchingLease(body);
     if (rows === null) return false;
@@ -9523,6 +9574,13 @@ class __QueueCell {
         return await this._settle(body)
           ? new Response(null, { status: 204 })
           : new Response("stale Queue settlement", { status: 409 });
+      }
+      // The host reports back a batch its consumer isolate could not take.
+      // This is not a settlement: attempts are left untouched.
+      if (path === "/__qRefuse") {
+        return await this._releaseRefused(body)
+          ? new Response(null, { status: 204 })
+          : new Response("stale Queue lease", { status: 409 });
       }
       if (body.op === "info") {
         if (!operator) return refuse("info", "cello queue info");
