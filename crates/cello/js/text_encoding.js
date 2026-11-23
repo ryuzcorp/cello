@@ -193,8 +193,7 @@
                 // normalizes the utf names to the spelling above.
                 const name = _tdLabel(label);
                 if (name === undefined) throw new RangeError(
-                    `The encoding label` +
-                    ` '${label}' is invalid.`
+                    `"${label}" is not a valid encoding.`
                 );
                 enc = aliases[name] ?? name;
             }

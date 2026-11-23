@@ -353,30 +353,42 @@ class IdentityTransformStream {
     // fetch body.
     if (limit !== undefined) readable._expectedLength = limit;
     let seen = 0;
+    // Workerd reports a length failure on the readable side only: the write
+    // or close that trips it resolves, and the error is stored so a repeated
+    // write and a later close keep rejecting with it (measured sequences:
+    // overflow write resolves, close rejects with the overflow TypeError;
+    // underflow close resolves, the readable errors).
+    let overflowed = null;
     const writable = new WritableStream({
       write(chunk) {
         let view;
         try {
           view = bytes(chunk);
-          if (limit !== undefined &&
-              (seen += view.byteLength) > limit)
-            throw new TypeError(
-              'Attempt to write too many bytes through a ' +
-              'FixedLengthStream.');
         } catch (e) {
           ctl._errorRd(e);
           throw e;
+        }
+        if (limit !== undefined) {
+          if (overflowed !== null) throw overflowed;
+          seen += view.byteLength;
+          if (seen > limit) {
+            overflowed = new TypeError(
+              'Attempt to write too many bytes through a ' +
+              'FixedLengthStream.');
+            ctl._errorRd(overflowed);
+            return;
+          }
         }
         if (view.byteLength === 0) return;
         return ctl._deliver(view);
       },
       close() {
+        if (overflowed !== null) throw overflowed;
         if (limit !== undefined && seen < limit) {
-          const e = new TypeError(
+          ctl._errorRd(new TypeError(
             'FixedLengthStream did not see all expected bytes ' +
-            'before close().');
-          ctl._errorRd(e);
-          throw e;
+            'before close().'));
+          return;
         }
         ctl._close();
       },

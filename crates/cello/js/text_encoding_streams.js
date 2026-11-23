@@ -52,3 +52,11 @@ globalThis.TextDecoderStream = class TextDecoderStream
   get fatal() { return this.#dec.fatal; }
   get ignoreBOM() { return this.#dec.ignoreBOM; }
 };
+// Workerd's streams carry their own tag instead of inheriting
+// TransformStream's.
+for (const [cls, name] of [
+  [globalThis.TextEncoderStream, "TextEncoderStream"],
+  [globalThis.TextDecoderStream, "TextDecoderStream"],
+])
+  Object.defineProperty(cls.prototype, Symbol.toStringTag,
+    { value: name, configurable: true });

@@ -86,10 +86,15 @@ enum ZlibStream {
     ZlibDecode(flate2::write::ZlibDecoder<Vec<u8>>),
     RawEncode(flate2::write::DeflateEncoder<Vec<u8>>),
     RawDecode(flate2::write::DeflateDecoder<Vec<u8>>),
+    // Workerd's brotli stream: quality 5 with a 19-bit window reproduces its
+    // bytes exactly (measured against workerd 1.20261121.1 for several
+    // inputs; qualities 5 and 6 are byte-identical on them).
+    BrotliEncode(brotli::CompressorWriter<Vec<u8>>),
+    BrotliDecode(brotli::DecompressorWriter<Vec<u8>>),
 }
 
-/// The six writer types share `write`/`flush`/`get_mut`/`finish` but no
-/// trait, so dispatch once here.
+/// The writer types share `write`/`get_ref`/`get_mut` but not `finish`,
+/// so dispatch once here; the brotli arms are the ones without `finish`.
 macro_rules! zlib_each {
     ($stream:expr, $w:ident => $body:expr) => {
         match $stream {
@@ -99,6 +104,26 @@ macro_rules! zlib_each {
             ZlibStream::ZlibDecode($w) => $body,
             ZlibStream::RawEncode($w) => $body,
             ZlibStream::RawDecode($w) => $body,
+            ZlibStream::BrotliEncode($w) => $body,
+            ZlibStream::BrotliDecode($w) => $body,
+        }
+    };
+}
+
+/// The flate2 writers also have `finish`; the brotli ones do not, so the
+/// `finish` path dispatches only over these.
+macro_rules! zlib_each_flate {
+    ($stream:expr, $w:ident => $body:expr) => {
+        match $stream {
+            ZlibStream::GzipEncode($w) => $body,
+            ZlibStream::GzipDecode($w) => $body,
+            ZlibStream::ZlibEncode($w) => $body,
+            ZlibStream::ZlibDecode($w) => $body,
+            ZlibStream::RawEncode($w) => $body,
+            ZlibStream::RawDecode($w) => $body,
+            ZlibStream::BrotliEncode(_) | ZlibStream::BrotliDecode(_) => {
+                unreachable!("brotli arms are finished by into_inner")
+            }
         }
     };
 }
@@ -115,6 +140,10 @@ impl ZlibStream {
             ("deflate", true) => Self::ZlibDecode(z::ZlibDecoder::new(sink())),
             ("deflate-raw", false) => Self::RawEncode(z::DeflateEncoder::new(sink(), level)),
             ("deflate-raw", true) => Self::RawDecode(z::DeflateDecoder::new(sink())),
+            ("brotli", false) => {
+                Self::BrotliEncode(brotli::CompressorWriter::new(sink(), 4096, 5, 19))
+            }
+            ("brotli", true) => Self::BrotliDecode(brotli::DecompressorWriter::new(sink(), 4096)),
             _ => return None,
         })
     }
@@ -122,7 +151,10 @@ impl ZlibStream {
     fn decompress(&self) -> bool {
         matches!(
             self,
-            Self::GzipDecode(_) | Self::ZlibDecode(_) | Self::RawDecode(_)
+            Self::GzipDecode(_)
+                | Self::ZlibDecode(_)
+                | Self::RawDecode(_)
+                | Self::BrotliDecode(_)
         )
     }
 
@@ -161,8 +193,26 @@ impl ZlibStream {
     /// Terminate the stream and return the final output. For gzip this
     /// also validates the trailer, so a truncated stream errors here.
     fn finish(self) -> Result<Vec<u8>> {
+        // Workerd tells a truncated stream apart from corrupt input on
+        // close(): "incomplete data" for the former, "Decompression failed."
+        // for the latter. flate2 reports the former as UnexpectedEof, and its
+        // brotli decoder reports both as a failed close (measured: workerd
+        // answers the incomplete message for either brotli case).
+        const INCOMPLETE: &str = "Called close() on a decompression stream with incomplete data";
         let failure = self.failure();
-        zlib_each!(self, w => w.finish().map_err(|_| anyhow!(failure)))
+        match self {
+            Self::BrotliEncode(writer) => Ok(writer.into_inner()),
+            Self::BrotliDecode(writer) => {
+                writer.into_inner().map_err(|_| anyhow!(INCOMPLETE))
+            }
+            other => zlib_each_flate!(other, w => w.finish().map_err(|error| {
+                if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                    anyhow!(INCOMPLETE)
+                } else {
+                    anyhow!(failure)
+                }
+            })),
+        }
     }
 }
 

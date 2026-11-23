@@ -1268,10 +1268,14 @@ impl v8::ValueDeserializerImpl for TransientCloneDelegate<'_> {
     fn get_wasm_module_from_id<'s>(
         &self,
         scope: &mut v8::PinScope<'s, '_>,
-        id: u32,
+        _id: u32,
     ) -> Option<v8::Local<'s, v8::WasmModuleObject>> {
-        let modules = self.wasm_modules.borrow();
-        v8::WasmModuleObject::from_compiled_module(scope, modules.get(id as usize)?)
+        // Workerd serializes a compiled module and then refuses to
+        // deserialize it ("Unable to deserialize cloned data."), so a
+        // capability one isolate compiled never crosses the clone boundary.
+        let message = v8::String::new(scope, "Unable to deserialize cloned data.").unwrap();
+        scope.throw_exception(v8::Exception::error(scope, message));
+        None
     }
 }
 

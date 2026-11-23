@@ -72,6 +72,10 @@ encoding_rs = "0.8"
 # version is exact to keep the upgrade a decision rather than a surprise.
 fastwebsockets = { version = "=0.8.1", default-features = false, features = ["upgrade", "with_axum", "unstable-split"] }
 flate2 = "1"
+# Brotli, for CompressionStream/DecompressionStream("brotli"). Pure Rust, and
+# it already reaches the build through nothing else, so the lock gains one
+# dependency edge (the crate and its decompressor).
+brotli = "8"
 futures-util = "0.3"
 getrandom = "0.3"
 glob = "0.3"

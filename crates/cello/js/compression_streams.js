@@ -29,12 +29,18 @@ function bytes(chunk) {
 // no-op. Created with the first stream, not when this file compiles.
 let registry;
 
-function make(format, decompress) {
-  format = String(format);
-  if (format !== 'gzip' && format !== 'deflate' &&
-      format !== 'deflate-raw')
+function make(format, decompress, name) {
+  // Workerd validates the format at construction (the stream is never
+  // created for an unknown one), and requires the argument to be a string.
+  if (format === undefined || typeof format !== 'string')
     throw new TypeError(
-      `Unsupported compression format: '${format}'`);
+      `Failed to construct '${name}': constructor parameter 1 is not ` +
+      'of type \'string\'.');
+  if (format !== 'gzip' && format !== 'deflate' &&
+      format !== 'deflate-raw' && format !== 'brotli')
+    throw new TypeError(
+      "The compression format must be either 'deflate', " +
+      "'deflate-raw', 'gzip' or 'brotli'.");
   let id;
   // The TransformStream's readable and writable sides both close over
   // this object, so it is collectable exactly when neither side is
@@ -76,7 +82,7 @@ function make(format, decompress) {
 
 class CompressionStream {
   constructor(format) {
-    const ts = make(format, false);
+    const ts = make(format, false, 'CompressionStream');
     this.readable = ts.readable;
     this.writable = ts.writable;
   }
@@ -84,7 +90,7 @@ class CompressionStream {
 
 class DecompressionStream {
   constructor(format) {
-    const ts = make(format, true);
+    const ts = make(format, true, 'DecompressionStream');
     this.readable = ts.readable;
     this.writable = ts.writable;
   }
