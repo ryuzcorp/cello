@@ -28,6 +28,13 @@ adoption time, after the command has already succeeded. Check that the
 nodes adopted the deployment (node logs, or `POST /reload` to adopt now)
 instead of trusting the command result.
 
+Compiling wasm from bytes at run time is refused, as on Cloudflare:
+`new WebAssembly.Module(bytes)`, `WebAssembly.compile()` and
+`WebAssembly.instantiate(bytes)` throw `CompileError: Wasm code generation
+disallowed by embedder`. An imported `.wasm` module is compiled ahead of time
+and instantiates normally, as does `WebAssembly.instantiate()` of a module
+you already have. `WebAssembly.validate()` still answers.
+
 Cello compiles each wasm module once per process, so later isolates and
 cell activations reuse it.
 

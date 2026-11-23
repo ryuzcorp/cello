@@ -7007,6 +7007,20 @@ enum Started<'s> {
     Threw,
 }
 
+/// V8 asks this before it compiles a wasm module from JavaScript —
+/// `new WebAssembly.Module(bytes)`, `WebAssembly.compile`, and
+/// `WebAssembly.instantiate(bytes)`. workerd answers no: a Worker has no wasm
+/// compiler. The embedder compile that serves a deployed or Worker Loader
+/// `.wasm` module (`v8::WasmModuleObject::compile`) never asks, so a
+/// pre-compiled module still instantiates. This is
+/// `v8::AllowWasmCodeGenerationCallback`.
+unsafe extern "C" fn deny_wasm_code_generation(
+    _context: v8::Local<v8::Context>,
+    _source: v8::Local<v8::String>,
+) -> bool {
+    false
+}
+
 fn settle_isolate_heap(isolate: &mut v8::Isolate) {
     #[cfg(all(test, cello_internal_tests))]
     let _observation = HeapSettlementObservationForTest::begin();
@@ -7042,6 +7056,11 @@ impl Worker {
             .heap_limits(0, heap_limit)
             .array_buffer_allocator(array_buffer_budget::allocator(&backing_stores).make_shared());
         let mut isolate = v8::Isolate::new(params);
+        // A Worker isolate has no wasm compiler: the callback answers false,
+        // so a JS-initiated compile throws `CompileError: Wasm code
+        // generation disallowed by embedder`, as on workerd. Deployed and
+        // Worker Loader modules compile through the embedder API instead.
+        isolate.set_allow_wasm_code_generation_callback(deny_wasm_code_generation);
         // Dynamic `import()` of builtin specifiers; per-import()-call only.
         isolate.set_host_import_module_dynamically_callback(host_import_module_dynamically);
         let original_heap_limit = isolate.get_heap_statistics().heap_size_limit();
@@ -7080,6 +7099,13 @@ impl Worker {
         let (context, fetch) = {
             v8::scope!(let hs, &mut isolate);
             let context = v8::Context::new(hs, Default::default());
+            // workerd's isolate has no string code generation, so `eval`,
+            // `new Function` and `Function(...)` throw `EvalError: Code
+            // generation from strings disallowed for this context`. Only the
+            // guest's JS is affected: Cello compiles its prelude, harness and
+            // module graph through the V8 embedder API, which this does not
+            // gate.
+            context.set_allow_generation_from_strings(false);
             let cs = &mut v8::ContextScope::new(hs, context);
             let tc = std::pin::pin!(v8::TryCatch::new(cs));
             let scope = &mut tc.init();
@@ -15743,5 +15769,164 @@ mod vfs_cap_tests {
         assert_eq!(vfs.stat("/tmp/a"), Some((4, 3)));
         assert_eq!(vfs.stat("/tmp"), Some((2, 0)));
         assert_eq!(vfs.stat("/"), Some((1, 0)));
+    }
+}
+
+#[cfg(test)]
+mod code_generation_tests {
+    //! A Worker isolate has no code generator: `eval`, `Function`, and a wasm
+    //! compile from JavaScript bytes throw as on workerd (#194), while a
+    //! `.wasm` module the embedder compiled ahead of time still instantiates.
+
+    use crate::js::{Compat, ModuleSource, RequestBody, Worker, WorkerConfig, WorkerConfigOptions};
+    use crate::WorkerJob;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    /// (module (func (export "run") (result i32) i32.const 42))
+    const ANSWER_WASM: [u8; 36] = [
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f,
+        0x03, 0x02, 0x01, 0x00, 0x07, 0x07, 0x01, 0x03, 0x72, 0x75, 0x6e, 0x00, 0x00, 0x0a, 0x06,
+        0x01, 0x04, 0x00, 0x41, 0x2a, 0x0b,
+    ];
+
+    fn on_engine_thread(test: impl FnOnce() + Send + 'static) {
+        crate::runtime::init_v8();
+        crate::asyncrt::shared_test_runtime();
+        std::thread::spawn(test).join().expect("engine thread");
+    }
+
+    fn load(src: &str, modules: Vec<(String, ModuleSource)>) -> Worker {
+        let config = WorkerConfig::new(WorkerConfigOptions {
+            src: src.to_string(),
+            script_name: "code-generation".to_string(),
+            do_classes: Vec::new(),
+            bindings: Vec::new(),
+            r2_bindings: Vec::new(),
+            d1_bindings: Vec::new(),
+            kv_bindings: Vec::new(),
+            queue_bindings: Vec::new(),
+            queue_consumers: Vec::new(),
+            workflow_bindings: Vec::new(),
+            vars: Vec::new(),
+            node: String::new(),
+            modules,
+            compat: Compat::default(),
+        });
+        Worker::load_config(Arc::new(config)).expect("load worker")
+    }
+
+    /// One request whose handler settles without awaiting I/O, so its first
+    /// turn is the whole request.
+    fn fetch(worker: &mut Worker, path: &str) -> serde_json::Value {
+        let (reply, mut receive) = tokio::sync::oneshot::channel();
+        let job = WorkerJob::Fetch {
+            queued_at: Instant::now(),
+            entrypoint: None,
+            invocation_limits: None,
+            url: format!("http://test{path}"),
+            method: "GET".to_string(),
+            body: RequestBody::Bytes(bytes::Bytes::new()),
+            headers: Vec::new(),
+            request_id: None,
+            tail_report: None,
+            reply,
+        };
+        let (entry, started) = worker.turn_begin(job, None);
+        drop(started);
+        let mut entry = entry.expect("request starts");
+        entry.abandon();
+        drop(entry);
+        let response = receive
+            .try_recv()
+            .unwrap_or_else(|error| panic!("{path} did not answer in one turn: {error:?}"))
+            .unwrap_or_else(|error| panic!("{path} was rejected: {error}"));
+        assert_eq!(response.status, 200, "{path} answered {}", response.status);
+        serde_json::from_slice(&response.body).expect("json body")
+    }
+
+    const EVAL_PROBE: &str = r#"
+const record = (error) => ({ name: error.name, message: error.message });
+export default {
+  fetch() {
+    const out = {};
+    try { out.eval = eval("1 + 1"); } catch (error) { out.eval = record(error); }
+    try { out.newFunction = new Function("return 7")(); } catch (error) { out.newFunction = record(error); }
+    try { out.functionCtor = Function("return 8")(); } catch (error) { out.functionCtor = record(error); }
+    return Response.json(out);
+  },
+};
+"#;
+
+    #[test]
+    fn eval_and_function_throw_eval_error() {
+        on_engine_thread(|| {
+            let mut worker = load(EVAL_PROBE, Vec::new());
+            let body = fetch(&mut worker, "/");
+            let expected = serde_json::json!({
+                "name": "EvalError",
+                "message": "Code generation from strings disallowed for this context",
+            });
+            assert_eq!(body["eval"], expected);
+            assert_eq!(body["newFunction"], expected);
+            assert_eq!(body["functionCtor"], expected);
+        });
+    }
+
+    const WASM_PROBE: &str = r#"
+const record = (error) => ({ name: error.name, message: error.message });
+export default {
+  fetch() {
+    const bytes = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]);
+    const out = {};
+    try { out.module = String(new WebAssembly.Module(bytes)); } catch (error) { out.module = record(error); }
+    // Validation inspects the bytes without compiling them.
+    out.validate = WebAssembly.validate(bytes);
+    return Response.json(out);
+  },
+};
+"#;
+
+    #[test]
+    fn runtime_wasm_compilation_is_refused() {
+        on_engine_thread(|| {
+            let mut worker = load(WASM_PROBE, Vec::new());
+            let body = fetch(&mut worker, "/");
+            assert_eq!(
+                body["module"],
+                serde_json::json!({
+                    "name": "CompileError",
+                    "message": "WebAssembly.Module(): Wasm code generation disallowed by embedder",
+                })
+            );
+            assert_eq!(body["validate"], serde_json::json!(true));
+        });
+    }
+
+    const WASM_IMPORT_PROBE: &str = r#"
+import answer from "./answer.wasm";
+export default {
+  fetch() {
+    const instance = new WebAssembly.Instance(answer, {});
+    return Response.json({
+      isModule: answer instanceof WebAssembly.Module,
+      run: instance.exports.run(),
+    });
+  },
+};
+"#;
+
+    #[test]
+    fn precompiled_wasm_module_still_instantiates() {
+        on_engine_thread(|| {
+            let modules = vec![(
+                "answer.wasm".to_string(),
+                ModuleSource::Wasm(ANSWER_WASM.to_vec().into()),
+            )];
+            let mut worker = load(WASM_IMPORT_PROBE, modules);
+            let body = fetch(&mut worker, "/");
+            assert_eq!(body["isModule"], serde_json::json!(true));
+            assert_eq!(body["run"], serde_json::json!(42));
+        });
     }
 }

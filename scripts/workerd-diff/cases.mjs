@@ -61,4 +61,10 @@ export const cases = [
     fixture: "cache",
     path: "/cache-put-string-chunks",
   },
+  // Code generation is an isolate capability: workerd refuses `eval`,
+  // `Function`, and runtime wasm compilation, and still instantiates a
+  // `.wasm` module the deployment compiled ahead of time (#194).
+  { name: "codegen-eval", fixture: "codegen", path: "/eval" },
+  { name: "codegen-wasm-runtime", fixture: "codegen", path: "/wasm-runtime" },
+  { name: "codegen-wasm-import", fixture: "codegen", path: "/wasm-import" },
 ];

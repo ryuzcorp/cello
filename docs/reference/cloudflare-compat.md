@@ -53,7 +53,7 @@ use. An unsupported feature that stays silent is a defect.
 | [WebSockets](#websockets) | **Yes** |
 | [Web Crypto](#web-crypto) | **Yes** |
 | [Web standards](#web-standards) | **Yes** |
-| WebAssembly | **Yes** |
+| [WebAssembly](#code-generation) | **Yes** |
 | [Performance and timers](#performance-and-timers) | **Yes** |
 | Console | **Yes** |
 | [Node.js compatibility](#nodejs-compatibility) | **Partial** |
@@ -369,6 +369,24 @@ The `tail` and `email` handlers are unavailable.
 `AbortSignal.timeout()` never keeps its event (or its admission slot)
 alive: the timer is unreferenced, so it fires or dies with the request,
 whichever comes first, and carries no timer id or cancellation.
+
+### Code generation
+
+A Worker has no code generator, as on Cloudflare. `eval()`, `new Function()`
+and `Function(...)` throw `EvalError: Code generation from strings disallowed
+for this context`, and compiling wasm from JavaScript bytes — `new
+WebAssembly.Module(bytes)`, `WebAssembly.compile()` and
+`WebAssembly.instantiate(bytes)` — throws `CompileError: Wasm code generation
+disallowed by embedder`. A library that probes `eval` inside `try`/`catch`
+just detects no support and keeps running.
+
+`WebAssembly.validate()` reads the bytes without compiling them and still
+answers. `WebAssembly.Memory`, and `WebAssembly.instantiate()` of an
+already-compiled `WebAssembly.Module` are not code generation and still work.
+A `.wasm` file imported by the bundle is compiled ahead of time (Wrangler's
+`CompiledWasm` rule, or the `no_bundle` sibling scan), so its default export
+is a `WebAssembly.Module` and a wasm-bindgen or workers-rs bundle runs
+unchanged. See [WebAssembly](wasm.md).
 
 ### [Performance and timers](https://developers.cloudflare.com/workers/runtime-apis/performance/)
 
