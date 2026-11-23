@@ -780,7 +780,14 @@ globalThis.Request = class Request {
     const hasBody =
       Object.prototype.hasOwnProperty.call(init, "body");
     let body = hasBody ? init.body : null;
-    if (hasBody && body != null && init.__celloPriorBody !== true &&
+    // The refusal is for a body a script *supplies* with a GET/HEAD. A
+    // Request used as the init dict carries its own `body` as an own
+    // property, and `new Request(url, request)` is the standard proxy shape
+    // -- workerd accepts it for an incoming GET, whose body presence comes
+    // from the wire, not from the init. A clone's tee'd branch
+    // (`__celloPriorBody`) is the same case.
+    if (hasBody && body != null && !(init instanceof Request) &&
+        init.__celloPriorBody !== true &&
         (this.method === "GET" || this.method === "HEAD") && !incoming)
       throw new TypeError(
         "Request with a GET or HEAD method cannot have a body.");
