@@ -8,11 +8,20 @@
 // injected clock/filesystem/async rules do not apply to it.
 #![allow(clippy::disallowed_methods)]
 
-//! Conformance for a Request that crossed an isolate boundary: the RPC lift
-//! carries body presence in the `__cello$req` marker, so a revived bodyless
-//! GET stays bodyless and a revived POST keeps its body (#127). A `fetch()`
-//! on either consumes exactly what workerd consumes, a refused `init` leaves
-//! the request untouched, and the bytes survive the crossing.
+//! Conformance for Request body presence and bytes:
+//!
+//! - a Request that crossed an isolate boundary keeps body presence in the
+//!   `__cello$req` marker, so a revived bodyless GET stays bodyless and a
+//!   revived POST keeps its body (#127), and a `fetch()` on either consumes
+//!   exactly what workerd consumes;
+//! - `new Request(usedRequest)` throws workerd's reconstruction TypeError
+//!   while `clone()` still copies (#140);
+//! - a bodyless POST reports `body === null` and reading it leaves
+//!   `bodyUsed` false, both for a constructed Request and for the ingress
+//!   request with no Content-Length or Transfer-Encoding (#142);
+//! - the response pump and body consumers read a view chunk through internal
+//!   slots, so a guest's own `buffer`/`byteOffset`/`byteLength` cannot widen
+//!   the window or turn the reply empty (#130).
 //!
 //! One `cello dev` boots the app fixture; the controller fixture is
 //! pre-seeded into the dev bucket via the library (the same `build` + `write`
@@ -190,6 +199,67 @@ fn get(addr: &str, path: &str) -> Result<(u16, String), String> {
     request_timeout(addr, "GET", path, Duration::from_secs(60))
 }
 
+/// A request that carries no body framing at all: no `Content-Length` and no
+/// `Transfer-Encoding`, as a bare `curl -X POST` or `curl` GET sends. Workerd
+/// reports `body === null` for it, unlike `Content-Length: 0` (#142, #174).
+fn no_framing(addr: &str, method: &str, path: &str) -> Result<(u16, String), String> {
+    let mut stream = TcpStream::connect(addr).map_err(|error| format!("connect: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .map_err(|error| format!("timeout: {error}"))?;
+    let wire = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(wire.as_bytes())
+        .map_err(|error| format!("write: {error}"))?;
+    let mut raw = Vec::new();
+    stream
+        .read_to_end(&mut raw)
+        .map_err(|error| format!("read: {error}"))?;
+    let raw = String::from_utf8(raw).map_err(|error| format!("utf8: {error}"))?;
+    let (head, body) = raw
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| format!("no header/body split in {raw:?}"))?;
+    let status: u16 = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .ok_or_else(|| format!("no status in {head:?}"))?;
+    Ok((status, body.to_string()))
+}
+
+/// The body with any HTTP/1.1 chunk framing removed. A streamed reply is
+/// chunked; a `Content-Length` reply is already plain, and both round-trip.
+fn dechunked(body: &str) -> String {
+    let mut at = 0;
+    let mut out = String::new();
+    loop {
+        let Some(line_end) = body[at..].find("\r\n").map(|offset| at + offset) else {
+            return body.to_string();
+        };
+        let size_text = &body[at..line_end];
+        if size_text.is_empty()
+            || size_text.len() > 8
+            || !size_text.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return body.to_string();
+        }
+        let Ok(size) = usize::from_str_radix(size_text, 16) else {
+            return body.to_string();
+        };
+        if size == 0 {
+            return out;
+        }
+        let start = line_end + 2;
+        let end = start + size;
+        if end > body.len() {
+            return body.to_string();
+        }
+        out.push_str(&body[start..end]);
+        at = end + 2;
+    }
+}
+
 /// Readiness probe with a short timeout: a bound-but-not-ready node holds
 /// connections open, so a long read would eat the boot deadline.
 fn probe(addr: &str, path: &str) -> bool {
@@ -202,6 +272,13 @@ fn probe(addr: &str, path: &str) -> bool {
 fn get_json(node: &TestNode, path: &str) -> Value {
     let (status, body) = get(&node.public, path).expect("public GET");
     assert_eq!(status, 200, "GET {path}: {body}");
+    serde_json::from_str(&body).expect("JSON body")
+}
+
+fn post_json(node: &TestNode, path: &str) -> Value {
+    let (status, body) =
+        request_timeout(&node.public, "POST", path, Duration::from_secs(60)).expect("public POST");
+    assert_eq!(status, 200, "POST {path}: {body}");
     serde_json::from_str(&body).expect("JSON body")
 }
 
@@ -274,4 +351,92 @@ fn fetch_used_body_conformance() {
     );
     assert_eq!(result["after"], false, "{bad}");
     assert_eq!(result["text"], "abc", "{bad}");
+
+    // #140: a used body cannot be rebuilt into a second Request, through
+    // either the buffered consumer or a disturbed stream, while clone()
+    // still copies an unused body in both shapes.
+    let copy = get_json(&node, "/request-copy-used");
+    assert_eq!(copy["ok"], true, "{copy}");
+    let result = &copy["result"];
+    assert_eq!(result["bufferedCopy"]["name"], "TypeError", "{copy}");
+    assert_eq!(
+        result["bufferedCopy"]["message"], "Cannot reconstruct a Request with a used body.",
+        "{copy}"
+    );
+    assert_eq!(result["disturbedCopy"]["name"], "TypeError", "{copy}");
+    assert_eq!(
+        result["disturbedCopy"]["message"], "Cannot reconstruct a Request with a used body.",
+        "{copy}"
+    );
+    assert_eq!(result["cloneText"], "clone", "{copy}");
+    assert_eq!(result["sourceText"], "clone", "{copy}");
+
+    // #142: a bodyless POST has no body stream, and reading it does not mark
+    // it used. An explicit zero-length body is still a body.
+    let bodyless = get_json(&node, "/request-bodyless-post");
+    assert_eq!(bodyless["ok"], true, "{bodyless}");
+    let result = &bodyless["result"];
+    assert_eq!(result["bodyIsNull"], true, "{bodyless}");
+    assert_eq!(result["usedBefore"], false, "{bodyless}");
+    assert_eq!(result["text"], "", "{bodyless}");
+    assert_eq!(result["usedAfter"], false, "{bodyless}");
+    assert_eq!(result["copyBodyIsNull"], true, "{bodyless}");
+    assert_eq!(result["emptyBodyIsNull"], false, "{bodyless}");
+    assert_eq!(result["emptyText"], "", "{bodyless}");
+    assert_eq!(result["emptyUsedAfter"], true, "{bodyless}");
+
+    // #142/#174 at ingress: presence is the HTTP framing rule, not the
+    // method. No framing is `body === null` and stays unused; `Content-Length:
+    // 0` frames an empty body that text() consumes once, for a POST and a GET
+    // alike.
+    for method in ["POST", "GET"] {
+        let (status, body) = no_framing(&node.public, method, "/incoming-inspect")
+            .unwrap_or_else(|error| panic!("unframed {method}: {error}"));
+        assert_eq!(status, 200, "unframed {method}: {body}");
+        let unframed: Value = serde_json::from_str(&body).expect("JSON body");
+        let result = &unframed["result"];
+        assert_eq!(result["bodyIsNull"], true, "{unframed}");
+        assert_eq!(result["usedBefore"], false, "{unframed}");
+        assert_eq!(result["text"], "", "{unframed}");
+        assert_eq!(result["usedAfter"], false, "{unframed}");
+        assert_eq!(result["textAgain"]["value"], "", "{unframed}");
+
+        let framed = if method == "POST" {
+            post_json(&node, "/incoming-inspect")
+        } else {
+            get_json(&node, "/incoming-inspect")
+        };
+        let result = &framed["result"];
+        assert_eq!(result["bodyIsNull"], false, "{framed}");
+        assert_eq!(result["usedBefore"], false, "{framed}");
+        assert_eq!(result["usedAfter"], true, "{framed}");
+        assert_eq!(result["textAgain"]["name"], "TypeError", "{framed}");
+        assert_eq!(
+            result["textAgain"]["message"],
+            "Body has already been used. It can only be used once. \
+             Use tee() first if you need to read it twice.",
+            "{framed}"
+        );
+    }
+
+    // #130: the response pump reads the view's real window even when the
+    // guest shadows its properties or keeps the backing buffer tight.
+    for route in ["/chunk-shadow-wide", "/chunk-shadow-tight"] {
+        let (status, body) = get(&node.public, route).expect("chunk-shadow GET");
+        assert_eq!(status, 200, "{route}: {body}");
+        assert_eq!(dechunked(&body), "abc", "{route}: {body:?}");
+    }
+
+    // #130: a forged prototype is the bytes TypeError, the same as workerd;
+    // it must never be silently sent as an empty body.
+    let forged = get_json(&node, "/chunk-forged");
+    assert_eq!(forged["ok"], true, "{forged}");
+    let result = &forged["result"];
+    for shape in ["typed", "buffer", "dataView"] {
+        assert_eq!(result[shape]["name"], "TypeError", "{shape}: {forged}");
+        assert_eq!(
+            result[shape]["message"], "This ReadableStream did not return bytes.",
+            "{shape}: {forged}"
+        );
+    }
 }

@@ -1253,6 +1253,7 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
                         operator_ingress: call.operator_ingress,
                     };
                     let attempt_body = match body {
+                        cello::js::RequestBody::Absent => cello::js::RequestBody::Absent,
                         cello::js::RequestBody::Bytes(bytes) => {
                             cello::js::RequestBody::Bytes(bytes.clone())
                         }
@@ -1876,33 +1877,6 @@ async fn dispatch_stub_call(app: AppHandle, call: RpcStubReq) {
     let _ = reply.send(result);
 }
 
-async fn request_payload(
-    request: Request<Incoming>,
-    trust_forwarded_headers: bool,
-    max_body_bytes: usize,
-) -> Result<(String, String, Vec<u8>, Vec<(String, String)>), Box<HttpReply>> {
-    let (parts, body) = request.into_parts();
-    let body = collect_limited_body(body, max_body_bytes)
-        .await
-        .map_err(|error| Box::new(body_read_error("request", error)))?;
-    let headers = parts
-        .headers
-        .iter()
-        .filter_map(|(name, value)| {
-            value
-                .to_str()
-                .ok()
-                .map(|value| (name.to_string(), value.to_string()))
-        })
-        .collect();
-    Ok((
-        request_url(&parts, trust_forwarded_headers),
-        parts.method.to_string(),
-        body.to_vec(),
-        headers,
-    ))
-}
-
 /// A body at or above this many bytes reaches the Worker as a stream.
 ///
 /// A small body crosses as bytes. The host makes one copy, and the handler
@@ -2108,11 +2082,21 @@ fn ingress_payload_parts(
         .get(hyper::header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok());
-    // A method that carries no body does not stream. There is nothing to
-    // pull, and a stream costs the handler one operation to learn this.
-    let bodyless =
-        matches!(parts.method, hyper::Method::GET | hyper::Method::HEAD) || declared == Some(0);
-    if bodyless || declared.is_some_and(|length| length < INGRESS_STREAM_THRESHOLD) {
+    // Whether the HTTP message frames a body at all. Hyper gives an HTTP/1.1
+    // request a body only through `Content-Length` (even 0) or
+    // `Transfer-Encoding`, so the presence rule is the framing rule. Workerd
+    // agrees: an unframed POST reports `body === null` and does not become
+    // used when read, while `Content-Length: 0` reports an empty body stream
+    // (#142). GET and HEAD are not special-cased; the framing headers decide.
+    let framed = declared.is_some() || parts.headers.contains_key(hyper::header::TRANSFER_ENCODING);
+    if !framed {
+        // Nothing to read and nothing to stream. Dropping the `Incoming` is
+        // safe: with no framing it is already end-of-stream.
+        return Ok((url, method, cello::js::RequestBody::Absent, headers, None));
+    }
+    // A body that fits in one piece does not stream. There is nothing to pull
+    // in parts, and a stream costs the handler one operation to learn this.
+    if declared.is_some_and(|length| length < INGRESS_STREAM_THRESHOLD) {
         return Ok((
             url,
             method,

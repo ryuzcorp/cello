@@ -114,11 +114,11 @@
         async write(chunk) {
           await socket._opened;
           if (socket._detached) throw new TypeError("This socket was upgraded.");
-          const bytes = chunk instanceof Uint8Array
-            ? chunk
-            : ArrayBuffer.isView(chunk)
-              ? new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength)
-              : new Uint8Array(chunk);
+          // A guest chunk's window comes from its internal slots (#130); a
+          // non-bytes value keeps the old coercion.
+          const bytes = __cello.__hostChunk(
+            chunk, "This socket write requires an ArrayBuffer or view") ??
+            new Uint8Array(chunk);
           await __tcp_write(socket._id, bytes);
         },
         async close() {
