@@ -13269,7 +13269,8 @@ if (!globalThis.structuredClone) {
     if (entry.serialize === null) {
       throw new DOMException("Unsupported object type", "DataCloneError");
     }
-    return entry.serialize(value);
+    // The serializers read the instance through `this`.
+    return entry.serialize.call(value);
   };
   const deserializers = {
     Blob: (data) => new Blob([data.bytes], { type: data.mimeType }),

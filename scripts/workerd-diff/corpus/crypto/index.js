@@ -431,6 +431,23 @@ export default {
       out.cloneKey = cloneKey.ok
         ? { ok: true, isKey: cloneKey.value instanceof CryptoKey }
         : { ok: false, name: cloneKey.error.name, message: cloneKey.error.message };
+      // A genuine File clones as its host type on Cello (workerd refuses File);
+      // its content, name and type must survive.
+      const fileClone = attemptSync(() => structuredClone(new File(["hi"], "a.txt", { type: "text/plain" })));
+      out.cloneFile = fileClone.ok
+        ? { ok: true, isFile: fileClone.value instanceof File, name: fileClone.value.name,
+            type: fileClone.value.type, size: fileClone.value.size, text: await fileClone.value.text() }
+        : { ok: false, name: fileClone.error.name, message: fileClone.error.message };
+      return Response.json(out);
+    }
+
+    if (path === "/clone-genuine") {
+      // Genuine host objects keep their content through structuredClone.
+      const out = {};
+      const blob = structuredClone(new Blob(["hi"], { type: "text/plain" }));
+      out.blob = { isBlob: blob instanceof Blob, size: blob.size, type: blob.type, text: await blob.text() };
+      const ex = structuredClone(new DOMException("boom", "DataError"));
+      out.domException = { isDOMException: ex instanceof DOMException, name: ex.name, message: ex.message };
       return Response.json(out);
     }
 
