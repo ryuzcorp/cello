@@ -10,7 +10,9 @@
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { cp, mkdtemp, readFile, rm } from "node:fs/promises";
+import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
+import { gzipSync } from "node:zlib";
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -51,6 +53,7 @@ function cleanUp() {
     children.clear();
     await Promise.all([...dirs].map((dir) => rm(dir, { recursive: true, force: true })));
     dirs.clear();
+    if (helperServer) await new Promise((done) => helperServer.close(done));
   })();
   return cleaning;
 }
@@ -85,11 +88,55 @@ async function verifyWorkerd() {
   }
 }
 
+/** A second origin the Worker can fetch: the fixture itself cannot serve as one. */
+function startHelper() {
+  const server = createServer((req, res) => {
+    const url = new URL(req.url, "http://helper.test");
+    if (url.pathname === "/target") {
+      res.writeHead(200, { "content-type": "text/plain", "x-helper": "yes" });
+      res.end("target-body");
+    } else if (url.pathname === "/redirect") {
+      res.writeHead(Number(url.searchParams.get("code") ?? "302"), { location: url.searchParams.get("to") ?? "/target" });
+      res.end();
+    } else if (url.pathname === "/not-found") {
+      res.writeHead(404, { "content-type": "text/plain" });
+      res.end("missing-body");
+    } else if (url.pathname === "/gzip") {
+      const body = gzipSync(Buffer.from("hello gzip"));
+      res.writeHead(200, { "content-encoding": "gzip", "content-type": "text/plain", "content-length": String(body.length) });
+      res.end(body);
+    } else if (url.pathname === "/echo") {
+      const headers = {};
+      for (let i = 0; i < req.rawHeaders.length; i += 2) headers[req.rawHeaders[i].toLowerCase()] = req.rawHeaders[i + 1];
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ method: req.method, url: req.url, headers }));
+    } else {
+      res.writeHead(418);
+      res.end();
+    }
+  });
+  return new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve(server)));
+}
+
+let helperServer;
+let helperOrigin;
+
 /** The fixture's own files plus a `wrangler.json` both runtimes understand. */
 async function fixtureDir(name) {
   const dir = await mkdtemp(join(tmpdir(), "cello-workerd-diff-"));
   dirs.add(dir);
   await cp(join(corpus, name), dir, { recursive: true });
+  // The helper origin's port is only known at boot, so the var is written here.
+  const configPath = join(dir, "wrangler.json");
+  if (existsSync(configPath)) {
+    const config = JSON.parse(await readFile(configPath, "utf8"));
+    config.vars = { ...(config.vars ?? {}), HELPER: helperOrigin };
+    await writeFile(configPath, JSON.stringify(config, null, 2));
+  }
+  const capnpPath = join(dir, "workerd.capnp");
+  if (existsSync(capnpPath)) {
+    await writeFile(capnpPath, (await readFile(capnpPath, "utf8")).replaceAll("__HELPER__", helperOrigin));
+  }
   return dir;
 }
 
@@ -542,6 +589,8 @@ for (const item of run) {
 }
 
 await verifyWorkerd();
+helperServer = await startHelper();
+helperOrigin = `http://127.0.0.1:${helperServer.address().port}`;
 const byFixture = new Map();
 for (const item of run) byFixture.set(item.fixture, [...(byFixture.get(item.fixture) ?? []), item]);
 
@@ -572,6 +621,13 @@ for (const [fixture, items] of byFixture) {
       console.log(`  a request answered ${unexpected.status}, not ${wantStatus}`);
       failures.push(item.name);
       continue;
+    }
+    if (process.env.DUMP_DIR) {
+      const { mkdir, writeFile: write } = await import("node:fs/promises");
+      const dir = join(process.env.DUMP_DIR, item.name);
+      await mkdir(dir, { recursive: true });
+      await write(join(dir, "workerd.json"), JSON.stringify(fromWorkerd[item.name], null, 2));
+      await write(join(dir, "cello.json"), JSON.stringify(fromCello[item.name], null, 2));
     }
     const diff = differences(fromWorkerd[item.name], fromCello[item.name]);
     if (diff.length === 0) {

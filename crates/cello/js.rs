@@ -11507,6 +11507,12 @@ fn op_fetch(
             // `validate` refuses anything past the day ceiling; the clamp keeps
             // a caller that skipped it from storing a bound that never fires.
             .min(crate::env_vars::MAX_TIMEOUT_SECONDS);
+        // The hop chain is reqwest's, so `Response::url()` is the only
+        // record of where a followed redirect landed; comparing it with the
+        // URL this op was asked for is how `Response.redirected` is derived
+        // (a chain that returns to the exact same URL is indistinguishable
+        // here, which reqwest does not expose).
+        let requested_url = reqwest::Url::parse(&url).ok();
         let mut rb = client.request(m, &url);
         // reqwest omits Content-Length for an empty Vec, which collapses the
         // wire representation of `Some([])` into the representation of
@@ -11575,8 +11581,12 @@ fn op_fetch(
         match sent {
             Ok(resp) => {
                 let status = resp.status().as_u16();
+                let final_url = resp.url().clone();
+                let redirected = requested_url
+                    .as_ref()
+                    .is_some_and(|requested| requested != &final_url);
                 let encoding = crate::http_streams::fetch_body_encoding(&resp, auto_decode);
-                let mut headers = resp
+                let headers = resp
                     .headers()
                     .iter()
                     .map(|(name, value)| {
@@ -11592,14 +11602,13 @@ fn op_fetch(
                     crate::http_streams::FetchBodyEncoding::Identity => {
                         HttpStreamSource::Stream(crate::http_streams::response_body_stream(resp))
                     }
-                    coding => {
-                        // The wire size no longer describes the body.
-                        // `content-encoding` itself stays, as in workerd.
-                        headers.retain(|(name, _)| !name.eq_ignore_ascii_case("content-length"));
-                        HttpStreamSource::Stream(crate::http_streams::idle_bounded_stream(
-                            crate::http_streams::decoded_fetch_stream(resp, coding),
-                        ))
-                    }
+                    // `content-encoding` and the original `content-length`
+                    // both stay, as in workerd: neither describes the decoded
+                    // body, and a Worker that forwards them sees the same
+                    // pair on both runtimes (#180).
+                    coding => HttpStreamSource::Stream(crate::http_streams::idle_bounded_stream(
+                        crate::http_streams::decoded_fetch_stream(resp, coding),
+                    )),
                 };
                 let Some(stream_id) = stream_service.register_source(source) else {
                     let error = format!("fetch: {HTTP_STREAM_REGISTRATION_CLOSED}");
@@ -11608,7 +11617,11 @@ fn op_fetch(
                 };
                 finish(true, Some(status), None);
                 Ok(serde_json::json!({
-                    "status": status, "streamId": stream_id, "headers": headers,
+                    "status": status,
+                    "streamId": stream_id,
+                    "headers": headers,
+                    "url": final_url.as_str(),
+                    "redirected": redirected,
                 })
                 .to_string())
             }
@@ -12952,8 +12965,12 @@ fn op_url_parse(
     };
     let u = match parsed {
         Ok(u) => u,
-        Err(e) => {
-            let msg = v8::String::new(scope, &format!("Invalid URL: {e}")).unwrap();
+        Err(_) => {
+            // Workerd reports one message for every parse failure (its
+            // `Invalid URL string.`); the underlying reason is not exposed
+            // to script, so a Worker that matches the text sees the same
+            // string on both runtimes (#184).
+            let msg = v8::String::new(scope, "Invalid URL string.").unwrap();
             let exc = v8::Exception::type_error(scope, msg);
             scope.throw_exception(exc);
             return;

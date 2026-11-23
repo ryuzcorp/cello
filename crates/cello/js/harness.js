@@ -59,7 +59,10 @@ function __bodyBytes(body) {
   // captured getters and maps a forged receiver to the bytes TypeError.
   if (typeof body === "object" && __bodyChunkKind(body) !== 0)
     return __bodyChunk(body).slice();
-  return new TextEncoder().encode(String(body));
+  // A template literal (ToString), not String(): a Symbol body is a
+  // TypeError in workerd's USVString conversion, and String() would accept
+  // it.
+  return new TextEncoder().encode(`${body}`);
 }
 // Bodies that carry their own Content-Type. A Blob's is its `type`, a
 // FormData serializes to multipart with a generated boundary, and a
@@ -412,6 +415,88 @@ const __BODY_LOCKED_REQUEST =
 const __bodyDisturbed = (message) => message.bodyUsed ||
   (message.body != null &&
     (message.body.locked || message.body._disturbed === true));
+// The Fetch standard's "parse a MIME type" plus "serialize a MIME type", which
+// `blob()` applies to a `content-type` header (workerd calls it through
+// MimeType). It is not header copying: the essence is lower-cased, parameters
+// are re-serialized, a duplicate parameter keeps its first value, and a value
+// that is not a token is quoted. workerd writes `charset` as `;charset=` and
+// `boundary` as `; boundary=` (a quirk of its serializer, pinned by
+// scripts/workerd-diff), and every other parameter as `;name=`. An unparsable
+// type is the empty string. Returning the raw header (lower-cased by Blob)
+// made `(await new Response("x", { headers: { "content-type":
+// "text/plain; charset=utf-8" } }).blob()).type` differ from workerd's
+// (issues #186, #159).
+const __MIME_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+const __MIME_TYPE =
+  /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+\/[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+const __MIME_SPACE = /[\t\n\r ]/;
+function __serializeContentType(value) {
+  if (value == null) return "";
+  const input = String(value);
+  let at = input.indexOf(";");
+  const essence = (at === -1 ? input : input.slice(0, at))
+    .replace(/^[\t\n\r ]+|[\t\n\r ]+$/g, "").toLowerCase();
+  if (!__MIME_TYPE.test(essence)) return "";
+  const names = [];
+  const values = [];
+  const seen = new Set();
+  while (at !== -1 && at < input.length) {
+    at++; // the ";"
+    while (at < input.length && __MIME_SPACE.test(input[at])) at++;
+    if (at < input.length && input[at] === ";") continue;
+    const nameStart = at;
+    while (at < input.length && input[at] !== "=" && input[at] !== ";")
+      at++;
+    // A parameter with no "=" ends the type, as in workerd: the parameters
+    // collected so far stay, everything after is dropped.
+    if (at >= input.length || input[at] === ";") break;
+    const name = input.slice(nameStart, at)
+      .replace(/[\t\n\r ]+$/, "").toLowerCase();
+    at++; // the "="
+    if (!__MIME_TOKEN.test(name)) break;
+    let parameter;
+    if (input[at] === '"') {
+      at++;
+      parameter = "";
+      while (at < input.length) {
+        const c = input[at++];
+        if (c === "\\" && at < input.length) parameter += input[at++];
+        else if (c === '"') break;
+        else parameter += c;
+      }
+      // Once the quoted string ends, everything up to the next ";" is
+      // ignored, as the spec's parameter parser does.
+      while (at < input.length && input[at] !== ";") at++;
+    } else {
+      const valueStart = at;
+      while (at < input.length && input[at] !== ";") at++;
+      parameter = input.slice(valueStart, at).replace(/[\t\n\r ]+$/, "");
+    }
+    if (!seen.has(name)) {
+      seen.add(name);
+      names.push(name);
+      values.push(parameter);
+    }
+  }
+  let out = essence;
+  for (let i = 0; i < names.length; i++) {
+    const name = names[i];
+    const parameter = values[i];
+    const quoted = __MIME_TOKEN.test(parameter) ? parameter
+      : '"' + parameter.replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
+    out += (name === "charset" ? ";charset="
+      : name === "boundary" ? "; boundary="
+      : ";" + name + "=") + quoted;
+  }
+  return out;
+}
+// A Blob's own `type` is the raw string lower-cased (no parsing), so a Blob
+// built from a serialized MIME type must skip that normalization.
+const __blobOfType = (bytes, type) => {
+  const blob = new Blob([bytes]);
+  if (type !== "") blob.type = type;
+  return blob;
+};
 globalThis.Response = class Response {
   constructor(body, init = {}) {
     // Streaming/iterable detection runs only for object bodies, so
@@ -444,13 +529,71 @@ globalThis.Response = class Response {
       : stream !== null
         ? stream
         : new CelloBodyStream(this);
-    this.status = init.status === undefined ? 200 : Number(init.status);
-    this.statusText = init.statusText === undefined ? "" : String(init.statusText);
+    // Workerd's status rules: ToNumber then truncate; 200-599, except that a
+    // 101 is reachable only alongside a WebSocket and a WebSocket only
+    // alongside a 101. A refused status used to be stored as-is (`"abc"`
+    // became null, `201.5` stayed fractional, 0 and 600 left the isolate),
+    // which reaches the host as an unrepresentable response instead of the
+    // error that names the mistake (#163).
+    const webSocket = init.webSocket ?? null;
+    if (webSocket !== null &&
+        !(globalThis.WebSocket && webSocket instanceof globalThis.WebSocket))
+      throw new TypeError(
+        "Incorrect type for the 'webSocket' field on 'InitializerDict': " +
+        "the provided value is not of type 'WebSocket'.");
+    let status = init.status === undefined ? 200 : Number(init.status);
+    // NaN and a fractional status both fail the range check / truncate, which
+    // is what workerd does: 201.5 is 201, "abc" is a RangeError.
+    status = status !== status ? 0 : Math.trunc(status);
+    const wsTarget = init.__wsTarget || init._wsTarget || null;
+    const __STATUS_RANGE =
+      "Responses may only be constructed with status codes in the " +
+      "range 200 to 599, inclusive.";
+    if (webSocket !== null && status !== 101)
+      throw new RangeError("Responses with a WebSocket must have status code 101.");
+    if (status === 101) {
+      // A 101 needs a WebSocket, or an internal cross-isolate upgrade target:
+      // the socket lives in the answering isolate and __wrapServiceResponse
+      // binds the caller end, so that response is built before its WebSocket
+      // exists.
+      if (webSocket === null && wsTarget === null)
+        throw new RangeError(__STATUS_RANGE);
+    } else if (status < 200 || status > 599) {
+      throw new RangeError(__STATUS_RANGE);
+    }
+    this.status = status;
+    // The status line is written verbatim, so a C0 control (CR and LF above
+    // all) must be refused here rather than escaped downstream (#167).
+    // Workerd's check is every C0 code point; DEL and above pass.
+    const statusText = init.statusText === undefined
+      ? "" : String(init.statusText);
+    if (/[\u0000-\u001f]/.test(statusText))
+      throw new TypeError("Invalid statusText");
+    this.statusText = statusText;
     this.headers = new Headers(init.headers);
     if (typed && typed.type && !this.headers.has("content-type"))
       this.headers.set("content-type", typed.type);
-    this.webSocket = init.webSocket ?? null;
-    this._wsTarget = init.__wsTarget || init._wsTarget || null;
+    // A USVString (or any other non-BodyInit value) body carries the
+    // Fetch-standard default type. Without it a string body reached the wire
+    // and a subrequest with no `content-type` at all (#159). Bytes and
+    // buffers must stay header-free, so they are excluded here -- by internal
+    // slot, not `instanceof` -- as is every body that became a stream or
+    // carries its own type.
+    if (body != null && stream === null && typed === null &&
+        __bodyChunkKind(body) === 0 &&
+        !this.headers.has("content-type"))
+      this.headers.set("content-type", "text/plain;charset=UTF-8");
+    // A null-body status refuses a body. Workerd allows a zero-length
+    // buffered one (byte-array, string or Blob) and refuses a stream, whose
+    // length it cannot know; the internal 101/204 constructors in this file
+    // pass either null or an empty body, so they keep working (#165).
+    if ((status === 204 || status === 205 || status === 304 || status === 101) &&
+        body != null && (stream !== null || this._bodyBytes.length !== 0))
+      throw new TypeError(
+        "Response with null body status (101, 204, 205, or 304) cannot " +
+        "have a body.");
+    this.webSocket = webSocket;
+    this._wsTarget = wsTarget;
     this.ok = this.status >= 200 && this.status <= 299;
     this.redirected = false;
     this.type = "default";
@@ -475,9 +618,14 @@ globalThis.Response = class Response {
         `${statusCode} is not a redirect status code. ` +
         "It must be one of: 301, 302, 303, 307, or 308.");
     }
+    // Workerd's wording for an unparsable target, which is all a relative
+    // URL is here (there is no base to resolve against) (#184).
+    let target;
+    try { target = new URL(input).href; }
+    catch { throw new TypeError("Unable to parse URL: " + input); }
     const response = new Response(null, {
       status: statusCode,
-      headers: { Location: new URL(input).href },
+      headers: { Location: target },
     });
     // A redirect response owns a guarded header list. Without the guard, an
     // application can rewrite Location after construction, which differs
@@ -523,8 +671,9 @@ globalThis.Response = class Response {
     return (await this._consume()).slice();
   }
   async blob() {
-    return new Blob([await this.arrayBuffer()],
-      { type: this.headers.get("content-type") || "" });
+    // The parsed-and-reserialized MIME type, not the raw header (#186).
+    return __blobOfType(await this.arrayBuffer(),
+      __serializeContentType(this.headers.get("content-type")));
   }
   clone() {
     if (__bodyDisturbed(this))
@@ -537,36 +686,83 @@ globalThis.Response = class Response {
       this.body = left;
       body = right;
     }
+    // A network-error response has status 0, which the constructor refuses;
+    // build the copy at 200 and put the error status back, preserving every
+    // other field.
+    const error = this.status === 0;
     const response = new Response(
       body,
       {
-        status: this.status, statusText: this.statusText, headers: this.headers,
+        status: error ? 200 : this.status,
+        statusText: this.statusText, headers: this.headers,
         webSocket: this.webSocket, __wsTarget: this._wsTarget, cf: this.cf,
       },
     );
+    if (error) {
+      response.status = 0;
+      response.ok = false;
+    }
     response.type = this.type;
+    response.url = this.url;
+    response.redirected = this.redirected;
     return response;
   }
 };
 // Hoisted: this would otherwise allocate an array and scan it on
-// every Request construction, which is the HTTP hot path.
+// every Request construction, which is the HTTP hot path. TRACE is here
+// because workerd normalizes `trace` into it (#190); CONNECT and TRACK are
+// not methods this runtime accepts.
 const __HTTP_METHODS = new Set(
-  ["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]);
-const __FETCH_REDIRECT_MODES = new Set(["follow", "manual", "error"]);
+  ["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "TRACE"]);
 // Server-side Requests that entered over the authenticated operator route.
 // The host marks them at dispatch; operator-only cell branches demand
 // membership. Script never observes the set itself, only the refusals.
 const __operatorIngressRequests = new WeakSet();
 globalThis.Request = class Request {
+  #cache;
   constructor(input, init = {}) {
     const prior = input instanceof Request ? input : null;
-    const suppliedSignal = init.signal !== undefined;
-    // The cache option needs the cache_option_enabled compat flag,
-    // which Cells does not implement (Workerd's cache-disabled path).
-    if (init.cache !== undefined)
-      throw new Error("The 'cache' field on 'RequestInitializerDict' " +
-        "is not implemented.");
-    this.url = prior ? prior.url : String(input);
+    // Host-built incoming requests (HTTP ingress and a service-binding
+    // target's view of a call) skip the script-facing URL and GET/HEAD body
+    // checks: the host guarantees an absolute URL, and workerd hands an
+    // incoming GET a body stream. Their headers are immutable.
+    const incoming = init.__celloIncoming === true;
+    const suppliedSignal = init.signal !== undefined && init.signal !== null;
+    if (suppliedSignal && !(init.signal instanceof globalThis.AbortSignal))
+      throw new TypeError(
+        "Incorrect type for the 'signal' field on 'RequestInitializerDict': " +
+        "the provided value is not of type 'AbortSignal'.");
+    if (init.integrity !== undefined && String(init.integrity) !== "")
+      throw new TypeError(
+        "Subrequest integrity checking is not implemented. The integrity " +
+        "option must be either undefined or an empty string.");
+    // Workerd's cache-disabled surface: `no-store` and `no-cache` are
+    // accepted, and every other mode is a TypeError rather than the blanket
+    // "not implemented" Error this used to throw for all of them -- which
+    // made the ubiquitous `fetch(url, { cache: "no-store" })` fail (#160).
+    if (init.cache !== undefined) {
+      const cache = String(init.cache);
+      if (cache !== "no-store" && cache !== "no-cache")
+        throw new TypeError("Unsupported cache mode: " + cache);
+      this.#cache = cache;
+    } else {
+      this.#cache = prior ? prior.#cache : undefined;
+    }
+    if (prior) {
+      this.url = prior.url;
+    } else if (incoming) {
+      this.url = String(input);
+    } else {
+      // A Request's url is a serialized absolute URL. A relative or
+      // unparsable input used to be stored verbatim, so `new URL(r.url)`,
+      // `fetch(r)` and `new Request(r.url)` each failed somewhere else
+      // (#175).
+      const raw = `${input}`;
+      let parsed;
+      try { parsed = new URL(raw); }
+      catch { throw new TypeError("Invalid URL: " + raw); }
+      this.url = parsed.href;
+    }
     {
       // Workers upper-cases every method (the
       // upper_case_all_http_methods flag) but rejects anything outside
@@ -574,6 +770,9 @@ globalThis.Request = class Request {
       const raw = String(init.method === undefined
         ? (prior ? prior.method : "GET") : init.method);
       const upper = raw.toUpperCase();
+      // Workerd normalizes every casing of `trace` (its known-method set
+      // includes TRACE) and reports an unknown method with the original
+      // casing (#190). CONNECT and TRACK stay outside the set.
       if (!__HTTP_METHODS.has(upper))
         throw new TypeError(`Invalid HTTP method string: ${raw}`);
       this.method = upper;
@@ -581,6 +780,10 @@ globalThis.Request = class Request {
     const hasBody =
       Object.prototype.hasOwnProperty.call(init, "body");
     let body = hasBody ? init.body : null;
+    if (hasBody && body != null && init.__celloPriorBody !== true &&
+        (this.method === "GET" || this.method === "HEAD") && !incoming)
+      throw new TypeError(
+        "Request with a GET or HEAD method cannot have a body.");
     let stream = null;
     let typed = null;
     if (hasBody && body !== null && typeof body === "object") {
@@ -613,7 +816,7 @@ globalThis.Request = class Request {
       ? null
       : hasBody
         ? (typed ? typed.bytes : __bodyBytes(body))
-        : (prior ? prior._bodyBytes.slice() : new Uint8Array());
+        : (prior ? prior._bodyBytes.slice() : new __primUint8Array());
     // Body text is decoded on the first text()/json(), not here: a request
     // whose body is never read never pays the decode.
     this._body = undefined;
@@ -638,9 +841,18 @@ globalThis.Request = class Request {
       this._headersInit = init.headers;
     }
     this._headers = null;
+    this._immutableHeaders = incoming;
     // A typed body's default content-type must land now; only user-built
-    // typed bodies reach this, never the incoming request path.
-    if (typed && typed.type && !this.headers.has("content-type")) {
+    // typed bodies reach this, never the incoming request path. A string
+    // body gets the Fetch-standard text/plain too (#159): without it a
+    // proxied string body reached the origin untyped. Bytes and buffers
+    // stay header-free; `__bodyChunkKind` classifies them by internal slot,
+    // so a forged view is not mistaken for a string body.
+    if (hasBody && body != null && stream === null && typed === null &&
+        __bodyChunkKind(body) === 0 &&
+        !this.headers.has("content-type")) {
+      this.headers.set("content-type", "text/plain;charset=UTF-8");
+    } else if (typed && typed.type && !this.headers.has("content-type")) {
       this.headers.set("content-type", typed.type);
     }
     // The explicit half of the prototype `bodyUsed` accessor below; kept an
@@ -659,13 +871,20 @@ globalThis.Request = class Request {
     // body stream (or AbortSignal) is what triggers that. Making them lazy
     // getters let `__sc_encode` clone the Request into a broken plain object
     // and skip the lift -- the serializeHttpTypes conformance failure.
+    // `body === null` is the one rule for "no body was supplied" (#142), so
+    // a bodyless POST reports null like a GET; the GET/HEAD body refusal
+    // above is about a script-supplied body, and an incoming request is
+    // exempt because the host's request can legitimately carry one.
     this.body = this._hasBody
       ? stream !== null ? stream : new CelloBodyStream(this)
       : null;
+    // Workerd compares the redirect mode case-insensitively ("FOLLOW" is
+    // "follow") and accepts only the two modes it implements; `error` is
+    // refused with the message its text describes (#184).
     this.redirect = String(init.redirect === undefined
       ? (prior ? prior.redirect : "follow")
-      : init.redirect);
-    if (!__FETCH_REDIRECT_MODES.has(this.redirect)) {
+      : init.redirect).toLowerCase();
+    if (this.redirect !== "follow" && this.redirect !== "manual") {
       // Workerd's text for an unsupported redirect value, verbatim.
       throw new TypeError(
         'Invalid redirect value, must be one of "follow" or "manual" ' +
@@ -690,22 +909,31 @@ globalThis.Request = class Request {
     // even its own local Request objects, and `new Request(prior)` never
     // inherits membership.
   }
+  // The RequestInit-derived attributes workerd reports with their spec
+  // defaults instead of `undefined` (#177): `integrity` is always the empty
+  // string (a non-empty value is refused above) and `keepalive` is always
+  // false, whatever the init asked for.
+  get integrity() { return ""; }
+  get keepalive() { return false; }
+  get cache() { return this.#cache; }
   get headers() {
     if (this._headers === null) {
       const src = this._headersJson !== undefined
         ? JSON.parse(this._headersJson)
         : this._headersInit;
       this._headers = new Headers(src);
+      // An incoming request's header list is immutable: a middleware that
+      // rewrites it must be told, not silently ignored (#169).
+      if (this._immutableHeaders)
+        Object.defineProperty(this._headers, "_immutable", { value: true });
       this._headersJson = undefined;
       this._headersInit = undefined;
     }
     return this._headers;
   }
-  set headers(value) {
-    this._headers = value instanceof Headers ? value : new Headers(value);
-    this._headersJson = undefined;
-    this._headersInit = undefined;
-  }
+  // No setter: `headers` is a readonly attribute in workerd and in the Fetch
+  // standard. A setter here was also the one way around an incoming
+  // request's immutable header list (#169).
   async _consume() {
     // One consumption, as on Response: a buffered body is served once and a
     // disturbed stream rejects, with workerd's TypeError (#127).
@@ -736,17 +964,20 @@ globalThis.Request = class Request {
     return (await this._consume()).slice();
   }
   async blob() {
-    return new Blob([await this.arrayBuffer()],
-      { type: this.headers.get("content-type") || "" });
+    // The parsed-and-reserialized MIME type, not the raw header (#186).
+    return __blobOfType(await this.arrayBuffer(),
+      __serializeContentType(this.headers.get("content-type")));
   }
   clone() {
     if (__bodyDisturbed(this))
       throw new TypeError(__BODY_LOCKED);
     if (this._bodyBytes === null) {
-      // Streaming body: tee, keep one branch, clone the other.
+      // Streaming body: tee, keep one branch, clone the other. The new
+      // branch is not a script-supplied body, so it skips the GET/HEAD
+      // body rule -- an incoming GET legitimately carries a body stream.
       const [left, right] = this.body.tee();
       this.body = left;
-      return new Request(this, { body: right });
+      return new Request(this, { body: right, __celloPriorBody: true });
     }
     return new Request(this);
   }
@@ -797,6 +1028,11 @@ const __makeRequest = __cello.__makeRequest = (
     // In particular, no client-controlled header becomes a country or a colo;
     // the forwarded-authority trust flag does not establish geolocation trust.
     method, body, __headersJson: headersJson, signal, cf: {},
+    // An incoming request's redirect mode is `manual`: a Worker that
+    // forwards it with `fetch(request)` must see the 3xx, not the target
+    // (#161). A deployment config cannot change it.
+    redirect: "manual",
+    __celloIncoming: true,
     __celloIncomingSignal: incomingSignal,
   });
   // Marked here, on the host-built server-side Request only: no
@@ -982,11 +1218,6 @@ globalThis.fetch = async (input, init) => {
     if (typeof refusal === "string" && refusal.startsWith(__EGRESS_REFUSAL_MARKER)) {
       throw new TypeError(refusal.slice(__EGRESS_REFUSAL_MARKER.length));
     }
-    // The Fetch API represents a redirect refusal as a network error, which
-    // rejects with TypeError. Keep the host message for diagnostics.
-    if (req.redirect === "error") {
-      throw new TypeError(error?.message ?? String(error));
-    }
     throw error;
   }
   const r = JSON.parse(raw);
@@ -1000,7 +1231,11 @@ globalThis.fetch = async (input, init) => {
     responseBody,
     { status: r.status, headers: r.headers },
   );
-  response.url = req.url;
+  // A followed redirect reports where it landed (#173). The host compares
+  // its final URL with the one it sent; a manual response keeps the
+  // requested URL, as workerd's does.
+  response.url = r.url !== undefined ? r.url : req.url;
+  response.redirected = r.redirected === true;
   return response;
 };
 const __fetchWebSocketUpgrade = __cello.__fetchWebSocketUpgrade =
@@ -1045,8 +1280,7 @@ const __fetchWebSocketUpgrade = __cello.__fetchWebSocketUpgrade =
     return response;
   }
   socket.protocol = raw.protocol ?? "";
-  const response = new Response(null, { status: 101 });
-  response.webSocket = socket;
+  const response = new Response(null, { status: 101, webSocket: socket });
   response.url = req.url;
   return response;
 };
@@ -4144,6 +4378,9 @@ const __makeServiceBinding = __cello.__makeServiceBinding =
         new Request(req, {
           signal: requestController.signal,
           __celloIncomingSignal: true,
+          // The target's view of a service-binding call is an incoming
+          // request: its headers are immutable, as on HTTP ingress (#169).
+          __celloIncoming: true,
         }));
       const response = signal
         ? await __raceCallerAbort(dispatch, signal, () =>
@@ -5743,11 +5980,14 @@ const __adoptBody = (target, bytes) => {
   }
 };
 // A non-bytes `b` is a live-stream body marker: revive it and
-// let the constructor adopt it as a streaming body.
+// let the constructor adopt it as a streaming body. The body arrives from
+// the wire, not from script, so it is exempt from the GET/HEAD body rule an
+// incoming GET's body stream would otherwise trip.
 const __reviveRequest = (marker, url, revive) => {
   if (!(marker.b instanceof __primUint8Array))
     return new Request(url, { method: marker.m,
       headers: marker.h, redirect: marker.r, cf: marker.c,
+      __celloPriorBody: true,
       body: revive(marker.b) });
   const req = new Request(url, { method: marker.m,
     headers: marker.h, redirect: marker.r, cf: marker.c });
@@ -5761,12 +6001,19 @@ const __reviveRequest = (marker, url, revive) => {
 };
 const __reviveResponse = (marker, revive) => {
   const bytes = marker.b instanceof __primUint8Array;
+  // A network-error response carries status 0, which the constructor
+  // refuses; revive it at 200 and put the error status back.
+  const error = marker.e === true;
   const res = new Response(
     marker.b === null ? null : bytes ? "" : revive(marker.b), {
-      status: marker["__cello$res"], statusText: marker.t,
+      status: error ? 200 : marker["__cello$res"], statusText: marker.t,
       headers: marker.h, cf: marker.c });
+  if (error) {
+    res.status = 0;
+    res.ok = false;
+    res.type = "error";
+  }
   if (bytes) __adoptBody(res, marker.b);
-  if (marker.e) res.type = "error";
   return res;
 };
 // Wire a received stream handle to a local endpoint built with
@@ -12479,7 +12726,7 @@ if (!globalThis.AbortSignal) {
       this.__celloHost = __rpcNoClone;
     }
     throwIfAborted() { if (this.aborted) throw this.reason; }
-    static abort(reason = new DOMException("This operation was aborted", "AbortError")) {
+    static abort(reason = new DOMException("The operation was aborted", "AbortError")) {
       const c = new AbortController(); c.abort(reason); return c.signal;
     }
     static timeout(ms) {
@@ -12498,6 +12745,19 @@ if (!globalThis.AbortSignal) {
       return c.signal;
     }
     static any(signals) {
+      // Workerd validates the parameter and every element before it uses
+      // one, so a non-signal names the element instead of failing later with
+      // "signal.addEventListener is not a function" (#184).
+      if (!Array.isArray(signals))
+        throw new TypeError(
+          "Failed to execute 'any' on 'AbortSignal': parameter 1 is not of " +
+          "type 'Array'.");
+      for (let i = 0; i < signals.length; i++) {
+        if (!(signals[i] instanceof globalThis.AbortSignal))
+          throw new TypeError(
+            `Incorrect type for array element ${i}: the provided value is ` +
+            "not of type 'AbortSignal'.");
+      }
       const c = new AbortController();
       for (const signal of signals) {
         if (signal.aborted) { c.abort(signal.reason); break; }
@@ -12522,7 +12782,7 @@ if (!globalThis.AbortSignal) {
   });
   globalThis.AbortController = class AbortController {
     constructor() { this.signal = new AbortSignal(__abortBrand); }
-    abort(reason = new DOMException("This operation was aborted", "AbortError")) {
+    abort(reason = new DOMException("The operation was aborted", "AbortError")) {
       __abortSignal(this.signal, reason);
     }
   };
@@ -12642,7 +12902,9 @@ if (!globalThis.File) {
       if (lm === undefined) this.#lastModified = Date.now();
       else {
         const n = +lm; // ToNumber: throws for BigInt, like WebIDL
-        this.#lastModified = Number.isFinite(n) ? Math.trunc(n) : 0;
+        // Workerd stores ToNumber's value, including a fraction and
+        // +/-Infinity; only NaN becomes 0 (#179).
+        this.#lastModified = Number.isNaN(n) ? 0 : n;
       }
     }
     get name() { return this.#name; }
@@ -12839,15 +13101,16 @@ __cello.__parseFormData = (bytes, contentType) => {
   }
   return form;
 };
-  // Spec entry conversion: strings stay strings; a Blob becomes a
-  // File named "blob" (or `filename`); a File is renamed only when a
-  // filename is supplied.
-  const __formDataValue = (value, filename) => {
+  // Spec entry conversion: strings stay strings; a Blob becomes a File (a
+  // File is renamed only when a filename is supplied).
+  // A Blob appended without a filename is stored as a File named after the
+  // entry key. That is workerd's choice; the WHATWG spec says "blob" (#188).
+  const __formDataValue = (value, filename, name) => {
     if (!(value instanceof Blob)) return String(value);
     if (value instanceof File && filename === undefined) return value;
     return new File(
       [value],
-      filename === undefined ? "blob" : String(filename),
+      filename === undefined ? String(name) : String(filename),
       {
         type: value.type,
         lastModified:
@@ -12858,12 +13121,13 @@ __cello.__parseFormData = (bytes, contentType) => {
   globalThis.FormData = class FormData {
     constructor() { this._entries = []; }
     append(name, value, filename) {
+      const key = String(name);
       this._entries.push(
-        [String(name), __formDataValue(value, filename)]);
+        [key, __formDataValue(value, filename, key)]);
     }
     set(name, value, filename) {
-      value = __formDataValue(value, filename);
       const key = String(name);
+      value = __formDataValue(value, filename, key);
       // Spec: replace the first match in place, keeping its position,
       // and drop any later matches.
       const first = this._entries.findIndex(([k]) => k === key);

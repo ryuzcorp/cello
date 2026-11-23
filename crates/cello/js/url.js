@@ -83,9 +83,12 @@
         }
 
         constructor(input, base) {
+            // Template literals, not String(): a Symbol argument is a
+            // TypeError in workerd (WebIDL's USVString conversion), while
+            // String() would accept it and fail as an unparsable URL.
             const p = _urlParse(
-                String(input),
-                base !== undefined ? String(base)
+                `${input}`,
+                base !== undefined ? `${base}`
                     : undefined,
             );
             this._apply(p);
@@ -268,6 +271,13 @@
                 this.#searchParams._url = this;
             }
             return this.#searchParams;
+        }
+        // Read-only in workerd, which reports V8's message for a read-only
+        // data property rather than the getter-only accessor text (#184).
+        set searchParams(_value) {
+            throw new TypeError(
+                "Cannot assign to read only property 'searchParams' of " +
+                "object '[object URL]'");
         }
 
         toString() { return this.#href; }
