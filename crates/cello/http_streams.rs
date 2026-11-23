@@ -43,6 +43,10 @@ static STREAM_IDLE_TIMEOUT_MS: std::sync::LazyLock<u64> = std::sync::LazyLock::n
         HTTP_STREAM_IDLE_TIMEOUT_MS / 1_000,
     )
     .expect("validated CELLO_HTTP_STREAM_IDLE_S")
+    // `validate` refuses anything past the day ceiling; the clamp keeps a
+    // caller that skipped it (a test harness) from storing a value that
+    // disables the bound.
+    .min(crate::env_vars::MAX_TIMEOUT_SECONDS)
     .saturating_mul(1_000)
 });
 
