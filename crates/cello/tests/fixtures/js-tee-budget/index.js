@@ -522,8 +522,14 @@ const checkEnqueueThrow = async (check) => {
   const reader1 = first.getReader();
   const reader2 = second.getReader();
   // Close branch 2's controller underneath the tee: its next enqueue
-  // throws, after branch 1 already got the chunk.
-  second._controller.close();
+  // throws, after branch 1 already got the chunk. The controller is private
+  // state (#170), so the test-only hook exposes it; the node boots with
+  // CELLO_TEST_WAIT=1 for exactly this.
+  const branchState = globalThis.__celloStreamStateForTestOnly?.(second);
+  if (branchState === undefined)
+    throw new Error(
+      "test-only stream state hook missing (boot with CELLO_TEST_WAIT=1)");
+  branchState.controller.close();
   const left = await settle(reader1.read());
   const right = await settle(reader2.read());
   check(

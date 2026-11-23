@@ -127,6 +127,204 @@ function _teeChunkBytes(chunk) {
   return bytes < _TEE_OBJECT_BYTES ? _TEE_OBJECT_BYTES : bytes;
 }
 
+// ---- private stream state -------------------------------------------------
+// Every field of a ReadableStream lives in a per-instance state object held
+// only by this module's WeakMap: the stream's own properties and every
+// internal operation stay out of reach of tenant code (#170, #206). The
+// other stream preludes (byte_streams.js, identity_transform_stream.js) and
+// the harness read the same state through `__cello.$$readableState`, which
+// no Worker can reach.
+class ReadableStreamState {
+  constructor() {
+    this.queue = [];
+    // Parallel array of chunk sizes (always 1 when no
+    // strategy.size is set) and the running total, for
+    // desiredSize accounting per spec.
+    this.queueSizes = [];
+    this.queueTotalSize = 0;
+    this.closed = false;
+    this.closeRequested = false;
+    this.errored = false;
+    this.error = null;
+    this.locked = false;
+    this.source = null;
+    this.controller = null;
+    this.reader = null;
+    this.readRequests = [];
+    this.hwm = 1;
+    this.pulling = false;
+    this.pullAgain = false;
+    this.started = false;
+    // Optional observer run after a read dequeues a queued chunk (a layer
+    // such as TransformStream releases its writable-side backpressure).
+    this.onDequeue = null;
+    // Closed promise + resolver.
+    this.closedPromise = undefined;
+    this.closedResolve = undefined;
+    this.closedReject = undefined;
+    this.sizeFn = undefined;
+    this.pullFn = undefined;
+    this.startFn = undefined;
+    this.cancelFn = undefined;
+    // Workerd extension: a source may declare its total byte length;
+    // fetch-style consumers read it for Content-Length.
+    this.expectedLength = undefined;
+    this.disturbed = false;
+    // Workerd's internal (native) streams reject a pending read() when the
+    // stream is cancelled instead of resolving {done: true} (compression
+    // streams opt in).
+    this.cancelRejectsReads = false;
+    // The byte-stream controller (byte_streams.js) or internal-transform
+    // controller (identity_transform_stream.js) layered on this stream, and
+    // the materialized-body cursor the BYOB reader turns into a controller.
+    this.byteCtl = undefined;
+    this.ictl = undefined;
+    this.buffered = undefined;
+    // Per-kind overrides for getReader/cancel, installed by the module that
+    // owns the controller so the shared prototype path stays unbranched.
+    this.readerHook = null;
+    this.cancelHook = null;
+  }
+}
+
+const _readableStates = new WeakMap();
+const __rsState = (stream) => {
+  const state = _readableStates.get(stream);
+  // A forged receiver (a plain object, or a Proxy of a stream) has no state
+  // and must fail like the private slot it stands in for.
+  if (state === undefined)
+    throw new TypeError("Illegal invocation");
+  return state;
+};
+const __rsIs = (value) =>
+  (typeof value === 'object' && value !== null) ||
+  typeof value === 'function'
+    ? _readableStates.has(value) : false;
+
+// Resolve one pending read request from queue.
+function __resolveRead(st) {
+  while (st.readRequests.length > 0 &&
+         st.queue.length > 0) {
+    const r = st.readRequests.shift();
+    const chunk = st.queue.shift();
+    const sz = st.queueSizes.shift() ?? 0;
+    st.queueTotalSize -= sz;
+    if (st.queueTotalSize < 0) st.queueTotalSize = 0;
+    r.resolve(_readResult(chunk, false));
+  }
+  if (st.queue.length === 0 &&
+      st.closeRequested)
+    __finishClose(st);
+}
+
+function __finishClose(st) {
+  if (st.closed) return;
+  st.closed = true;
+  // Resolve pending reads with done.
+  for (const r of st.readRequests)
+    r.resolve(_readResult(undefined, true));
+  st.readRequests = [];
+  if (st.closedResolve) {
+    st.closedResolve();
+    st.closedResolve = null;
+  }
+}
+
+function __rejectClosed(st, e) {
+  if (st.closedReject) {
+    st.closedReject(e);
+    st.closedReject = null;
+    st.closedResolve = null;
+  }
+}
+
+function __maybePull(st) {
+  if (!st.started || st.closed ||
+      st.errored || st.closeRequested)
+    return;
+  if (!st.pullFn) return;
+  // Spec ShouldCallPull: a registered read request pulls regardless of
+  // backpressure, then a positive desiredSize does. Workerd checks the
+  // same two signals. desiredSize is the strategy highWaterMark minus
+  // the queued *bytes*, not the queued chunk count: a strategy.size
+  // (tee branches charge real chunk bytes) must hold back a pull that
+  // still leaves the queue over its mark.
+  if (st.readRequests.length === 0 &&
+      st.hwm - st.queueTotalSize <= 0)
+    return;
+  if (st.pulling) {
+    st.pullAgain = true;
+    return;
+  }
+  st.pulling = true;
+  let result;
+  try {
+    result = st.pullFn.call(
+      st.source, st.controller);
+  } catch (e) {
+    st.pulling = false;
+    st.controller.error(e);
+    return;
+  }
+  Promise.resolve(result).then(
+    () => {
+      st.pulling = false;
+      if (st.pullAgain) {
+        st.pullAgain = false;
+        __maybePull(st);
+      }
+    },
+    (e) => {
+      st.pulling = false;
+      st.controller.error(e);
+    }
+  );
+}
+
+// Discard queued chunks and transition to closed. The shared tail of
+// cancel() and the internal-stream/byte-stream cancel paths.
+function __cancelStream(stream, st, reason) {
+  // Spec section 4.2.6: cancel discards queued chunks and
+  // transitions to closed. Without this, read() hits
+  // the `queue.length > 0` branch before the `closed`
+  // check and keeps yielding stale values.
+  st.queue = [];
+  st.queueSizes = [];
+  st.queueTotalSize = 0;
+  st.disturbed = true;
+  // Workerd's internal (native) streams reject a pending
+  // read() when the stream is cancelled; spec JS streams
+  // resolve it {done: true}. Compression streams opt in
+  // to the internal behavior (compression_streams.js).
+  if (st.cancelRejectsReads) {
+    for (const r of st.readRequests)
+      r.reject(reason);
+    st.readRequests = [];
+  }
+  __finishClose(st);
+  if (st.cancelFn) {
+    let result;
+    try {
+      result = st.cancelFn.call(
+        st.source, reason);
+    } catch (e) {
+      return Promise.reject(e);
+    }
+    return Promise.resolve(result)
+      .then(() => undefined);
+  }
+  return Promise.resolve(undefined);
+}
+
+// The internal cancel path shared by the reader and the stream: the byte and
+// internal-stream modules own their own queue and install a hook.
+function __cancelReadable(stream, reason) {
+  const st = __rsState(stream);
+  return st.cancelHook !== null
+    ? st.cancelHook(stream, reason)
+    : __cancelStream(stream, st, reason);
+}
+
 class ReadableStreamDefaultController {
   #stream;
   #closeRequested = false;
@@ -139,8 +337,9 @@ class ReadableStreamDefaultController {
     this.#stream = stream;
   }
   enqueue(chunk) {
+    const st = __rsState(this.#stream);
     if (this.#closeRequested || this.#errored ||
-        this.#stream._closed)
+        st.closed)
       throw new TypeError(
         "Cannot enqueue a closed/errored stream");
     // Run size() if the strategy provides one. A throw
@@ -148,8 +347,8 @@ class ReadableStreamDefaultController {
     // the stream and rethrows from enqueue. Size's own
     // controller.error(...) wins if it was called first.
     let size = 1;
-    if (this.#stream._sizeFn) {
-      try { size = this.#stream._sizeFn(chunk); }
+    if (st.sizeFn) {
+      try { size = st.sizeFn(chunk); }
       catch (e) { this.error(e); throw e; }
       // Workerd's message for a non-number size --
       // e.g. an async size() returning a promise.
@@ -167,43 +366,46 @@ class ReadableStreamDefaultController {
         throw err;
       }
     }
-    this.#stream._queue.push(chunk);
-    this.#stream._queueSizes.push(size);
-    this.#stream._queueTotalSize += size;
-    this.#stream._resolveRead();
-    this.#stream._maybePull();
+    st.queue.push(chunk);
+    st.queueSizes.push(size);
+    st.queueTotalSize += size;
+    __resolveRead(st);
+    __maybePull(st);
   }
   close() {
+    const st = __rsState(this.#stream);
     if (this.#closeRequested || this.#errored ||
-        this.#stream._closed)
+        st.closed)
       throw new TypeError("Already closed");
     this.#closeRequested = true;
-    this.#stream._closeRequested = true;
-    if (this.#stream._queue.length === 0)
-      this.#stream._finishClose();
+    st.closeRequested = true;
+    if (st.queue.length === 0)
+      __finishClose(st);
     else
-      this.#stream._resolveRead();
+      __resolveRead(st);
   }
   error(e) {
     if (this.#errored) return;
     this.#errored = true;
-    this.#stream._error = e;
-    this.#stream._errored = true;
-    this.#stream._queue = [];
-    this.#stream._queueSizes = [];
-    this.#stream._queueTotalSize = 0;
+    const st = __rsState(this.#stream);
+    st.error = e;
+    st.errored = true;
+    st.queue = [];
+    st.queueSizes = [];
+    st.queueTotalSize = 0;
     // Reject closed first (spec order).
-    this.#stream._rejectClosed(e);
+    __rejectClosed(st, e);
     // Then reject pending reads.
-    for (const r of this.#stream._readRequests)
+    for (const r of st.readRequests)
       r.reject(e);
-    this.#stream._readRequests = [];
+    st.readRequests = [];
   }
   get desiredSize() {
     if (this.#errored) return null;
     if (this.#closeRequested) return 0;
-    return this.#stream._hwm -
-           this.#stream._queueTotalSize;
+    const st = __rsState(this.#stream);
+    return st.hwm -
+           st.queueTotalSize;
   }
 }
 
@@ -212,47 +414,48 @@ class ReadableStreamDefaultReader {
   #released = false;
 
   constructor(stream) {
-    if (!(stream instanceof ReadableStream))
+    if (!__rsIs(stream))
       throw new TypeError(
         "ReadableStreamDefaultReader requires a " +
         "ReadableStream argument");
-    if (stream._locked)
+    const st = __rsState(stream);
+    if (st.locked)
       throw new TypeError("ReadableStream is locked");
     this.#stream = stream;
-    stream._locked = true;
-    stream._reader = this;
+    st.locked = true;
+    st.reader = this;
   }
 
   read() {
     if (this.#released)
       return _readSettled(Promise.reject(
         new TypeError(RELEASED)));
-    const s = this.#stream;
-    s._disturbed = true;
-    if (s._errored)
-      return _readSettled(Promise.reject(s._error));
-    // Check _closed first: a stream that was closed
+    const s = __rsState(this.#stream);
+    s.disturbed = true;
+    if (s.errored)
+      return _readSettled(Promise.reject(s.error));
+    // Check closed first: a stream that was closed
     // re-entrantly (e.g. close() called from sizeFn) may
     // still have a stuck chunk in its queue which must
     // never be emitted. Only drain the queue while the
     // stream is still readable.
-    if (s._closed)
+    if (s.closed)
       return _readSettled(Promise.resolve(
         _readResult(undefined, true)));
-    if (s._queue.length > 0) {
-      const chunk = s._queue.shift();
-      const sz = s._queueSizes.shift() ?? 0;
-      s._queueTotalSize -= sz;
-      if (s._queueTotalSize < 0) s._queueTotalSize = 0;
-      if (s._queue.length === 0 && s._closeRequested)
-        s._finishClose();
+    if (s.queue.length > 0) {
+      const chunk = s.queue.shift();
+      const sz = s.queueSizes.shift() ?? 0;
+      s.queueTotalSize -= sz;
+      if (s.queueTotalSize < 0) s.queueTotalSize = 0;
+      if (s.queue.length === 0 && s.closeRequested)
+        __finishClose(s);
       // A stream layered on this one can need the desired-size change a
       // dequeue causes even though no pull runs. TransformStream's readable
       // side is such a layer: workerd's transform controller updates its
       // writable-side backpressure from the queue itself (a native
       // backpressure listener), so a read that frees a queue slot must
       // release a parked write here too (see writable_stream.js).
-      if (s._onDequeue) s._onDequeue();
+      if (s.onDequeue) s.onDequeue();
       // Workerd does not refill after dequeuing a buffered chunk: a pull
       // runs only for a registered read request (below) or from an
       // enqueue. The spec's [[PullSteps]] calls CallPullIfNeeded here,
@@ -264,20 +467,20 @@ class ReadableStreamDefaultReader {
     }
     // Queue a read request.
     return _readSettled(new Promise((resolve, reject) => {
-      s._readRequests.push({ resolve, reject });
-      s._maybePull();
+      s.readRequests.push({ resolve, reject });
+      __maybePull(s);
     }));
   }
 
   releaseLock() {
     if (!this.#released) {
-      const s = this.#stream;
+      const s = __rsState(this.#stream);
       // Reject pending read requests per spec.
-      for (const r of s._readRequests)
+      for (const r of s.readRequests)
         r.reject(new TypeError(RELEASED));
-      s._readRequests = [];
-      s._locked = false;
-      s._reader = null;
+      s.readRequests = [];
+      s.locked = false;
+      s.reader = null;
       this.#released = true;
     }
   }
@@ -286,61 +489,37 @@ class ReadableStreamDefaultReader {
     if (this.#released)
       return Promise.reject(
         new TypeError(RELEASED));
-    return this.#stream._closedPromise;
+    return __rsState(this.#stream).closedPromise;
   }
 
   cancel(reason) {
     if (this.#released)
       return Promise.reject(
         new TypeError(RELEASED));
-    return this.#stream._cancel(reason);
+    return __cancelReadable(this.#stream, reason);
   }
 }
 
 class ReadableStream {
-  _queue = [];
-  // Parallel array of chunk sizes (always 1 when no
-  // strategy.size is set) and the running total, for
-  // desiredSize accounting per spec.
-  _queueSizes = [];
-  _queueTotalSize = 0;
-  _closed = false;
-  _closeRequested = false;
-  _errored = false;
-  _error = null;
-  _locked = false;
-  _source = null;
-  _controller = null;
-  _reader = null;
-  _readRequests = [];
-  _hwm = 1;
-  _pulling = false;
-  _pullAgain = false;
-  _started = false;
-  // Optional observer run after a read dequeues a queued chunk (a layer
-  // such as TransformStream releases its writable-side backpressure).
-  _onDequeue = null;
-
-  // Closed promise + resolver.
-  _closedPromise;
-  _closedResolve;
-  _closedReject;
+  #s;
 
   constructor(underlyingSource, queuingStrategy) {
-    this._closedPromise = new Promise((res, rej) => {
-      this._closedResolve = res;
-      this._closedReject = rej;
+    const st = this.#s = new ReadableStreamState();
+    _readableStates.set(this, st);
+    st.closedPromise = new Promise((res, rej) => {
+      st.closedResolve = res;
+      st.closedReject = rej;
     });
     // WHATWG Streams treats [[closedPromise]] as internal
     // state that only surfaces when the user queries
-    // reader.closed / stream's _closedPromise. Our
+    // reader.closed / stream's closedPromise. Our
     // Promise is a real JS Promise, so rejecting it when
     // no one has attached a .catch fires V8's unhandled-
     // rejection signal. Attach a no-op sink to mark it
     // handled at the engine level; user `await` on
     // reader.closed still sees the rejection because the
     // promise is shared.
-    this._closedPromise.catch(() => {});
+    st.closedPromise.catch(() => {});
     // Spec: extract strategy fields first. Size is read
     // and validated before highWaterMark; an invalid size
     // must beat an invalid highWaterMark. hwm stays
@@ -365,8 +544,8 @@ class ReadableStream {
         hwm = n;
       }
     }
-    this._hwm = hwm === undefined ? 1 : hwm;
-    this._sizeFn = sizeFn;
+    st.hwm = hwm === undefined ? 1 : hwm;
+    st.sizeFn = sizeFn;
     if (underlyingSource === null ||
         (underlyingSource !== undefined &&
          typeof underlyingSource !== 'object'))
@@ -376,7 +555,7 @@ class ReadableStream {
     // byte length; fetch-style consumers read it for
     // Content-Length (see also FixedLengthStream).
     if (src.expectedLength !== undefined)
-      this._expectedLength = Number(src.expectedLength);
+      st.expectedLength = Number(src.expectedLength);
     if (src.type !== undefined) {
       const t = String(src.type);
       if (t !== 'bytes')
@@ -384,11 +563,11 @@ class ReadableStream {
           `Invalid type '${t}'`);
       // Byte-stream machinery lives in a lazy prelude;
       // naming the global compiles it on first use. It
-      // installs the byte controller plus instance
-      // overrides for getReader/_cancel, so nothing
-      // below (default controller, pull wiring) runs.
-      ReadableByteStreamController
-        ._setup(this, src, hwm);
+      // installs the byte controller on this stream, so
+      // nothing below (default controller, pull wiring)
+      // runs.
+      ReadableByteStreamController;
+      __cello.$$setupByteStream(this, src, hwm);
       return;
     }
     // Read each getter once per spec -- extracting
@@ -409,20 +588,20 @@ class ReadableStream {
         typeof startFn !== 'function')
       throw new TypeError(
         "start must be a function");
-    this._source = src;
-    this._startFn = startFn;
-    this._pullFn = pullFn;
-    this._cancelFn = cancelFn;
-    this._controller =
+    st.source = src;
+    st.startFn = startFn;
+    st.pullFn = pullFn;
+    st.cancelFn = cancelFn;
+    st.controller =
       new ReadableStreamDefaultController(
         _rsc_brand, this);
-    if (!this._startFn) {
+    if (!st.startFn) {
       // Workerd starts a source with no start()
       // synchronously (mirrors the byte controller and
       // the writable's sink), so a strategy size() runs
       // before the constructor returns.
-      this._started = true;
-      this._maybePull();
+      st.started = true;
+      __maybePull(st);
       return;
     }
     // A sync start() throw must error the stream, not
@@ -430,102 +609,24 @@ class ReadableStream {
     let startResult;
     try {
       startResult =
-        this._startFn.call(this._source, this._controller);
+        st.startFn.call(st.source, st.controller);
     } catch (e) {
       startResult = Promise.reject(e);
     }
     Promise.resolve(startResult).then(
       () => {
-        this._started = true;
-        this._maybePull();
+        st.started = true;
+        __maybePull(st);
       },
       (e) => {
-        this._controller.error(e);
-      }
-    );
-  }
-
-  // Resolve one pending read request from queue.
-  _resolveRead() {
-    while (this._readRequests.length > 0 &&
-           this._queue.length > 0) {
-      const r = this._readRequests.shift();
-      const chunk = this._queue.shift();
-      const sz = this._queueSizes.shift() ?? 0;
-      this._queueTotalSize -= sz;
-      if (this._queueTotalSize < 0) this._queueTotalSize = 0;
-      r.resolve(_readResult(chunk, false));
-    }
-    if (this._queue.length === 0 &&
-        this._closeRequested)
-      this._finishClose();
-  }
-
-  _finishClose() {
-    if (this._closed) return;
-    this._closed = true;
-    // Resolve pending reads with done.
-    for (const r of this._readRequests)
-      r.resolve(_readResult(undefined, true));
-    this._readRequests = [];
-    if (this._closedResolve) {
-      this._closedResolve();
-      this._closedResolve = null;
-    }
-  }
-
-  _rejectClosed(e) {
-    if (this._closedReject) {
-      this._closedReject(e);
-      this._closedReject = null;
-      this._closedResolve = null;
-    }
-  }
-
-  _maybePull() {
-    if (!this._started || this._closed ||
-        this._errored || this._closeRequested)
-      return;
-    if (!this._pullFn) return;
-    // Spec ShouldCallPull: a registered read request pulls regardless of
-    // backpressure, then a positive desiredSize does. Workerd checks the
-    // same two signals. desiredSize is the strategy highWaterMark minus
-    // the queued *bytes*, not the queued chunk count: a strategy.size
-    // (tee branches charge real chunk bytes) must hold back a pull that
-    // still leaves the queue over its mark.
-    if (this._readRequests.length === 0 &&
-        this._hwm - this._queueTotalSize <= 0)
-      return;
-    if (this._pulling) {
-      this._pullAgain = true;
-      return;
-    }
-    this._pulling = true;
-    let result;
-    try {
-      result = this._pullFn.call(
-        this._source, this._controller);
-    } catch (e) {
-      this._pulling = false;
-      this._controller.error(e);
-      return;
-    }
-    Promise.resolve(result).then(
-      () => {
-        this._pulling = false;
-        if (this._pullAgain) {
-          this._pullAgain = false;
-          this._maybePull();
-        }
-      },
-      (e) => {
-        this._pulling = false;
-        this._controller.error(e);
+        st.controller.error(e);
       }
     );
   }
 
   getReader(options) {
+    const st = this.#s;
+    if (st.readerHook !== null) return st.readerHook(this, options);
     if (options !== undefined && options !== null) {
       if (options.mode !== undefined)
         throw new TypeError(
@@ -534,53 +635,29 @@ class ReadableStream {
     return new ReadableStreamDefaultReader(this);
   }
 
-  get locked() { return this._locked; }
+  get locked() { return this.#s.locked; }
 
-  _cancel(reason) {
-    // Spec section 4.2.6: cancel discards queued chunks and
-    // transitions to closed. Without this, read() hits
-    // the `_queue.length > 0` branch before the `_closed`
-    // check and keeps yielding stale values.
-    this._queue = [];
-    this._queueSizes = [];
-    this._queueTotalSize = 0;
-    this._disturbed = true;
-    // Workerd's internal (native) streams reject a pending
-    // read() when the stream is cancelled; spec JS streams
-    // resolve it {done: true}. Compression streams opt in
-    // to the internal behavior (compression_streams.js).
-    if (this._cancelRejectsReads) {
-      for (const r of this._readRequests)
-        r.reject(reason);
-      this._readRequests = [];
-    }
-    this._finishClose();
-    if (this._cancelFn) {
-      let result;
-      try {
-        result = this._cancelFn.call(
-          this._source, reason);
-      } catch (e) {
-        return Promise.reject(e);
-      }
-      return Promise.resolve(result)
-        .then(() => undefined);
-    }
-    return Promise.resolve(undefined);
+  // The internal cancel path: the byte and internal-stream modules install
+  // their own implementation because they own the queue that has to be
+  // discarded.
+  #cancel(reason) {
+    const st = this.#s;
+    if (st.cancelHook !== null) return st.cancelHook(this, reason);
+    return __cancelStream(this, st, reason);
   }
 
   cancel(reason) {
-    if (this._locked)
+    if (this.#s.locked)
       return Promise.reject(new TypeError(
         "Cannot cancel a locked ReadableStream"));
-    return this._cancel(reason);
+    return this.#cancel(reason);
   }
 
   tee() {
     // Branches of a byte stream are byte streams, so
     // they support BYOB reads; the source is still read
     // through a default reader (coalesced chunks).
-    const isBytes = this._byteCtl !== undefined;
+    const isBytes = this.#s.byteCtl !== undefined;
     const reader = this.getReader();
     let closed = false;
     let canceled1 = false, canceled2 = false;
@@ -593,7 +670,7 @@ class ReadableStream {
     // The charge of the chunk the in-flight pull is enqueuing, computed
     // once per chunk before either enqueue (which may transfer a buffer).
     // A default branch's size strategy reads it back, so the budget and
-    // the branch's `_queueTotalSize` agree and a chunk is never measured
+    // the branch's `queueTotalSize` agree and a chunk is never measured
     // twice.
     let chunkCharge = _TEE_OBJECT_BYTES;
     const live1 = () => !canceled1 && !failed1;
@@ -628,7 +705,7 @@ class ReadableStream {
         return new ReadableStream(src);
       }
       // Size a default branch's chunks in the budget's own bytes, so its
-      // `_queueTotalSize` -- which the reader maintains on every dequeue
+      // `queueTotalSize` -- which the reader maintains on every dequeue
       // -- is exactly what the branch holds unconsumed. A bytes strategy
       // may not carry size(), and a byte branch already counts bytes.
       return new ReadableStream(src, { size: () => chunkCharge });
@@ -636,14 +713,17 @@ class ReadableStream {
     const branch1 = makeBranch(true);
     const branch2 = makeBranch(false);
     const controllers = [
-      branch1._controller,
-      branch2._controller,
+      branch1.#s.controller,
+      branch2.#s.controller,
     ];
     // Bytes a branch holds queued and unconsumed: a byte branch keeps the
     // total on its controller, a default branch on the stream.
-    const held = (branch) => branch._byteCtl !== undefined
-      ? branch._byteCtl._queueTotalSize
-      : branch._queueTotalSize;
+    const held = (branch) => {
+      const st = branch.#s;
+      return st.byteCtl !== undefined
+        ? __cello.$$byteControllerState(st.byteCtl).queueTotalSize
+        : st.queueTotalSize;
+    };
 
     function failBranch(first) {
       if (first) { failed1 = true; reason1 = _TEE_SKEW_MESSAGE; }
@@ -772,13 +852,11 @@ class ReadableStream {
   }
 
   pipeTo(destination, options) {
-    if (!('_queue' in this) ||
-        !(this instanceof ReadableStream))
+    if (!__rsIs(this))
       return Promise.reject(new TypeError(
         "pipeTo called on non-ReadableStream"));
     if (destination === null ||
         typeof destination !== 'object' ||
-        !('_sink' in destination) ||
         !(destination instanceof WritableStream))
       return Promise.reject(new TypeError(
         "pipeTo destination must be WritableStream"));
@@ -794,23 +872,24 @@ class ReadableStream {
       preventCancel = !!options.preventCancel;
       signal = options.signal;
     }
-    if (this._locked)
+    const st = this.#s;
+    if (st.locked)
       return Promise.reject(new TypeError(
         "ReadableStream is locked"));
-    if (destination._locked)
+    if (__cello.$$writableStreamState(destination).locked)
       return Promise.reject(new TypeError(
         "WritableStream is locked"));
     if (signal && signal.aborted) {
       const err = signal.reason || new DOMException(
         "The operation was aborted", "AbortError");
-      if (!preventCancel) this._cancel(err);
+      if (!preventCancel) this.#cancel(err);
       if (!preventAbort) destination.abort(err);
       return Promise.reject(err);
     }
     // Per spec, pipeTo immediately marks the source as
     // disturbed so bodyUsed / similar observers flip
     // synchronously even before the first read fires.
-    this._disturbed = true;
+    st.disturbed = true;
     const reader = this.getReader();
     const writer = destination.getWriter();
     let shuttingDown = false;
@@ -898,7 +977,7 @@ class ReadableStream {
   }
 
   pipeThrough(transform, options) {
-    if (!(this instanceof ReadableStream))
+    if (!__rsIs(this))
       throw new TypeError(
         "pipeThrough called on non-ReadableStream");
     if (typeof transform !== 'object' ||
@@ -913,10 +992,10 @@ class ReadableStream {
           WritableStream))
       throw new TypeError(
         "transform.writable must be WritableStream");
-    if (this._locked)
+    if (this.#s.locked)
       throw new TypeError(
         "ReadableStream is locked");
-    if (transform.writable._locked)
+    if (__cello.$$writableStreamState(transform.writable).locked)
       throw new TypeError(
         "WritableStream is locked");
     // Spec: mark the pipeTo promise as handled --
@@ -1044,20 +1123,30 @@ ReadableStream.from = function(asyncIterable) {
   }, { highWaterMark: 0 });
 };
 
+// Workerd reflects both strategies with an enumerable `highWaterMark`
+// accessor and an enumerable `size` accessor that returns the algorithm
+// (a prototype `size()` method would report the wrong descriptor kind).
+const _countSize = function() { return 1; };
+// Optional chain: size(undefined) returns undefined
+// rather than throwing (Workerd behavior).
+const _byteLengthSize = function(chunk) { return chunk?.byteLength; };
+
 class CountQueuingStrategy {
+  #hwm;
   constructor({ highWaterMark }) {
-    this.highWaterMark = highWaterMark;
+    this.#hwm = highWaterMark;
   }
-  size() { return 1; }
+  get highWaterMark() { return this.#hwm; }
+  get size() { return _countSize; }
 }
 
 class ByteLengthQueuingStrategy {
+  #hwm;
   constructor({ highWaterMark }) {
-    this.highWaterMark = highWaterMark;
+    this.#hwm = highWaterMark;
   }
-  // Optional chain: size(undefined) returns undefined
-  // rather than throwing (Workerd behavior).
-  size(chunk) { return chunk?.byteLength; }
+  get highWaterMark() { return this.#hwm; }
+  get size() { return _byteLengthSize; }
 }
 
 globalThis.ReadableStream = ReadableStream;
@@ -1068,9 +1157,20 @@ globalThis.ReadableStreamDefaultController =
 globalThis.CountQueuingStrategy = CountQueuingStrategy;
 globalThis.ByteLengthQueuingStrategy =
   ByteLengthQueuingStrategy;
-// Web IDL toStringTag -- `Object.prototype.toString
-// .call(rs)` returns "[object ReadableStream]"
-// instead of "[object Object]".
+
+// The runtime's own modules read a stream's private state and close it out
+// through these hooks; tenant code cannot reach `__cello`.
+__cello.$$readableState = __rsState;
+__cello.$$isReadableStream = __rsIs;
+__cello.$$finishCloseStream = (stream) =>
+  __finishClose(__rsState(stream));
+__cello.$$rejectClosedStream = (stream, e) =>
+  __rejectClosed(__rsState(stream), e);
+__cello.$$cancelReadableStream = (stream, reason) =>
+  __cancelReadable(stream, reason);
+
+// WebIDL reflection (enumerable members, data tag, hidden constructor) for
+// every interface this file defines (#171, #206).
 for (const [cls, name] of [
   [ReadableStream, 'ReadableStream'],
   [ReadableStreamDefaultReader,
@@ -1081,8 +1181,6 @@ for (const [cls, name] of [
   [ByteLengthQueuingStrategy,
     'ByteLengthQueuingStrategy'],
 ]) {
-  Object.defineProperty(cls.prototype,
-    Symbol.toStringTag,
-    { value: name, configurable: true });
+  __cello.$$webidl(cls, name);
 }
 })();

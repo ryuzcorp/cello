@@ -31,6 +31,7 @@
 (function () {
     const _urlParse = $$urlParse;
 
+
     // WHATWG special schemes and their default ports. A port equal to its
     // scheme's default is not serialized, so both the `protocol` and `port`
     // setters clear it.
@@ -80,6 +81,11 @@
             __cello.__isUrlInstance = (value) => {
                 try { return #protocol in value; } catch { return false; }
             };
+            // URLSearchParams drives the paired URL through these: the
+            // methods themselves are private, so neither the prototype nor a
+            // guest can name them (#206).
+            __cello.$$urlUpdateSearch = (url, params) =>
+                url.#updateSearch(params);
         }
 
         constructor(input, base) {
@@ -91,10 +97,10 @@
                 base !== undefined ? `${base}`
                     : undefined,
             );
-            this._apply(p);
+            this.#apply(p);
         }
 
-        _apply(p) {
+        #apply(p) {
             this.#protocol = p.protocol + ':';
             this.#username = p.username || '';
             this.#password = p.password || '';
@@ -105,8 +111,8 @@
             this.#hash = p.hash ? '#' + p.hash : '';
             this.#href = p.href;
             if (this.#searchParams) {
-                this.#searchParams._initFromSearch(
-                    this.#search);
+                __cello.$$urlSearchParamsInit(
+                    this.#searchParams, this.#search);
             }
         }
 
@@ -119,19 +125,19 @@
             // A port that is the new scheme's default is dropped.
             if (this.#port && _DEFAULT_PORTS[v] === this.#port)
                 this.#port = '';
-            this._rebuildHref();
+            this.#rebuildHref();
         }
 
         get username() { return this.#username; }
         set username(v) {
             this.#username = String(v);
-            this._rebuildHref();
+            this.#rebuildHref();
         }
 
         get password() { return this.#password; }
         set password(v) {
             this.#password = String(v);
-            this._rebuildHref();
+            this.#rebuildHref();
         }
 
         get host() {
@@ -152,13 +158,13 @@
                 this.#port =
                     _DEFAULT_PORTS[this.#protocol] === port ? '' : port;
             }
-            this._rebuildHref();
+            this.#rebuildHref();
         }
 
         get hostname() { return this.#hostname; }
         set hostname(v) {
             this.#hostname = String(v);
-            this._rebuildHref();
+            this.#rebuildHref();
         }
 
         get port() { return this.#port; }
@@ -171,7 +177,7 @@
             else if (/^\d+$/.test(v))
                 this.#port =
                     _DEFAULT_PORTS[this.#protocol] === v ? '' : v;
-            this._rebuildHref();
+            this.#rebuildHref();
         }
 
         get pathname() { return this.#pathname; }
@@ -181,7 +187,7 @@
             // absolute path -- prepend '/' if missing.
             if (v && !v.startsWith('/')) v = '/' + v;
             this.#pathname = v;
-            this._rebuildHref();
+            this.#rebuildHref();
         }
 
         get search() { return this.#search; }
@@ -190,10 +196,10 @@
             if (v.startsWith('?')) v = v.slice(1);
             this.#search = v === '' ? '' : '?' + _encodeQuery(v);
             if (this.#searchParams) {
-                this.#searchParams._initFromSearch(
-                    this.#search);
+                __cello.$$urlSearchParamsInit(
+                    this.#searchParams, this.#search);
             }
-            this._rebuildHref();
+            this.#rebuildHref();
         }
 
         get hash() { return this.#hash; }
@@ -202,7 +208,7 @@
             if (v === '') this.#hash = '';
             else if (!v.startsWith('#')) this.#hash = '#' + v;
             else this.#hash = v;
-            this._rebuildHref();
+            this.#rebuildHref();
         }
 
         // Origin is a derived value (protocol + host) and
@@ -240,10 +246,10 @@
 
         get href() { return this.#href; }
         set href(v) {
-            this._apply(_urlParse(String(v)));
+            this.#apply(_urlParse(String(v)));
         }
 
-        _rebuildHref() {
+        #rebuildHref() {
             let h = this.#protocol + '//';
             if (this.#username) {
                 h += this.#username;
@@ -258,17 +264,17 @@
             this.#href = h;
         }
 
-        _updateSearch(sp) {
+        #updateSearch(sp) {
             const s = sp.toString();
             this.#search = s ? '?' + s : '';
-            this._rebuildHref();
+            this.#rebuildHref();
         }
 
         get searchParams() {
             if (!this.#searchParams) {
                 this.#searchParams =
                     new URLSearchParams(this.#search);
-                this.#searchParams._url = this;
+                __cello.$$bindUrlSearchParams(this.#searchParams, this);
             }
             return this.#searchParams;
         }
@@ -293,6 +299,15 @@
                 return true;
             } catch { return false; }
         }
+        // Workerd defines both members but does not implement them; the
+        // message is workerd's verbatim, so a bundle that probes one gets the
+        // same answer on either runtime.
+        static createObjectURL(_blob) {
+            throw new Error("URL.createObjectURL() is not implemented");
+        }
+        static revokeObjectURL(_url) {
+            throw new Error("URL.revokeObjectURL() is not implemented");
+        }
         static parse(url, base) {
             try {
                 return new URL(
@@ -303,12 +318,16 @@
             } catch { return null; }
         }
     };
-    // Per WHATWG / Web IDL, every interface gets a
-    // Symbol.toStringTag matching its class name so
-    // `Object.prototype.toString.call(url)` returns
-    // "[object URL]" instead of "[object Object]".
-    Object.defineProperty(globalThis.URL.prototype,
-        Symbol.toStringTag, {
-            value: 'URL', configurable: true,
-        });
+    // Per WHATWG / Web IDL, every interface reflects the same shape workerd
+    // has: enumerable prototype members and a data-property tag.
+    __cello.$$webidl(globalThis.URL, 'URL');
+    for (const key of Object.getOwnPropertyNames(globalThis.URL)) {
+        if (key === 'length' || key === 'name' || key === 'prototype') continue;
+        const descriptor =
+            Object.getOwnPropertyDescriptor(globalThis.URL, key);
+        if (descriptor === undefined || descriptor.enumerable ||
+            !descriptor.configurable) continue;
+        descriptor.enumerable = true;
+        Object.defineProperty(globalThis.URL, key, descriptor);
+    }
 })();

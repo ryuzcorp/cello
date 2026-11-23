@@ -87,6 +87,49 @@ removals are listed again in the breaking-changes section below.
 - **`structuredClone` refuses a compiled wasm module** (#220). It throws
   `Error: Unable to deserialize cloned data.` as workerd does, instead of
   transferring the module.
+- **Web API objects no longer expose host internals, and they report
+  workerd's interface shape** (#170, #171, #206, #207). Every reflected
+  object -- `Request`, `Response`, `Headers`, `FormData`,
+  `AbortController`/`AbortSignal`, `Blob`/`File`, `URL`/`URLSearchParams`,
+  `TextEncoder`/`TextDecoder`, every stream and its reader, writer and
+  controller, `TransformStream` subclasses, the events, `DOMException`,
+  `MessagePort`/`MessageChannel`, `WebSocket`, `CryptoKey`/`SubtleCrypto`,
+  the KV/R2/D1 bindings and `Cache` -- keeps its state in a private slot.
+  `Object.keys(obj)` is empty, `JSON.stringify(new Response("x"))` is `{}`,
+  `JSON.stringify(new FixedLengthStream(3))` is `"{}"`, and spread copies
+  nothing; `Object.getOwnPropertyNames()` lists no `_bodyBytes`,
+  `__celloHost`, `_entries`, `_expectedLength` or similar field, and no
+  `_cancel`, `_finishClose`, `_pump`, `__celloHeaderList` or other host
+  helper is on a prototype. Attributes are enumerable prototype accessors as
+  workerd's reflection has them, so assigning to a read-only attribute no
+  longer changes what the object reports; each interface carries its
+  `Symbol.toStringTag` (so `Object.prototype.toString.call(response)` is
+  `"[object Response]"`), and `Request`/`Response` share workerd's global
+  `Body` prototype level. `DOMException` is now shaped like workerd's: own
+  enumerable `code`/`name`/`message`/`stack`, no `Error` statics, tag
+  `DOMException`. `Headers.getAll()`, `Request.cf`/`integrity`/`keepalive`/
+  `cache`/`fetcher`, `Response.cf`, `WebSocket.readyState`/
+  `bufferedAmount`/`url`/`protocol`/`extensions`, and
+  `ReadableStreamBYOBRequest.atLeast` now exist as workerd defines them.
+  `R2Bucket` is a real interface whose construction is token-gated, so a
+  forged `new R2Bucket(...)` throws instead of minting an object the host
+  paths would accept, and `D1Database.query()` refuses with workerd's
+  `d1_binding_jsrpc` message. **Breaking:** KV's Cello-only `deleteBulk()` is
+  gone (workerd has no such method) and `DOMException.captureStackTrace`, and
+  the other `Error` statics, are no longer reachable. The `shape-*` gate
+  cases pin the reflected shape of every class above against workerd
+  1.20261121.1; the remaining, reflection-only differences (interface
+  `prototype` writability, V8's method `length`s, D1 sessions, the
+  not-implemented cache methods, and the two object-URL stubs) are listed in
+  the compatibility page.
+- **A host value can no longer cross RPC or storage as inert data** (#170).
+  The RPC projection marks a private-state host -- a signal, `Request`,
+  `Response`, `Headers`, `Blob`, `CryptoKey` or a stream -- as a host value,
+  so it takes the lift path instead of a structured clone that would have
+  flattened it to `{}`. The persisted codec refuses those values outright
+  with workerd's `DataCloneError` text, where a private slot used to store
+  `{}`. A stream still crosses a caller boundary as a
+  `DataCloneError`, exactly as before.
 
 Two more `WritableStream` divergences from workerd are fixed, and the
 tee-skew conformance test no longer assumes which of a tee's copies the skew

@@ -10,6 +10,7 @@
 // legitimate stub transfers (availability) -- and forgery is closed
 // host-side regardless (the brand check, table, and tag live in Rust).
 const __primReflectApply = Reflect.apply;
+const __primConstruct = Reflect.construct;
 const __primArrayIsArray = Array.isArray;
 const __primObjectKeys = Object.keys;
 const __primGetProto = Object.getPrototypeOf;
@@ -51,8 +52,13 @@ const __startsWith = (s, prefix) =>
   __primReflectApply(__primStartsWith, s, [prefix]);
 function __bodyBytes(body) {
   if (body == null) return new __primUint8Array();
-  if (body && body.__celloBodyBytes instanceof __primUint8Array)
-    return body.__celloBodyBytes.slice();
+  // A materialized body stream carries its bytes in a private slot. The
+  // accessor is installed with CelloBodyStream below, so it is looked up when
+  // this runs, never captured: the bytes are not an own property (#170).
+  const streamBytes = typeof __cello.$$bodyStreamBytes === "function"
+    ? __cello.$$bodyStreamBytes(body) : undefined;
+  if (streamBytes instanceof __primUint8Array)
+    return streamBytes.slice();
   // A view or buffer takes its window from internal slots only (#130): its
   // own `buffer`/`byteOffset`/`byteLength` are guest-writable, and a forged
   // prototype passes an `instanceof` check. `__bodyChunk` reads through the
@@ -73,7 +79,7 @@ function __bodyBytes(body) {
 function __typedBody(body) {
   if (body == null || typeof body !== "object") return null;
   if (globalThis.Blob && body instanceof Blob)
-    return { bytes: body._bytes.slice(), type: body.type };
+    return { bytes: __cello.$$blobBytes(body).slice(), type: body.type };
   if (globalThis.FormData && body instanceof FormData)
     return __multipartBody(body);
   if (globalThis.URLSearchParams && body instanceof URLSearchParams)
@@ -118,7 +124,8 @@ function __multipartBody(form) {
       header += `\r\nContent-Type: ${value.type || "application/octet-stream"}`;
     }
     chunks.push(encoder.encode(`${header}\r\n\r\n`));
-    chunks.push(value instanceof Blob ? value._bytes : encoder.encode(value));
+    chunks.push(value instanceof Blob
+      ? __cello.$$blobBytes(value) : encoder.encode(value));
     chunks.push(encoder.encode("\r\n"));
   }
   chunks.push(encoder.encode(`--${boundary}--\r\n`));
@@ -276,6 +283,9 @@ const __bodyChunk = (chunk) => {
   if (bytes === null) throw new TypeError(__BODY_NOT_BYTES);
   return bytes;
 };
+// The Cache API's own body drain reads guest chunks through the same slot
+// rules; the export is internal (`__cello`), never a guest member.
+__cello.$$bodyChunk = __bodyChunk;
 // The host response pump's chunk reader. A string chunk is UTF-8, as workerd
 // writes it; every other chunk must be bytes, read through the internal slots.
 // `__bodyBytes` is not used here: its String() fallback would turn a number or
@@ -303,21 +313,37 @@ async function __drainBody(target) {
     bytes.set(chunk, offset);
     offset += chunk.byteLength;
   }
-  target._bodyBytes = bytes;
-  // text() memoizes into _body on demand. Decoding here charges every
+  const state = __bodyOwnerState(target);
+  state.bytes = bytes;
+  // text() memoizes into the slot on demand. Decoding here charges every
   // binary passthrough the cost of a string it never reads.
-  target._body = undefined;
+  state.text = undefined;
   return bytes;
 }
 class CelloBodyStream extends ReadableStream {
+  // The coupled bytes, read offset, BYOB buffer and expected length live in
+  // a private slot: a body stream is a Web API object, so a worker holding
+  // `response.body` must see the ReadableStream surface only (#170, #206).
+  #s;
+  // Runs at class definition: an arrow body would never execute.
+  static #expose = (() => {
+    __cello.$$bodyStream = (stream) => stream.#s;
+    __cello.$$bodyStreamBytes = (value) => {
+      if (value === null || value === undefined) return undefined;
+      return __primGetProto(value) === CelloBodyStream.prototype
+        ? value.#s.bytes : undefined;
+    };
+    __cello.$$bodyStreamText = (stream) =>
+      new TextDecoder().decode(stream.#s.bytes);
+  })();
   constructor(owner) {
-    // Couple the stream to its buffered owner, so _bodyBytes and the stream
+    // Couple the stream to its buffered owner, so the bytes and the stream
     // cannot be installed from different arrays. Copying the owner's bytes
     // again here doubles the external memory held for every constructed body.
-    if (!(owner instanceof globalThis.Request) &&
-        !(owner instanceof globalThis.Response))
+    const ownerState = __bodyOwnerState(owner);
+    if (ownerState === null)
       throw new TypeError("CelloBodyStream requires a buffered body owner");
-    const bytes = owner._bodyBytes;
+    const bytes = ownerState.bytes;
     if (!(bytes instanceof Uint8Array))
       throw new TypeError("CelloBodyStream owner requires buffered body bytes");
     const st = { bytes, off: 0 };
@@ -332,13 +358,14 @@ class CelloBodyStream extends ReadableStream {
         st.off = end;
       },
     }, { highWaterMark: 0 });
-    this._st = st;
-    this.__celloBodyBytes = bytes;
-    // Known length, so re-using this stream as a subrequest body
-    // still advertises Content-Length.
-    this._expectedLength = bytes.byteLength;
+    // `expectedLength` lets a re-used stream advertise Content-Length; both
+    // it and the BYOB cursor live in the stream's private state (#170), so a
+    // body stream carries no own fields.
+    this.#s = { bytes, st };
+    const streamState = __cello.$$readableState(this);
+    streamState.expectedLength = bytes.byteLength;
+    streamState.buffered = st;
   }
-  get __celloBodyText() { return new TextDecoder().decode(this.__celloBodyBytes); }
   // Workerd body streams are internal streams, so BYOB readers
   // work on them. Naming ReadableStreamBYOBReader compiles the
   // lazy byte-stream prelude; a worker that never asks for byob
@@ -348,20 +375,27 @@ class CelloBodyStream extends ReadableStream {
         options.mode !== undefined) {
       if (String(options.mode) !== "byob")
         throw new TypeError(`Invalid reader mode '${options.mode}'`);
-      if (this._ictl === undefined)
-        this._ictl = ReadableStreamBYOBReader._buffered(this._st);
+      const state = __cello.$$readableState(this);
+      if (state.ictl === undefined) {
+        // Reading the global materializes the lazy prelude, which installs
+        // the controller factory the next line calls.
+        void ReadableStreamBYOBReader;
+        state.ictl = __cello.$$bufferedByobController(state.buffered);
+      }
       return new ReadableStreamBYOBReader(this);
     }
     return super.getReader(options);
   }
-  // Cancelling a body stream poisons later consumption: text()
-  // and friends reject, as they would over a real socket.
-  _cancel(reason) {
-    this._cancelled = true;
-    return super._cancel(reason);
-  }
 }
 class CelloHttpBodyStream extends ReadableStream {
+  #s;
+  static #expose = (() => {
+    __cello.$$httpStreamId = (stream) => {
+      if (stream === null || stream === undefined) return undefined;
+      return __primGetProto(stream) === CelloHttpBodyStream.prototype
+        ? stream.#s.id : undefined;
+    };
+  })();
   constructor(streamId) {
     const id = Number(streamId);
     super({
@@ -374,14 +408,15 @@ class CelloHttpBodyStream extends ReadableStream {
       },
       cancel() { __http_stream_cancel(id); },
     }, { highWaterMark: 0 });
-    this.__celloStreamId = id;
+    this.#s = { id };
   }
   tee() {
     if (this.locked) throw new TypeError("ReadableStream is locked");
-    this._locked = true;
-    this._disturbed = true;
+    const state = __cello.$$readableState(this);
+    state.locked = true;
+    state.disturbed = true;
     const [left, right] = JSON.parse(
-      __http_stream_tee(this.__celloStreamId),
+      __http_stream_tee(this.#s.id),
     );
     return [
       new CelloHttpBodyStream(left),
@@ -414,7 +449,8 @@ const __BODY_LOCKED_REQUEST =
   "The ReadableStream has been locked to a reader.";
 const __bodyDisturbed = (message) => message.bodyUsed ||
   (message.body != null &&
-    (message.body.locked || message.body._disturbed === true));
+    (message.body.locked ||
+      __cello.$$readableState(message.body).disturbed));
 // The Fetch standard's "parse a MIME type" plus "serialize a MIME type", which
 // `blob()` applies to a `content-type` header (workerd calls it through
 // MimeType). It is not header copying: the essence is lower-cased, parameters
@@ -494,7 +530,7 @@ function __serializeContentType(value) {
 // built from a serialized MIME type must skip that normalization.
 const __blobOfType = (bytes, type) => {
   const blob = new Blob([bytes]);
-  if (type !== "") blob.type = type;
+  if (type !== "") __cello.$$setBlobType(blob, type);
   return blob;
 };
 // A response status that carries no body at all. Workerd's Response reports
@@ -516,7 +552,160 @@ const __hostReplyBody = (status, reply) => {
     : reply.body !== undefined ? reply.body
       : Uint8Array.from(reply.bodyBytes || []);
 };
+
+// ---- WebIDL reflection helpers ---------------------------------------------
+// WebIDL makes every interface prototype member enumerable, which class syntax
+// does not; workerd follows the IDL and so must the shape a Worker reflects
+// (#206). The constructor stays hidden, and the tag stays non-enumerable.
+const __webidlPrototype = (ctor) => {
+  for (const key of Object.getOwnPropertyNames(ctor.prototype)) {
+    if (key === "constructor") continue;
+    const descriptor = Object.getOwnPropertyDescriptor(ctor.prototype, key);
+    if (descriptor === undefined || descriptor.enumerable ||
+        !descriptor.configurable) continue;
+    descriptor.enumerable = true;
+    Object.defineProperty(ctor.prototype, key, descriptor);
+  }
+};
+const __webidlStatics = (ctor) => {
+  for (const key of Object.getOwnPropertyNames(ctor)) {
+    if (key === "length" || key === "name" || key === "prototype") continue;
+    const descriptor = Object.getOwnPropertyDescriptor(ctor, key);
+    if (descriptor === undefined || descriptor.enumerable ||
+        !descriptor.configurable) continue;
+    descriptor.enumerable = true;
+    Object.defineProperty(ctor, key, descriptor);
+  }
+};
+const __webidlTag = (ctor, name) =>
+  Object.defineProperty(ctor.prototype, Symbol.toStringTag, {
+    value: name, configurable: true, writable: true, enumerable: false,
+  });
+// WebIDL reports an interface's `length` as its number of required arguments;
+// every Fetch interface in workerd defines none. (A class's `prototype` stays
+// non-writable; V8 refuses to redefine it, and no Worker branch depends on it.)
+const __webidlLength = (ctor) =>
+  Object.defineProperty(ctor, "length", {
+    value: 0, configurable: true, writable: false,
+  });
+
+// ---- request/response state ------------------------------------------------
+// Every field of a Request or Response lives in a private slot; the runtime's
+// own modules read it through `__cello.$$...`, which a Worker cannot reach.
+// `_bodyUsed` used to be an own field for hidden-class stability; the WeakMap
+// alone is the flag now, so a guest cannot un-use a body by assignment (#130).
+const __bodyUsedTargets = new __primWeakMap();
+const __bodyUsedFlag = (target) => __weakGet(__bodyUsedTargets, target) === true;
+const __markBodyUsed = (target) => {
+  __weakSet(__bodyUsedTargets, target, true);
+};
+// The Cache API marks a body it drains host-side; internal only.
+__cello.$$markBodyUsed = __markBodyUsed;
+let __requestState;
+let __responseState;
+const __bodyOwnerState = (owner) =>
+  owner instanceof globalThis.Request ? __requestState(owner)
+    : owner instanceof globalThis.Response ? __responseState(owner)
+      : null;
+const __bodyProtocol = (receiver) => {
+  const state = __bodyOwnerState(receiver);
+  if (state === null) throw new TypeError("Illegal invocation");
+  return state;
+};
+// A body can be taken once. `bodyUsed` covers both halves: a buffered body a
+// consumer already took and a stream a reader disturbed, including one
+// cancelled. A null body has nothing to consume and stays unused, as workerd's
+// does.
+const __bodyConsume = async (receiver) => {
+  const state = __bodyProtocol(receiver);
+  if (state.body !== null) {
+    if (__bodyUsedFlag(receiver) || __bodyDisturbed(receiver))
+      throw new TypeError(__BODY_USED);
+    __markBodyUsed(receiver);
+  }
+  if (state.bytes !== null) return state.bytes;
+  return __drainBody(receiver);
+};
+const __bodyText = async (receiver) => {
+  const state = __bodyProtocol(receiver);
+  const bytes = await __bodyConsume(receiver);
+  // Only Request memoizes: a Response decodes fresh, so a large binary body
+  // never keeps a second, string-shaped copy alive. Both classes keep the
+  // slot so their hidden class stays stable.
+  if (state.memoText) return state.text ??= new TextDecoder().decode(bytes);
+  return new TextDecoder().decode(bytes);
+};
+const __bodyFormData = async (receiver) => {
+  // The undecoded bytes, not `text()`: a UTF-8 decode replaces each invalid
+  // sequence in a binary file part with one U+FFFD, so both the bytes and
+  // the length change.
+  const bytes = await __bodyConsume(receiver);
+  return __cello.__parseFormData(bytes, receiver.headers.get("content-type"));
+};
+const __bodyArrayBuffer = async (receiver) =>
+  (await __bodyConsume(receiver)).slice().buffer;
+// The parsed-and-reserialized MIME type, not the raw header (#186). The
+// serializer is workerd's own: lower-cased essence, re-serialized parameters.
+const __bodyBlob = async (receiver) =>
+  __blobOfType((await __bodyConsume(receiver)).slice().buffer,
+    __serializeContentType(receiver.headers.get("content-type")));
+// Workerd's Body interface is a global and the shared prototype level under
+// Request and Response; its members are the Body mixin's.
+globalThis.Body = function Body() {
+  throw new TypeError("Illegal constructor");
+};
+{
+  const proto = globalThis.Body.prototype;
+  __webidlTag(globalThis.Body, "Body");
+  // Method shorthand, not the arrow helpers by reference: a method receives
+  // its receiver as `this`, while an arrow closes over the module's (here
+  // undefined) `this`.
+  const methods = {
+    // Each helper takes the owner explicitly; a method must hand it its
+    // receiver, which the helper-style arrow definitions above cannot see.
+    arrayBuffer: function () { return __bodyArrayBuffer(this); },
+    bytes: function () {
+      return __bodyConsume(this).then((bytes) => bytes.slice());
+    },
+    text: function () { return __bodyText(this); },
+    json: async function () {
+      return JSON.parse(await __bodyText(this));
+    },
+    formData: function () { return __bodyFormData(this); },
+    blob: function () { return __bodyBlob(this); },
+  };
+  for (const [name, value] of Object.entries(methods))
+    __primDefineProp(proto, name, {
+      value, writable: true, enumerable: true, configurable: true,
+    });
+  __primDefineProp(proto, "body", {
+    get() { return __bodyProtocol(this).body; },
+    enumerable: true, configurable: true,
+  });
+  // Fetch's `bodyUsed` observes the body stream; it is not stored state. The
+  // getter turns true as soon as the stream is disturbed -- a read or a
+  // cancel through any reader, including a Worker's own half-read of a live
+  // request body -- which is what workerd reports. The explicit half -- a
+  // buffered body or a host-stream transfer -- is the WeakMap flag.
+  __primDefineProp(proto, "bodyUsed", {
+    get() {
+      const state = __bodyProtocol(this);
+      return __bodyUsedFlag(this) ||
+        (state.body != null &&
+          __cello.$$readableState(state.body).disturbed);
+    },
+    enumerable: true, configurable: true,
+  });
+}
+__cello.$$consumeBody = __bodyConsume;
+__cello.$$setResponseType = (response, type) => {
+  __responseState(response).type = type;
+};
+__cello.$$responseState = (response) => __responseState(response);
+__cello.$$requestState = (request) => __requestState(request);
 globalThis.Response = class Response {
+  #s;
+  static #expose = (__responseState = (response) => response.#s);
   constructor(body, init = {}) {
     // Streaming/iterable detection runs only for object bodies, so
     // the common string path skips every instanceof below.
@@ -527,27 +716,6 @@ globalThis.Response = class Response {
       else if ((typed = __typedBody(body)) !== null) { /* bytes and type */ }
       else stream = __iterableBody(body);
     }
-    this._bodyBytes = stream !== null
-      ? null
-      : typed ? typed.bytes : __bodyBytes(body);
-    // Never decoded eagerly: a whole-body UTF-8 decode costs seconds for a
-    // large binary body (an archive, a git pack) and can exceed V8's string
-    // length. On Response the field is deliberately write-only -- text()
-    // decodes fresh from _bodyBytes and only Request.text() memoizes into
-    // _body -- but the assignment stays: __drainBody and __adoptBody assign
-    // _body on both classes, so defining it here keeps the hidden-class
-    // shape stable. Do not add a Response reader; do not "simplify" this
-    // away.
-    this._body = undefined;
-    // Hono rebuilds a response after middleware with
-    // `new Response(response.body, response)`; the held stream (or a
-    // fresh CelloBodyStream) preserves the payload across that
-    // standard clone shape.
-    this.body = body == null
-      ? null
-      : stream !== null
-        ? stream
-        : new CelloBodyStream(this);
     // Workerd's status rules: ToNumber then truncate; 200-599, except that a
     // 101 is reachable only alongside a WebSocket and a WebSocket only
     // alongside a 101. A refused status used to be stored as-is (`"abc"`
@@ -580,7 +748,6 @@ globalThis.Response = class Response {
     } else if (status < 200 || status > 599) {
       throw new RangeError(__STATUS_RANGE);
     }
-    this.status = status;
     // The status line is written verbatim, so a C0 control (CR and LF above
     // all) must be refused here rather than escaped downstream (#167).
     // Workerd's check is every C0 code point; DEL and above pass.
@@ -588,54 +755,77 @@ globalThis.Response = class Response {
       ? "" : String(init.statusText);
     if (/[\u0000-\u001f]/.test(statusText))
       throw new TypeError("Invalid statusText");
-    this.statusText = statusText;
-    this.headers = new Headers(init.headers);
+    const nullBody = __nullBodyStatus(status);
+    const headers = new Headers(init.headers);
     // A null-body status infers nothing from the body: workerd reports no body
     // at all, so an empty typed Blob or URLSearchParams carries no
     // `content-type` either. An explicit header is still kept.
-    if (typed && typed.type && !__nullBodyStatus(status) &&
-        !this.headers.has("content-type"))
-      this.headers.set("content-type", typed.type);
+    if (typed && typed.type && !nullBody && !headers.has("content-type"))
+      headers.set("content-type", typed.type);
     // A USVString (or any other non-BodyInit value) body carries the
     // Fetch-standard default type. Without it a string body reached the wire
     // and a subrequest with no `content-type` at all (#159). Bytes and
     // buffers must stay header-free, so they are excluded here -- by internal
     // slot, not `instanceof` -- as is every body that became a stream or
-    // carries its own type.
-    // A null-body status never infers a type: workerd reports no body at all
-    // for one, so `new Response("", {status: 204})` carries no `content-type`.
+    // carries its own type, and a null-body status, which reports no body at
+    // all.
     if (body != null && stream === null && typed === null &&
-        __bodyChunkKind(body) === 0 && !__nullBodyStatus(status) &&
-        !this.headers.has("content-type"))
-      this.headers.set("content-type", "text/plain;charset=UTF-8");
+        __bodyChunkKind(body) === 0 && !nullBody &&
+        !headers.has("content-type"))
+      headers.set("content-type", "text/plain;charset=UTF-8");
+    const bytes = stream !== null
+      ? null
+      : typed ? typed.bytes : __bodyBytes(body);
     // A null-body status refuses a body. Workerd allows a zero-length
     // buffered one (byte-array, string or Blob) and refuses a stream, whose
     // length it cannot know; the internal 101/204 constructors in this file
     // pass either null or an empty body, so they keep working (#165).
-    if (__nullBodyStatus(status) &&
-        body != null && (stream !== null || this._bodyBytes.length !== 0))
+    if (nullBody && body != null && (stream !== null || bytes.length !== 0))
       throw new TypeError(
         "Response with null body status (101, 204, 205, or 304) cannot " +
         "have a body.");
-    // Workerd accepts such a body and then reports none: `body === null` and
-    // an empty read. Keep that shape so a zero-length body is
-    // indistinguishable from an absent one, as on Cloudflare.
-    if (__nullBodyStatus(status) && body != null) {
-      this._bodyBytes = new Uint8Array(0);
-      this.body = null;
-    }
-    this.webSocket = webSocket;
-    this._wsTarget = wsTarget;
-    this.ok = this.status >= 200 && this.status <= 299;
-    this.redirected = false;
-    this.type = "default";
-    this.url = "";
-    // `bodyUsed` is the prototype accessor below: this owns the explicit
-    // half, the getter adds the disturbed-stream half. Declared here so
-    // every Response keeps one hidden class.
-    this._bodyUsed = false;
-    if (init.cf !== undefined) this.cf = init.cf;
+    this.#s = {
+      // Never decoded eagerly: a whole-body UTF-8 decode costs seconds for a
+      // large binary body (an archive, a git pack) and can exceed V8's string
+      // length. Workerd accepts a zero-length body on a null-body status and
+      // then reports none: an empty read and `body === null`, so a zero-length
+      // body is indistinguishable from an absent one, as on Cloudflare.
+      bytes: nullBody && body != null ? new Uint8Array(0) : bytes,
+      text: undefined,
+      // A Response decodes fresh; only a Request memoizes the string.
+      memoText: false,
+      body: null,
+      status,
+      statusText,
+      headers,
+      webSocket,
+      wsTarget,
+      ok: status >= 200 && status <= 299,
+      redirected: false,
+      type: "default",
+      url: "",
+      cf: init.cf,
+    };
+    __weakSetAdd(__responseInstances, this);
+    // Hono rebuilds a response after middleware with
+    // `new Response(response.body, response)`; the held stream (or a
+    // fresh CelloBodyStream) preserves the payload across that
+    // standard clone shape. A null-body status owns no stream at all.
+    this.#s.body = nullBody || body == null
+      ? null
+      : stream !== null
+        ? stream
+        : new CelloBodyStream(this);
   }
+  get status() { return this.#s.status; }
+  get statusText() { return this.#s.statusText; }
+  get headers() { return this.#s.headers; }
+  get ok() { return this.#s.ok; }
+  get redirected() { return this.#s.redirected; }
+  get url() { return this.#s.url; }
+  get webSocket() { return this.#s.webSocket; }
+  get cf() { return this.#s.cf; }
+  get type() { return this.#s.type; }
   static json(data, init = {}) {
     const headers = new Headers(init.headers || {});
     if (!headers.has("content-type"))
@@ -662,60 +852,27 @@ globalThis.Response = class Response {
     // A redirect response owns a guarded header list. Without the guard, an
     // application can rewrite Location after construction, which differs
     // from both Fetch and Workerd even though the initial response is valid.
-    Object.defineProperty(response.headers, "_immutable", { value: true });
+    __cello.$$sealHeaders(response.headers);
     return response;
   }
   static error() {
     const response = new Response(null);
-    response.status = 0;
-    response.ok = false;
-    response.type = "error";
+    response.#s.status = 0;
+    response.#s.ok = false;
+    response.#s.type = "error";
     return response;
   }
-  async _consume() {
-    // A body can be taken once. `bodyUsed` covers both halves: a buffered
-    // body a consumer already took (`_bodyUsed`) and a stream a reader
-    // disturbed, including one cancelled. A null body has nothing to consume
-    // and stays unused, as workerd's does.
-    if (this.body !== null) {
-      if (this.bodyUsed) throw new TypeError(__BODY_USED);
-      __markBodyUsed(this);
-    }
-    if (this._bodyBytes !== null) return this._bodyBytes;
-    return __drainBody(this);
-  }
-  async text() {
-    return new TextDecoder().decode(await this._consume());
-  }
-  async json() { return JSON.parse(await this.text()); }
-  async formData() {
-    // The undecoded bytes, not `text()`: a UTF-8 decode replaces each invalid
-    // sequence in a binary file part with one U+FFFD, so both the bytes and
-    // the length change.
-    return __cello.__parseFormData(
-      await this._consume(), this.headers.get('content-type'));
-  }
-  async arrayBuffer() {
-    return (await this._consume()).slice().buffer;
-  }
-  // Fetch's bytes(): the undecoded body as a fresh Uint8Array.
-  async bytes() {
-    return (await this._consume()).slice();
-  }
-  async blob() {
-    // The parsed-and-reserialized MIME type, not the raw header (#186).
-    return __blobOfType(await this.arrayBuffer(),
-      __serializeContentType(this.headers.get("content-type")));
-  }
+
   clone() {
     if (__bodyDisturbed(this))
       throw new TypeError(__BODY_LOCKED);
     // Streaming body: tee, keep one branch, clone the other (as
     // Request.clone does, and as Workerd does for both).
-    let body = this.body === null ? null : this._bodyBytes;
-    if (this._bodyBytes === null) {
-      const [left, right] = this.body.tee();
-      this.body = left;
+    const state = this.#s;
+    let body = state.body === null ? null : state.bytes;
+    if (state.bytes === null) {
+      const [left, right] = state.body.tee();
+      state.body = left;
       body = right;
     }
     // A network-error response has status 0, which the constructor refuses;
@@ -725,21 +882,29 @@ globalThis.Response = class Response {
     const response = new Response(
       body,
       {
-        status: error ? 200 : this.status,
-        statusText: this.statusText, headers: this.headers,
-        webSocket: this.webSocket, __wsTarget: this._wsTarget, cf: this.cf,
+        status: error ? 200 : state.status,
+        statusText: state.statusText, headers: state.headers,
+        webSocket: state.webSocket, __wsTarget: state.wsTarget, cf: state.cf,
       },
     );
     if (error) {
-      response.status = 0;
-      response.ok = false;
+      response.#s.status = 0;
+      response.#s.ok = false;
     }
-    response.type = this.type;
-    response.url = this.url;
-    response.redirected = this.redirected;
+    response.#s.type = state.type;
+    response.#s.url = state.url;
+    response.#s.redirected = state.redirected;
     return response;
   }
 };
+__webidlPrototype(globalThis.Response);
+__webidlStatics(globalThis.Response);
+__webidlTag(globalThis.Response, "Response");
+__webidlLength(globalThis.Response);
+// The Body mixin sits between Request/Response and Object, as workerd's
+// interface hierarchy does, so the body members are shared rather than
+// duplicated on each prototype.
+Object.setPrototypeOf(globalThis.Response.prototype, globalThis.Body.prototype);
 // Hoisted: this would otherwise allocate an array and scan it on
 // every Request construction, which is the HTTP hot path. TRACE is here
 // because workerd normalizes `trace` into it (#190); CONNECT and TRACK are
@@ -758,9 +923,11 @@ const __operatorIngressRequests = new WeakSet();
 const __INCOMING = Symbol("celloIncoming");
 const __PRIOR_BODY = Symbol("celloPriorBody");
 globalThis.Request = class Request {
-  #cache;
+  #s;
+  static #expose = (__requestState = (request) => request.#s);
   constructor(input, init = {}) {
     const prior = input instanceof Request ? input : null;
+    const priorState = prior === null ? null : __requestState(prior);
     // Host-built incoming requests (HTTP ingress and a service-binding
     // target's view of a call) skip the script-facing URL and GET/HEAD body
     // checks: the host guarantees an absolute URL, and workerd hands an
@@ -779,18 +946,20 @@ globalThis.Request = class Request {
     // accepted, and every other mode is a TypeError rather than the blanket
     // "not implemented" Error this used to throw for all of them -- which
     // made the ubiquitous `fetch(url, { cache: "no-store" })` fail (#160).
+    let callCache;
     if (init.cache !== undefined) {
       const cache = String(init.cache);
       if (cache !== "no-store" && cache !== "no-cache")
         throw new TypeError("Unsupported cache mode: " + cache);
-      this.#cache = cache;
+      callCache = cache;
     } else {
-      this.#cache = prior ? prior.#cache : undefined;
+      callCache = prior ? priorState.cache : undefined;
     }
+    let url;
     if (prior) {
-      this.url = prior.url;
+      url = priorState.url;
     } else if (incoming) {
-      this.url = String(input);
+      url = String(input);
     } else {
       // A Request's url is a serialized absolute URL. A relative or
       // unparsable input used to be stored verbatim, so `new URL(r.url)`,
@@ -800,21 +969,20 @@ globalThis.Request = class Request {
       let parsed;
       try { parsed = new URL(raw); }
       catch { throw new TypeError("Invalid URL: " + raw); }
-      this.url = parsed.href;
+      url = parsed.href;
     }
+    let method;
     {
-      // Workers upper-cases every method (the
-      // upper_case_all_http_methods flag) but rejects anything outside
-      // the known set, reporting the original casing.
+      // Workers upper-cases every method (the upper_case_all_http_methods
+      // flag) but rejects anything outside the known set, reporting the
+      // original casing. Workerd's set includes TRACE and excludes CONNECT
+      // and TRACK (#190).
       const raw = String(init.method === undefined
-        ? (prior ? prior.method : "GET") : init.method);
+        ? (prior ? priorState.method : "GET") : init.method);
       const upper = raw.toUpperCase();
-      // Workerd normalizes every casing of `trace` (its known-method set
-      // includes TRACE) and reports an unknown method with the original
-      // casing (#190). CONNECT and TRACK stay outside the set.
       if (!__HTTP_METHODS.has(upper))
         throw new TypeError(`Invalid HTTP method string: ${raw}`);
-      this.method = upper;
+      method = upper;
     }
     const hasBody =
       Object.prototype.hasOwnProperty.call(init, "body");
@@ -827,7 +995,7 @@ globalThis.Request = class Request {
     // (`__PRIOR_BODY`) is the same case.
     if (hasBody && body != null && !(init instanceof Request) &&
         init[__PRIOR_BODY] !== true &&
-        (this.method === "GET" || this.method === "HEAD") && !incoming)
+        (method === "GET" || method === "HEAD") && !incoming)
       throw new TypeError(
         "Request with a GET or HEAD method cannot have a body.");
     let stream = null;
@@ -843,51 +1011,94 @@ globalThis.Request = class Request {
     // explicit `init.body` still replaces the prior's, and before the adopt
     // below, which itself disturbs the prior; `clone()` tees a live stream
     // and copies an unused buffered body, so it never reaches here disturbed.
-    // A bodyless prior -- `body === null` -- has nothing to steal and copies
-    // normally.
     if (!hasBody && prior) {
       if (prior.bodyUsed) throw new TypeError(__FETCH_USED);
       // Locked but unread: a reader holds the stream, so the copy cannot
       // steal it, with workerd's own message.
-      if (prior.body != null && prior.body.locked)
+      if (priorState.body != null && priorState.body.locked)
         throw new TypeError(__BODY_LOCKED_REQUEST);
     }
-    if (!hasBody && prior && prior._bodyBytes === null) {
+    if (!hasBody && prior && priorState.bytes === null) {
       // Adopt the prior request's stream; per spec the prior body
       // is disturbed by the new request.
-      stream = prior.body;
+      stream = priorState.body;
       __markBodyUsed(prior);
     }
-    this._bodyBytes = stream !== null
+    const bytes = stream !== null
       ? null
       : hasBody
         ? (typed ? typed.bytes : __bodyBytes(body))
-        : (prior ? prior._bodyBytes.slice() : new __primUint8Array());
-    // Body text is decoded on the first text()/json(), not here: a request
-    // whose body is never read never pays the decode.
-    this._body = undefined;
+        : (prior ? priorState.bytes.slice() : new __primUint8Array());
     // Headers are stored raw and built on the first `.headers` access. The
     // hot paths -- a hello world, a Worker that only forwards to a cell --
     // read none, so `new Headers` and the JSON.parse behind it never run.
+    let headersJson;
+    let headersInit;
     if (init.__headersJson !== undefined) {
-      this._headersJson = init.__headersJson;
-      this._headersInit = undefined;
+      headersJson = init.__headersJson;
+      headersInit = undefined;
     } else if (init.headers === undefined && prior) {
-      this._headersJson = prior._headersJson;
+      headersJson = priorState.headersJson;
       // Per spec `new Request(request)` copies the header list. The prior
       // request's `Headers` object cannot stand in for it: `new Headers(h)`
       // reads `h` through its iterator, which sorts, lower-cases and
       // combines, so forwarding a request whose headers were read would
       // undo the wire shape the outbound paths preserve.
-      this._headersInit = prior._headers
-        ? prior._headers.__celloHeaderList
-        : prior._headersInit;
+      headersInit = priorState.headers !== null
+        ? __cello.$$headerList(priorState.headers)
+        : priorState.headersInit;
     } else {
-      this._headersJson = undefined;
-      this._headersInit = init.headers;
+      headersJson = undefined;
+      headersInit = init.headers;
     }
-    this._headers = null;
-    this._immutableHeaders = incoming;
+    // Whether the request carries a body at all. Workerd's `body` is null
+    // when none was supplied: a bodyless POST and a GET both report null, a
+    // Content-Length: 0 request reports an empty body stream, and
+    // `new Request(request)` copies the distinction (#142).
+    const hasBodyFlag = stream !== null ||
+      (hasBody ? body !== null : prior ? priorState.hasBody : false);
+    // Workerd compares the redirect mode case-insensitively ("FOLLOW" is
+    // "follow") and accepts only the two modes it implements; `error` is
+    // refused with the message its text describes (#184).
+    const redirect = String(init.redirect === undefined
+      ? (prior ? priorState.redirect : "follow")
+      : init.redirect).toLowerCase();
+    if (redirect !== "follow" && redirect !== "manual") {
+      // Workerd's text for an unsupported redirect value, verbatim.
+      throw new TypeError(
+        'Invalid redirect value, must be one of "follow" or "manual" ' +
+        '("error" won\'t be implemented since it does not make sense at ' +
+        'the edge; use "manual" and check the response status code).');
+    }
+    const signal = suppliedSignal
+      ? init.signal
+      : (prior ? priorState.signal : new AbortController().signal);
+    __weakSetAdd(__requestInstances, this);
+    this.#s = {
+      url,
+      method,
+      // Never decoded eagerly: a request whose body is never read never
+      // pays the decode.
+      bytes,
+      text: undefined,
+      memoText: true,
+      body: null,
+      headersJson, headersInit, headers: null,
+      // An incoming request's header list is immutable: a middleware that
+      // rewrites it must be told, not silently ignored (#169).
+      immutableHeaders: incoming,
+      hasBody: hasBodyFlag,
+      redirect,
+      callCache,
+      signal,
+      signalForSubrequests: init.__celloIncomingSignal
+        ? null
+        : suppliedSignal
+          ? signal
+          : (prior ? priorState.signalForSubrequests : null),
+      cf: init.cf === undefined
+        ? (prior ? priorState.cf : undefined) : init.cf,
+    };
     // A typed body's default content-type must land now; only user-built
     // typed bodies reach this, never the incoming request path. A string
     // body gets the Fetch-standard text/plain too (#159): without it a
@@ -901,53 +1112,19 @@ globalThis.Request = class Request {
     } else if (typed && typed.type && !this.headers.has("content-type")) {
       this.headers.set("content-type", typed.type);
     }
-    // The explicit half of the prototype `bodyUsed` accessor below; kept an
-    // own field here so every Request has one hidden class.
-    this._bodyUsed = false;
-    // Whether the request carries a body at all. Workerd's `body` is null
-    // when none was supplied: a bodyless POST and a GET both report null, a
-    // Content-Length: 0 request reports an empty body stream, and
-    // `new Request(request)` copies the distinction. The constructor, the
-    // revive path and the fetch surfaces all key off this one flag (#142).
-    this._hasBody = stream !== null ||
-      (hasBody ? body !== null : prior ? prior._hasBody : false);
-    // The body stream and the signal stay eager, own properties: the RPC and
-    // storage serializers fall back to the lift-into-marker path only when a
-    // value is not directly structured-cloneable, and a Request's un-cloneable
-    // body stream (or AbortSignal) is what triggers that. Making them lazy
-    // getters let `__sc_encode` clone the Request into a broken plain object
-    // and skip the lift -- the serializeHttpTypes conformance failure.
+    // The body stream stays eager in the private slot: the RPC and storage
+    // serializers fall back to the lift-into-marker path only when a value is
+    // not directly structured-cloneable, and a Request's un-cloneable body
+    // stream (or AbortSignal) is what triggers that. A lazy getter let
+    // `__sc_encode` clone the Request into a broken plain object and skip the
+    // lift -- the serializeHttpTypes conformance failure.
     // `body === null` is the one rule for "no body was supplied" (#142), so
     // a bodyless POST reports null like a GET; the GET/HEAD body refusal
     // above is about a script-supplied body, and an incoming request is
     // exempt because the host's request can legitimately carry one.
-    this.body = this._hasBody
+    this.#s.body = hasBodyFlag
       ? stream !== null ? stream : new CelloBodyStream(this)
       : null;
-    // Workerd compares the redirect mode case-insensitively ("FOLLOW" is
-    // "follow") and accepts only the two modes it implements; `error` is
-    // refused with the message its text describes (#184).
-    this.redirect = String(init.redirect === undefined
-      ? (prior ? prior.redirect : "follow")
-      : init.redirect).toLowerCase();
-    if (this.redirect !== "follow" && this.redirect !== "manual") {
-      // Workerd's text for an unsupported redirect value, verbatim.
-      throw new TypeError(
-        'Invalid redirect value, must be one of "follow" or "manual" ' +
-        '("error" won\'t be implemented since it does not make sense at ' +
-        'the edge; use "manual" and check the response status code).');
-    }
-    const cf = init.cf === undefined
-      ? (prior ? prior.cf : undefined) : init.cf;
-    if (cf !== undefined) this.cf = cf;
-    this.signal = suppliedSignal
-      ? init.signal
-      : (prior ? prior.signal : new AbortController().signal);
-    this._signalForSubrequests = init.__celloIncomingSignal
-      ? null
-      : suppliedSignal
-        ? this.signal
-        : (prior ? prior._signalForSubrequests : null);
     // Operator ingress lives in `__operatorIngressRequests`, which only the
     // host's `__makeRequest` adds to when it builds the server-side Request
     // for a call that entered over the authenticated `/runtime/` route. The
@@ -955,27 +1132,20 @@ globalThis.Request = class Request {
     // even its own local Request objects, and `new Request(prior)` never
     // inherits membership.
   }
-  // The RequestInit-derived attributes workerd reports with their spec
-  // defaults instead of `undefined` (#177): `integrity` is always the empty
-  // string (a non-empty value is refused above) and `keepalive` is always
-  // false, whatever the init asked for.
-  get integrity() { return ""; }
-  get keepalive() { return false; }
-  get cache() { return this.#cache; }
+  get url() { return this.#s.url; }
+  get method() { return this.#s.method; }
   get headers() {
-    if (this._headers === null) {
-      const src = this._headersJson !== undefined
-        ? JSON.parse(this._headersJson)
-        : this._headersInit;
-      this._headers = new Headers(src);
-      // An incoming request's header list is immutable: a middleware that
-      // rewrites it must be told, not silently ignored (#169).
-      if (this._immutableHeaders)
-        Object.defineProperty(this._headers, "_immutable", { value: true });
-      this._headersJson = undefined;
-      this._headersInit = undefined;
+    const state = this.#s;
+    if (state.headers === null) {
+      const source = state.headersJson !== undefined
+        ? JSON.parse(state.headersJson)
+        : state.headersInit;
+      state.headers = new Headers(source);
+      if (state.immutableHeaders) __cello.$$sealHeaders(state.headers);
+      state.headersJson = undefined;
+      state.headersInit = undefined;
     }
-    return this._headers;
+    return state.headers;
   }
   // `headers` is a readonly attribute in workerd and in the Fetch standard. A
   // setter here was also the one way around an incoming request's immutable
@@ -986,88 +1156,104 @@ globalThis.Request = class Request {
     throw new TypeError(
       "Cannot assign to read only property 'headers' of object '#<Request>'");
   }
-  async _consume() {
-    // One consumption, as on Response: a buffered body is served once and a
-    // disturbed stream rejects, with workerd's TypeError (#127).
-    if (this.body !== null) {
-      if (this.bodyUsed) throw new TypeError(__BODY_USED);
-      __markBodyUsed(this);
-    }
-    if (this._bodyBytes !== null) return this._bodyBytes;
-    return __drainBody(this);
-  }
-  async text() {
-    const bytes = await this._consume();
-    return this._body ??= new TextDecoder().decode(bytes);
-  }
-  async json() { return JSON.parse(await this.text()); }
-  async formData() {
-    // The undecoded bytes, not `text()`: a UTF-8 decode replaces each invalid
-    // sequence in a binary file part with one U+FFFD, so both the bytes and
-    // the length change.
-    return __cello.__parseFormData(
-      await this._consume(), this.headers.get('content-type'));
-  }
-  async arrayBuffer() {
-    return (await this._consume()).slice().buffer;
-  }
-  // Fetch's bytes(): the undecoded body as a fresh Uint8Array.
-  async bytes() {
-    return (await this._consume()).slice();
-  }
-  async blob() {
-    // The parsed-and-reserialized MIME type, not the raw header (#186).
-    return __blobOfType(await this.arrayBuffer(),
-      __serializeContentType(this.headers.get("content-type")));
-  }
+  get redirect() { return this.#s.redirect; }
+  get signal() { return this.#s.signal; }
+  get cf() { return this.#s.cf; }
+  // Workerd defines these four attributes; a cell has no fetcher, cannot
+  // honour an integrity digest, and runs with the cache option disabled, so
+  // they carry workerd's own defaults instead of being absent.
+  get fetcher() { return null; }
+  get integrity() { return ""; }
+  get keepalive() { return false; }
+  get cache() { return this.#s.callCache; }
   clone() {
     if (__bodyDisturbed(this))
       throw new TypeError(__BODY_LOCKED);
-    if (this._bodyBytes === null) {
+    const state = this.#s;
+    if (state.bytes === null) {
       // Streaming body: tee, keep one branch, clone the other. The new
       // branch is not a script-supplied body, so it skips the GET/HEAD
       // body rule -- an incoming GET legitimately carries a body stream.
-      const [left, right] = this.body.tee();
-      this.body = left;
+      const [left, right] = state.body.tee();
+      state.body = left;
       return new Request(this, { body: right, [__PRIOR_BODY]: true });
     }
     return new Request(this);
   }
 };
-// Fetch's `bodyUsed` observes the body stream; it is not stored state. The
-// getter turns true as soon as the stream is disturbed -- a read or a cancel
-// through any reader, including a Worker's own half-read of a live request
-// body -- which is the flag a guard re-checks mid-stream and what workerd
-// reports. The explicit half -- for consumers that take the body without
-// reading the stream (a buffered body, a host-stream transfer) -- is host
-// state in a WeakMap, not the `_bodyUsed` own field: the field stays a plain
-// writable property for the hidden-class shape, and a guest that assigns
-// `resp._bodyUsed = false` (or an accessor that throws) cannot un-use a body
-// (#130). Only runtime code marks it, through `__markBodyUsed`. The accessor
-// is getter-only, as workerd's readonly property is.
-const __bodyUsedTargets = new __primWeakMap();
-const __bodyUsedFlag = (target) => __weakGet(__bodyUsedTargets, target) === true;
-const __markBodyUsed = (target) => {
-  target._bodyUsed = true;
-  __weakSet(__bodyUsedTargets, target, true);
+__webidlPrototype(globalThis.Request);
+__webidlStatics(globalThis.Request);
+__webidlTag(globalThis.Request, "Request");
+__webidlLength(globalThis.Request);
+Object.setPrototypeOf(globalThis.Request.prototype, globalThis.Body.prototype);
+// Clone-refusal brands: a WeakSet proves a constructed instance, so a forged
+// prototype clones as plain data exactly as workerd's does (#221).
+const __requestInstances = new __primWeakSet();
+const __responseInstances = new __primWeakSet();
+__cello.$$isRequestInstance = (value) => __weakSetHas(__requestInstances, value);
+__cello.$$isResponseInstance = (value) => __weakSetHas(__responseInstances, value);
+// Response attributes are read-only on the prototype (workerd's are too), so
+// the two internal transitions go through the state object.
+// The persisted codec (storage, queue v8 bodies, socket attachments, signal
+// reasons) is plain V8 structured clone with no host-object support: a value
+// whose state is all private would be stored as `{}` where it used to be
+// refused by an uncloneable function brand. Walk the graph and refuse the
+// host instances this codec cannot round-trip.
+const __cloneHostName = (value) => {
+  if (__cello.$$isRequestInstance(value)) return "Request";
+  if (__cello.$$isResponseInstance(value)) return "Response";
+  if (__cello.$$isHeadersInstance(value)) return "Headers";
+  if (__cello.$$isFormDataInstance(value)) return "FormData";
+  if (__cello.$$isAbortSignalInstance(value)) return "AbortSignal";
+  if (typeof __cello.$$isMessagePortInstance === "function" &&
+      __cello.$$isMessagePortInstance(value)) return "MessagePort";
+  if (__cello.__isBlobInstance(value)) return "Blob";
+  if (typeof __cello.$$isCryptoKey === "function" &&
+      __cello.$$isCryptoKey(value)) return "CryptoKey";
+  if (value instanceof ReadableStream) return "ReadableStream";
+  if (value instanceof WritableStream) return "WritableStream";
+  if (value instanceof TransformStream) return "TransformStream";
+  return null;
 };
-__cello.__markBodyUsed = __markBodyUsed;
-// The isolated scripts after the harness (cache.js) run in their own scope,
-// so the byte-window helper is reachable only through `__cello`. cache.js
-// captures it when it installs, before any Worker code runs.
-__cello.__bodyChunk = __bodyChunk;
-__cello.__hostChunk = __hostChunk;
-const __defineBodyUsed = (ctor) => {
-  Object.defineProperty(ctor.prototype, "bodyUsed", {
-    configurable: true,
-    get() {
-      return __bodyUsedFlag(this) ||
-        (this.body != null && this.body._disturbed === true);
-    },
-  });
+const __scEncodeStrict = (value) => {
+  const seen = new __primSet();
+  const stack = [value];
+  while (stack.length > 0) {
+    const v = stack.pop();
+    if (v === null || typeof v !== "object") continue;
+    if (__setHas(seen, v)) continue;
+    __setAdd(seen, v);
+    const host = __cloneHostName(v);
+    if (host !== null) {
+      throw new DOMException(
+        'Could not serialize object of type "' + host +
+        '". This type does not support serialization.', "DataCloneError");
+    }
+    if (v instanceof Date || v instanceof RegExp || v instanceof Error ||
+        v instanceof ArrayBuffer || ArrayBuffer.isView(v) ||
+        (typeof SharedArrayBuffer !== "undefined" &&
+          v instanceof SharedArrayBuffer) ||
+        (typeof WebAssembly !== "undefined" &&
+          v instanceof WebAssembly.Module)) continue;
+    if (v instanceof Map) {
+      for (const [key, entry] of v) stack.push(key, entry);
+      continue;
+    }
+    if (v instanceof Set) {
+      for (const entry of v) stack.push(entry);
+      continue;
+    }
+    const keys = __primObjectKeys(v);
+    for (let i = 0; i < keys.length; i++) stack.push(v[keys[i]]);
+  }
+  return __sc_encode(value);
 };
-__defineBodyUsed(Response);
-__defineBodyUsed(Request);
+__cello.$$setResponseUrl = (response, url) => {
+  __responseState(response).url = url;
+};
+__cello.$$setResponseWebSocket = (response, webSocket) => {
+  __responseState(response).webSocket = webSocket;
+};
 const __makeRequest = __cello.__makeRequest = (
   url, method, body, headersJson = "[]", signal = undefined,
   incomingSignal = false, operatorIngress = false,
@@ -1142,11 +1328,12 @@ const __subrequestBody = async (req, absent = false) => {
   // stream it used to carry, or the target sees a present zero-length body.
   if (absent || req.body === null)
     return { body: undefined, streamId: undefined };
-  if (req._bodyBytes !== null)
-    return { body: req._bodyBytes, streamId: undefined };
-  const streamId = req.body?.__celloStreamId;
+  const state = __requestState(req);
+  if (state.bytes !== null)
+    return { body: state.bytes, streamId: undefined };
+  const streamId = __cello.$$httpStreamId(req.body);
   if (streamId === undefined)
-    return { body: await req._consume(), streamId: undefined };
+    return { body: await __bodyConsume(req), streamId: undefined };
   // The receiver now owns the one host source. Lock the wrapper so a later
   // read fails instead of racing the receiver, and expose the transfer through
   // the standard Body flag.
@@ -1208,7 +1395,7 @@ const __EGRESS_REFUSAL_MARKER = "CELLO_EGRESS_REFUSED:";
 // with its own `body` leaves the input alone, both as workerd behaves.
 const __FETCH_USED = "Cannot reconstruct a Request with a used body.";
 const __fetchAdoptsBody = (input, init) =>
-  input instanceof Request && input._hasBody === true &&
+  input instanceof Request && __requestState(input).hasBody === true &&
   !(init !== null && typeof init === "object" &&
     Object.prototype.hasOwnProperty.call(init, "body"));
 // `usedBefore` is snapshotted before the Request copy: constructing it marks a
@@ -1234,7 +1421,7 @@ globalThis.fetch = async (input, init) => {
     return await __fetchWebSocketUpgrade(req);
   }
   // The caller's signal, never the incoming request's own.
-  const signal = req._signalForSubrequests;
+  const signal = __requestState(req).signalForSubrequests;
   if (signal?.aborted) throw signal.reason;
   // The bytes go to the host as a typed array, the same way every other
   // subrequest op takes a body. Encoding them as a JSON number array cost
@@ -1251,7 +1438,7 @@ globalThis.fetch = async (input, init) => {
   try {
     const dispatch = __op_fetch(
       req.method, req.url, body,
-      JSON.stringify(req.headers.__celloHeaderList), req.redirect,
+      JSON.stringify(__cello.$$headerList(req.headers)), req.redirect,
       streamId, signal != null,
     );
     if (signal) {
@@ -1291,8 +1478,9 @@ globalThis.fetch = async (input, init) => {
   // A followed redirect reports where it landed (#173). The host compares
   // its final URL with the one it sent; a manual response keeps the
   // requested URL, as workerd's does.
-  response.url = r.url !== undefined ? r.url : req.url;
-  response.redirected = r.redirected === true;
+  __cello.$$responseState(response).url =
+    r.url !== undefined ? r.url : __requestState(req).url;
+  __cello.$$responseState(response).redirected = r.redirected === true;
   return response;
 };
 const __fetchWebSocketUpgrade = __cello.__fetchWebSocketUpgrade =
@@ -1300,10 +1488,11 @@ const __fetchWebSocketUpgrade = __cello.__fetchWebSocketUpgrade =
   const scope = __currentActorScope();
   const id = __ws_alloc();
   const socket = __makeSocket(id);
-  socket._outbound = true;
-  socket._polled = !scope;
-  socket.url = req.url;
-  socket.readyState = WebSocket.READY_STATE_CONNECTING;
+  const socketState = __wsState(socket);
+  socketState.outbound = true;
+  socketState.polled = !scope;
+  socketState.url = req.url;
+  socketState.readyState = WebSocket.READY_STATE_CONNECTING;
   __sockets.set(id, socket);
   let raw;
   try {
@@ -1333,12 +1522,13 @@ const __fetchWebSocketUpgrade = __cello.__fetchWebSocketUpgrade =
       status: raw.status,
       headers: raw.headers,
     });
-    response.url = req.url;
+    __cello.$$setResponseUrl(response, req.url);
     return response;
   }
-  socket.protocol = raw.protocol ?? "";
-  const response = new Response(null, { status: 101, webSocket: socket });
-  response.url = req.url;
+  socketState.protocol = raw.protocol ?? "";
+  const response = new Response(null, { status: 101 });
+  __cello.$$setResponseWebSocket(response, socket);
+  __cello.$$setResponseUrl(response, req.url);
   return response;
 };
 __cello.__makeAssetsBinding = (script) => ({
@@ -1356,7 +1546,7 @@ __cello.__makeAssetsBinding = (script) => ({
       responseBody,
       { status: r.status, headers: r.headers },
     );
-    response.url = req.url;
+    __cello.$$setResponseUrl(response, req.url);
     return response;
   },
 });
@@ -1593,7 +1783,8 @@ const __r2Object = (object, body) => {
   const drain = () => __r2Drain(body);
   r2.body = body;
   Object.defineProperty(r2, "bodyUsed", {
-    get: () => body.locked || body._disturbed === true,
+    get: () => body.locked ||
+      __cello.$$readableState(body).disturbed,
   });
   r2.arrayBuffer = async () => (await drain()).buffer;
   r2.bytes = drain;
@@ -1735,13 +1926,32 @@ const __r2Multipart = (binding, bucketName, key, id) => ({
     await __r2_mp_abort(await id.host);
   },
 });
-__cello.__makeR2Bucket = (binding, bucketName) => ({
+// R2 bucket state is a module-private WeakMap, and the seven R2 operations
+// are prototype members: workerd's binding has no own property and no host
+// helper in its shape (#206).
+const __r2BucketStates = new __primWeakMap();
+// A module-private token: the interface is guest-constructible by name (as
+// workerd's is), but only the host's factory can mint one, so a tenant cannot
+// forge a bucket for a name its script was never granted.
+const __r2Create = Symbol("cello.R2Bucket.create");
+class R2Bucket {
+  constructor(token, binding, bucketName) {
+    if (token !== __r2Create) throw new TypeError("Illegal constructor");
+    __weakSet(__r2BucketStates, this, { binding, bucketName });
+  }
+  #state() {
+    const state = __weakGet(__r2BucketStates, this);
+    if (state === undefined) throw new TypeError("Illegal invocation");
+    return state;
+  }
   async head(key) {
+    const { binding, bucketName } = this.#state();
     const name = __r2Key(binding, "head", key);
     const r = JSON.parse(await __r2_head(bucketName, name));
     return r.state === "miss" ? null : __r2Object(r.object);
-  },
+  }
   async get(key, options) {
+    const { binding, bucketName } = this.#state();
     const name = __r2Key(binding, "get", key);
     const o = options ?? {};
     if (o.ssecKey !== undefined) {
@@ -1757,8 +1967,9 @@ __cello.__makeR2Bucket = (binding, bucketName) => ({
     // a caller tells "not modified" from "not there".
     if (r.state === "unmet") return __r2Object(r.object);
     return __r2Object(r.object, new CelloHttpBodyStream(r.streamId));
-  },
+  }
   async put(key, value, options) {
+    const { binding, bucketName } = this.#state();
     const name = __r2Key(binding, "put", key);
     const write = __r2WriteOptions(binding, "put", options);
     const body = await __r2Value(binding, value);
@@ -1767,8 +1978,9 @@ __cello.__makeR2Bucket = (binding, bucketName) => ({
       : await __r2PutStream(bucketName, name, body, write);
     // R2 answers a refused `onlyIf` with `null` rather than throwing.
     return r.stored ? __r2Object(r.object) : null;
-  },
+  }
   async delete(keys) {
+    const { binding, bucketName } = this.#state();
     const list = (Array.isArray(keys) ? keys : [keys]).map((key) =>
       __r2Key(binding, "delete", key)
     );
@@ -1778,8 +1990,9 @@ __cello.__makeR2Bucket = (binding, bucketName) => ({
       );
     }
     if (list.length) await __r2_delete(bucketName, JSON.stringify(list));
-  },
+  }
   async list(options) {
+    const { binding, bucketName } = this.#state();
     const o = options ?? {};
     if (o.limit !== undefined && o.limit !== null) {
       const limit = Number(o.limit);
@@ -1822,8 +2035,9 @@ __cello.__makeR2Bucket = (binding, bucketName) => ({
     const page = { objects, truncated: r.truncated, delimitedPrefixes: r.prefixes };
     if (r.truncated && r.cursor) page.cursor = r.cursor;
     return page;
-  },
+  }
   async createMultipartUpload(key, options) {
+    const { binding, bucketName } = this.#state();
     const name = __r2Key(binding, "createMultipartUpload", key);
     const write = __r2WriteOptions(binding, "createMultipartUpload", options);
     if (write.onlyIf) {
@@ -1843,10 +2057,11 @@ __cello.__makeR2Bucket = (binding, bucketName) => ({
       value: uploadId,
       host: Promise.resolve(Number(uploadId)),
     });
-  },
+  }
   // R2 hands back a handle without checking it; so does this, and the
   // first method that uses it says whether the upload is still open.
   resumeMultipartUpload(key, uploadId) {
+    const { binding, bucketName } = this.#state();
     const name = __r2Key(binding, "resumeMultipartUpload", key);
     const id = String(uploadId);
     const host = __r2_mp_resume(bucketName, name, id).then(Number);
@@ -1854,8 +2069,13 @@ __cello.__makeR2Bucket = (binding, bucketName) => ({
     // first method that awaits `host` still sees the failure.
     host.catch(() => {});
     return __r2Multipart(binding, bucketName, name, { value: id, host });
-  },
-});
+  }
+}
+__webidlTag(R2Bucket, "R2Bucket");
+__webidlPrototype(R2Bucket);
+globalThis.R2Bucket = R2Bucket;
+__cello.__makeR2Bucket = (binding, bucketName) =>
+  new R2Bucket(__r2Create, binding, bucketName);
 // A host timer op resolves once, so an interval arms a new one after every
 // round. Workerd hands back a `Timeout` object: its primitive value is the
 // handle's numeric id, `refresh` re-arms it with a fresh id, and
@@ -2379,7 +2599,7 @@ class DurableObjectStorage {
       // which serializes fully before queueing.
       const encoded = entries.map(([key, value]) => {
         try {
-          return [key, __sc_encode(value)];
+          return [key, __scEncodeStrict(value)];
         } catch (error_) {
           return [key, __storedBytes(value, error_)];
         }
@@ -3024,7 +3244,7 @@ class DurableObjectFacets {
         const usedBefore = adoptsBody && input.bodyUsed;
         const req = new Request(input, init);
         if (adoptsBody) __fetchTakeBody(input, usedBefore);
-        const headers = JSON.stringify(req.headers.__celloHeaderList);
+        const headers = JSON.stringify(__cello.$$headerList(req.headers));
         const { body, streamId } = await __subrequestBody(req);
         const response = JSON.parse(await __facet_fetch(
           loader, className, manager._state._scope, record.owner, name, id,
@@ -3720,15 +3940,17 @@ class DurableObjectState {
     return JSON.parse(__ws_list(this._scope, tag)).map((row) => __socketFromRow(row));
   }
   getTags(ws) {
-    if (!(ws instanceof WebSocket) || !ws._hibernatable) {
+    if (!(ws instanceof WebSocket) || !__wsState(ws).hibernatable) {
       throw new Error(
         "you must call 'acceptWebSocket()' before attempting to access " +
         "the tags of a WebSocket.");
     }
-    return Array.from(ws._tags);
+    return Array.from(__wsState(ws).tags);
   }
   acceptWebSocket(ws, tags = []) {
-    if (ws._accepted || ws._hibernationAccepted)
+    const accepted = __wsState(ws).accepted ||
+      __wsState(ws).hibernationAccepted;
+    if (accepted)
       throw new Error(
         "Cannot call `acceptWebSocket()` if the WebSocket was already " +
         "accepted via `accept()`");
@@ -3737,18 +3959,21 @@ class DurableObjectState {
         "the isolate is near its V8 heap limit, so it refused a " +
         "WebSocket (see CELLO_V8_HEAP_LIMIT_MB)");
     const acceptedTags = Array.from(tags, String);
-    __ws_accept(ws._id, this._scope, JSON.stringify(acceptedTags));
-    ws._target = { id: ws._id, scope: this._scope };
-    if (ws._peer) ws._peer._target = ws._target;
-    ws._hibernatable = true;
-    ws._hibernationAccepted = true;
-    if (ws._peer) ws._peer._hibernatable = true;
-    ws._tags = acceptedTags;
-    __sockets.set(ws._id, ws);
+    const wsState = __wsState(ws);
+    __ws_accept(wsState.id, this._scope, JSON.stringify(acceptedTags));
+    wsState.target = { id: wsState.id, scope: this._scope };
+    if (wsState.peer) __wsState(wsState.peer).target = wsState.target;
+    wsState.hibernatable = true;
+    // Accepting for hibernation is a second, distinct acceptance: workerd
+    // refuses `acceptWebSocket()` once either form ran.
+    wsState.hibernationAccepted = true;
+    if (wsState.peer) __wsState(wsState.peer).hibernatable = true;
+    wsState.tags = acceptedTags;
+    __sockets.set(wsState.id, ws);
   }
   _socket(id) {
     return __sockets.get(Number(id)) ||
-      this.getWebSockets().find((ws) => ws._id === id) ||
+      this.getWebSockets().find((ws) => __wsState(ws).id === id) ||
       __wsStub(id);
   }
   // Workerd actor-state.c++ setWebSocketAutoResponse: no argument unsets,
@@ -3788,7 +4013,7 @@ class DurableObjectState {
     return new WebSocketRequestResponsePair(pair[0], pair[1]);
   }
   getWebSocketAutoResponseTimestamp(ws) {
-    const ms = __ws_auto_response_ts(ws._id);
+    const ms = __ws_auto_response_ts(__wsState(ws).id);
     return ms === null ? null : new Date(ms);
   }
   waitUntil(promise) {
@@ -3847,12 +4072,10 @@ const __endActorEventsForContext = (context) => {
   }
 };
 const __incomingRequestSignals = new Map();
-const __abortSignal = (signal, reason) => {
-  if (signal.aborted) return;
-  signal.aborted = true;
-  signal.reason = reason;
-  signal.dispatchEvent(new Event("abort"));
-};
+// The slots belong to AbortSignal, so the class installs the implementation
+// when it is defined; this indirection stays callable from module-level code.
+let __abortSignalImpl;
+const __abortSignal = (signal, reason) => __abortSignalImpl(signal, reason);
 const __abortIncomingRequest = __cello.__abortIncomingRequest = (requestId) => {
   const signal = __incomingRequestSignals.get(String(requestId));
   if (signal && !signal.aborted) {
@@ -4001,8 +4224,8 @@ const __wrapServiceResponse = (res, url) => {
   // end the host can join to that target, on the same terms as a Durable
   // Object subrequest -- nothing binds until `accept()`, so a response
   // passed straight back out keeps the direct route to the real client.
-  const bound = !res.webSocket && res._wsTarget && res.status === 101
-    ? new WebSocket(undefined, [], res._wsTarget)
+  const bound = !res.webSocket && __responseState(res).wsTarget && res.status === 101
+    ? new WebSocket(undefined, [], __responseState(res).wsTarget)
     : undefined;
   const wrapped = new Response(
     // Buffered bodies re-stream (an empty buffer still yields a
@@ -4011,37 +4234,41 @@ const __wrapServiceResponse = (res, url) => {
     // become an empty stream (or, with #159, a `content-type`).
     __nullBodyStatus(res.status)
       ? null
-      : res._bodyBytes !== null ? res._bodyBytes : res.body,
+      : __responseState(res).bytes !== null
+        ? __responseState(res).bytes : res.body,
     {
       status: res.status,
       statusText:
         res.statusText || __STATUS_TEXT[res.status] || "",
       headers: res.headers,
       webSocket: res.webSocket || bound,
-      __wsTarget: res._wsTarget,
+      __wsTarget: __responseState(res).wsTarget,
     },
   );
-  // The constructor copies headers, so mark the copy.
-  Object.defineProperty(wrapped.headers, "_immutable", { value: true });
-  wrapped.url = url;
+  // The constructor copies headers, so seal the copy.
+  __cello.$$sealHeaders(wrapped.headers);
+  __cello.$$setResponseUrl(wrapped, url);
   // An upgraded pair whose both ends live in this isolate: link them
   // directly -- the host connection seam only reaches external
   // clients. Frames the handler queued before linking flush first.
   const client = wrapped.webSocket;
-  if (wrapped.status === 101 && client && client._peer) {
-    const server = client._peer;
-    client._loopback = server;
-    server._loopback = client;
-    for (const frame of server._pending.splice(0)) {
+  if (wrapped.status === 101 && client && __wsState(client).peer) {
+    const clientState = __wsState(client);
+    const server = clientState.peer;
+    const serverState = __wsState(server);
+    clientState.loopback = server;
+    serverState.loopback = client;
+    for (const frame of serverState.pending.splice(0)) {
       // "send-binary" joined this queue with outbound sockets; without a case
       // of its own it fell through to the close branch and tore the pair down
       // instead of delivering the frame.
       if (frame[0] === "send")
-        queueMicrotask(() => client._dispatchMessage(frame[1]));
+        queueMicrotask(() => __wsHooks.dispatchMessage(client, frame[1]));
       else if (frame[0] === "send-binary")
         queueMicrotask(() => {
           const data = frame[1];
-          client._dispatchMessage(
+          __wsHooks.dispatchMessage(
+            client,
             data instanceof ArrayBuffer ? data : data.buffer.slice(
               data.byteOffset,
               data.byteOffset + data.byteLength,
@@ -4050,7 +4277,7 @@ const __wrapServiceResponse = (res, url) => {
         });
       else
         queueMicrotask(
-          () => client._dispatchClose(frame[1], frame[2], true));
+          () => __wsHooks.dispatchClose(client, frame[1], frame[2], true));
     }
   }
   return wrapped;
@@ -4070,10 +4297,10 @@ const __CROSS_ORIGIN_SENSITIVE_HEADERS = [
 // receives the Request itself and can consume or mutate it before it redirects.
 const __serviceRedirectState = (req) => ({
   method: req.method,
-  headers: req.headers.__celloHeaderList,
+  headers: __cello.$$headerList(req.headers),
   body: req.body === null ? undefined
-    : req._bodyBytes === null ? null : req._bodyBytes.slice(),
-  signal: req._signalForSubrequests,
+    : __requestState(req).bytes === null ? null : __requestState(req).bytes.slice(),
+  signal: __requestState(req).signalForSubrequests,
 });
 const __finishServiceFetch = async (res, req, replay) => {
   const response = __wrapServiceResponse(res, req.url);
@@ -4114,8 +4341,8 @@ const __finishServiceFetch = async (res, req, replay) => {
   if (body !== undefined) init.body = body;
   if (replay.signal !== null) init.signal = replay.signal;
   const followed = await globalThis.fetch(url, init);
-  followed.redirected = true;
-  if (followed.url === "") followed.url = url;
+  __cello.$$responseState(followed).redirected = true;
+  if (followed.url === "") __cello.$$setResponseUrl(followed, url);
   return followed;
 };
 // `[[services]]` binding: a Fetcher pointed at another Worker in this
@@ -4179,12 +4406,12 @@ __cello.__makeLoader = () => {
         if (adoptsBody) __fetchTakeBody(input, usedBefore);
         // The caller's signal, never the incoming request's own, as for a
         // service binding.
-        const signal = req._signalForSubrequests;
+        const signal = __requestState(req).signalForSubrequests;
         if (signal?.aborted) throw signal.reason;
         // The verbatim header list; see the note on the outbound `fetch`.
         // The loaded worker rebuilds a `Headers` from these pairs, so a
         // repeat and its casing survive the isolate boundary.
-        const headers = JSON.stringify(req.headers.__celloHeaderList);
+        const headers = JSON.stringify(__cello.$$headerList(req.headers));
         const { body, streamId } = await __subrequestBody(req);
         const loaded = __loader_fetch(
           id, req.url, req.method, body, headers, streamId, entrypoint,
@@ -4469,14 +4696,14 @@ const __makeServiceBinding = __cello.__makeServiceBinding =
     const usedBefore = adoptsBody && input.bodyUsed;
     const req = new Request(input, init);
     if (adoptsBody) __fetchTakeBody(input, usedBefore);
-    const signal = req._signalForSubrequests;
+    const signal = __requestState(req).signalForSubrequests;
     if (signal?.aborted) throw signal.reason;
     // A stream body advertises its length the way the HTTP layer
     // would: known length -> Content-Length, unknown -> chunked.
-    if (req._bodyBytes === null &&
+    if (__requestState(req).bytes === null &&
         !req.headers.has("content-length") &&
         !req.headers.has("transfer-encoding")) {
-      const length = req.body._expectedLength;
+      const length = __cello.$$readableState(req.body).expectedLength;
       if (length === undefined)
         req.headers.set("transfer-encoding", "chunked");
       else req.headers.set("content-length", String(length));
@@ -4538,7 +4765,7 @@ const __makeServiceBinding = __cello.__makeServiceBinding =
     // The verbatim header list; see the note on the outbound `fetch`. The
     // target isolate rebuilds a `Headers` from these pairs, so a repeat and
     // its casing survive the crossing.
-    const headers = JSON.stringify(req.headers.__celloHeaderList);
+    const headers = JSON.stringify(__cello.$$headerList(req.headers));
     // Cross-isolate calls carry exact bytes. A host-backed stream transfers
     // its one source to the target, and another stream uses the byte fallback.
     const { body, streamId } = await __subrequestBody(req);
@@ -4721,6 +4948,12 @@ const __rpcUnsupportedType = (value) => new DOMException(
 const __rpcProject = (value) => {
   const seen = new __primMap();
   const originals = new __primWeakMap();
+  // A host value (a signal, Request/Response/Headers/Blob, a stream, a stub)
+  // must take the lift path. It used to force that by carrying an enumerable
+  // function brand, which made the plain V8 clone throw; with the state in
+  // private slots the clone would flatten it to `{}` instead, so the
+  // projection says outright that the graph is not plain data.
+  let liftable = false;
   const set = (target, key, value) => __primDefineProp(target, key, {
     value, enumerable: true, configurable: true, writable: true,
   });
@@ -4729,19 +4962,30 @@ const __rpcProject = (value) => {
       return v;
     const cached = __mapGet(seen, v);
     if (cached !== undefined) return cached;
+    // Only the interfaces whose state is entirely private can reach the clone
+    // as `{}`: everything else below keeps enough function-valued own state
+    // that V8 refuses it (a stub Proxy), which selects the lift path on its
+    // own. A stream used to qualify too -- its source, controller and reader
+    // were own fields -- so it is listed here now that they live in the
+    // private state (#170).
+    const privateStateHost =
+      v instanceof Headers || v instanceof Blob || v instanceof Request ||
+      v instanceof Response || v instanceof AbortSignal ||
+      v instanceof ReadableStream || v instanceof WritableStream ||
+      (typeof CryptoKey !== "undefined" && v instanceof CryptoKey);
     if (typeof v === "function" || v instanceof __cf.RpcTarget ||
         __weakHas(__stubMeta, v) || __weakHas(__svcMeta, v) || __do_is_stub(v) ||
-        v instanceof Headers || v instanceof Blob || v instanceof Request ||
-        v instanceof Response || v instanceof ReadableStream ||
-        v instanceof WritableStream || v instanceof AbortSignal ||
+        privateStateHost ||
         v instanceof Date || v instanceof RegExp || v instanceof Error ||
         v instanceof ArrayBuffer || ArrayBuffer.isView(v) ||
         (typeof SharedArrayBuffer !== "undefined" &&
           v instanceof SharedArrayBuffer) ||
-        (typeof CryptoKey !== "undefined" && v instanceof CryptoKey) ||
         (typeof WebAssembly !== "undefined" &&
           v instanceof WebAssembly.Module) ||
-        __util_proxy_details(v) !== undefined) return v;
+        __util_proxy_details(v) !== undefined) {
+      if (privateStateHost) liftable = true;
+      return v;
+    }
     if (v instanceof __primMap) {
       const out = new __primMap();
       __mapSet(seen, v, out);
@@ -4779,7 +5023,7 @@ const __rpcProject = (value) => {
     }
     return out;
   };
-  return { tree: project(value), originals };
+  return { tree: project(value), originals, liftable };
 };
 // ---- request-context confinement -------------------------------
 // Workerd ties I/O objects to the IoContext of the event that made
@@ -5514,11 +5758,11 @@ const __rpcSignalReceiverFinalizer = new FinalizationRegistry(
     __rpc_signal_unsubscribe(id, subscription));
 const __rpcSignalReasonOut = (reason) => {
   if (reason instanceof DOMException)
-    return __sc_encode({ d: true, n: reason.name, m: reason.message });
+    return __scEncodeStrict({ d: true, n: reason.name, m: reason.message });
   try {
-    return __sc_encode({ v: reason });
+    return __scEncodeStrict({ v: reason });
   } catch {
-    return __sc_encode({ v: new Error(String(reason)) });
+    return __scEncodeStrict({ v: new Error(String(reason)) });
   }
 };
 const __rpcSignalReasonIn = (bytes) => {
@@ -5835,7 +6079,7 @@ const __stubLift = (value, allowCapabilities = true, originals, collector = null
   // crosses as a stream handle (a capability, so the reply
   // roots its callee context and the pulls keep working).
   const liftBody = (v) => {
-    if (v._bodyBytes !== null) return v._bodyBytes;
+    if (__responseState(v).bytes !== null) return __responseState(v).bytes;
     caps = true;
     return __liftStream(v.body, host, collector);
   };
@@ -5971,7 +6215,7 @@ const __stubLift = (value, allowCapabilities = true, originals, collector = null
       marker = { "__cello$hdr": [...v] };
     } else if (v instanceof Blob) {
       if (!allowAll && !host) return v;
-      marker = { "__cello$blob": v._bytes, y: v.type };
+      marker = { "__cello$blob": __cello.$$blobBytes(v), y: v.type };
       if (v instanceof File) {
         marker.n = v.name;
         marker.m = v.lastModified;
@@ -5980,7 +6224,7 @@ const __stubLift = (value, allowCapabilities = true, originals, collector = null
       if (!allowAll && !host) return v;
       marker = { "__cello$req": v.url, m: v.method,
                  h: [...v.headers], r: v.redirect, c: v.cf,
-                 hb: v._hasBody === true, b: liftBody(v) };
+                 hb: __requestState(v).hasBody === true, b: liftBody(v) };
     } else if (v instanceof Response) {
       if (!allowAll && !host) return v;
       marker = { "__cello$res": v.status,
@@ -6077,23 +6321,23 @@ const __reviveBlob = (marker, bytes) => {
     ? new File([], marker.n,
         { type: marker.y, lastModified: marker.m })
     : new Blob([], { type: marker.y });
-  blob._bytes = bytes;
-  blob.size = bytes.byteLength;
+  __cello.$$setBlobBytes(blob, bytes);
   return blob;
 };
 const __adoptBody = (target, bytes) => {
-  target._bodyBytes = bytes;
-  target._body = undefined; // decoded lazily on the first text()/json()
+  const state = __bodyOwnerState(target);
+  state.bytes = bytes;
+  state.text = undefined; // decoded lazily on the first text()/json()
   // A revived Request is built with no `init.body`, so its constructor left
   // `body === null`; presence arrives separately in the marker. Install the
   // coupled stream here when the marker says the body exists (#142).
-  if (target.body === null && target._hasBody === true)
-    target.body = new CelloBodyStream(target);
-  const body = target.body;
-  if (body !== null) {
-    body._st.bytes = bytes;
-    body.__celloBodyBytes = bytes;
-    body._expectedLength = bytes.byteLength;
+  if (state.body === null && state.hasBody === true)
+    state.body = new CelloBodyStream(target);
+  if (state.body !== null) {
+    const streamState = __cello.$$bodyStream(state.body);
+    streamState.st.bytes = bytes;
+    streamState.bytes = bytes;
+    __cello.$$readableState(state.body).expectedLength = bytes.byteLength;
   }
 };
 // A non-bytes `b` is a live-stream body marker: revive it and
@@ -6112,8 +6356,9 @@ const __reviveRequest = (marker, url, revive) => {
   // revives with `body === null`, and a Content-Length: 0 request revives
   // with an empty stream. A fetch on the former consumes nothing (#127,
   // #142).
-  req._hasBody = marker.hb === true;
-  if (req._hasBody) __adoptBody(req, marker.b);
+  const reqState = __requestState(req);
+  reqState.hasBody = marker.hb === true;
+  if (reqState.hasBody) __adoptBody(req, marker.b);
   return req;
 };
 const __reviveResponse = (marker, revive) => {
@@ -6126,9 +6371,10 @@ const __reviveResponse = (marker, revive) => {
       status: error ? 200 : marker["__cello$res"], statusText: marker.t,
       headers: marker.h, cf: marker.c });
   if (error) {
-    res.status = 0;
-    res.ok = false;
-    res.type = "error";
+    const state = __responseState(res);
+    state.status = 0;
+    state.ok = false;
+    state.type = "error";
   }
   if (bytes) __adoptBody(res, marker.b);
   return res;
@@ -7091,6 +7337,7 @@ const __ctxExports = () => __ctxExportsCache ??= (() => {
 const __rpcOut = (value, lift) => {
   const projected = __rpcProject(value);
   try {
+    if (projected.liftable) throw new TypeError("host value");
     return __sc_encode(projected.tree);
   } catch (error) {
     // A cross-isolate call lifts only a live signal (plus DO stubs in "do"
@@ -7376,16 +7623,17 @@ class DurableObjectNamespace {
         const usedBefore = adoptsBody && input.bodyUsed;
         const req = new Request(input, init);
         if (adoptsBody) __fetchTakeBody(input, usedBefore);
-        const signal = req._signalForSubrequests;
+        const signal = __requestState(req).signalForSubrequests;
         if (signal?.aborted) throw signal.reason;
         // A body already backed by a host stream forwards to the cell as its
         // stream id, so a proxied upload to a cell on this node costs a chunk
         // rather than the whole body (#156). The host keeps it a stream for a
         // local cell and collects it only to sign a cross-node frame. A held
         // body -- or a stream with no host id -- crosses as its bytes.
+        const hostStreamId = __cello.$$httpStreamId(req.body);
         const bodyStreamId =
-          req._bodyBytes === null && req.body && req.body.__celloStreamId !== undefined
-            ? req.body.__celloStreamId
+          __requestState(req).bytes === null && hostStreamId !== undefined
+            ? hostStreamId
             : undefined;
         // A null body forwards as absent, not as an empty typed array: the
         // cell's revived request must also report `body === null` (#142).
@@ -7393,9 +7641,9 @@ class DurableObjectNamespace {
           ? undefined
           : bodyStreamId !== undefined
             ? new Uint8Array()
-            : req._bodyBytes === null
-              ? await req._consume()
-              : req._bodyBytes;
+            : __requestState(req).bytes === null
+              ? await __bodyConsume(req)
+              : __requestState(req).bytes;
         if (bodyStreamId !== undefined) {
           // The cell reads this upload through the same host stream id, so the
           // Worker's wrapper must not also read it: lock it (a late read throws
@@ -7415,9 +7663,9 @@ class DurableObjectNamespace {
         // the header list too, not the iterator; see the note on the
         // outbound `fetch`. Reading `.headers` on a forwarded request used
         // to change what the cell received.
-        const headersJson = req._headersJson !== undefined
-          ? req._headersJson
-          : JSON.stringify(req.headers.__celloHeaderList);
+        const headersJson = __requestState(req).headersJson !== undefined
+          ? __requestState(req).headersJson
+          : JSON.stringify(__cello.$$headerList(req.headers));
         const r = JSON.parse(await invoke(() => {
           if (!signal) return __do_call(
             scope, dispatchName ?? null, req.url, req.method, body_,
@@ -7480,7 +7728,7 @@ const __attachResponseRequestCancellation = (
   wrapBody,
 ) => {
   if (!(response instanceof Response) ||
-      response._bodyBytes !== null ||
+      __responseState(response).bytes !== null ||
       response.body === null) {
     return;
   }
@@ -7575,16 +7823,18 @@ const __dispatchTo = __cello.__dispatchTo = async (
     // controller rather than this one.
     __attachResponseRequestCancellation(response, requestController, false);
     if (response instanceof Response && response.status === 101 &&
-        response.webSocket && !response.webSocket._target) {
-      const socket = response.webSocket._peer;
-      const target = { id: response.webSocket._id, scope };
-      response.webSocket._target = target;
+        response.webSocket && !__wsState(response.webSocket).target) {
+      const responseSocketState = __wsState(response.webSocket);
+      const socket = responseSocketState.peer;
+      const target = { id: responseSocketState.id, scope };
+      responseSocketState.target = target;
       if (socket) {
-        socket._target = target;
-        if (!socket._hibernatable)
-          __ws_accept_regular(socket._id, scope);
-        __sockets.set(socket._id, socket);
-        socket._flushPending();
+        const socketState = __wsState(socket);
+        socketState.target = target;
+        if (!socketState.hibernatable)
+          __ws_accept_regular(socketState.id, scope);
+        __sockets.set(socketState.id, socket);
+        __wsHooks.flushPending(socket);
       }
     }
     if (response instanceof Response) __fetchCtxs.set(response, ctxId);
@@ -7606,10 +7856,10 @@ const __dispatchTo = __cello.__dispatchTo = async (
 // dispatch. The methods below are exactly the ones the binding clients
 // call; `fetch` travels the doFetch path, not this one, and is
 // unaffected.
-// - D1: `D1Database._query`, `_batch`, and `exec`. Export and migrate are
+// - D1: the database's private query/batch and `exec`. Export and migrate are
 //   operator-only and enter over `fetch` with the operator-ingress marker.
 // - KV: `get`/`getWithMetadata` (single and bulk) over `__kvGet`, `put`
-//   over `__kvPut`, `delete`/`deleteBulk` over `__kvDelete`, and `list`
+//   over `__kvPut`, `delete` over `__kvDelete`, and `list`
 //   (cursors included) over `__kvList`. `__kvSweep` runs inside the
 //   cell's own alarm and `__kvMetrics` inside the marker-gated fetch
 //   `info` branch.
@@ -7875,6 +8125,14 @@ __cello.__stubStats = () => {
 };
 if (__test_stub_stats_enabled())
   globalThis.__celloStubStatsForTestOnly = __cello.__stubStats;
+// Test-only: a stream's private state, so a conformance fixture can drive an
+// internal invariant that tenant code can no longer reach (a tee branch's
+// controller closed underneath the tee, #170). Defined only on nodes booted
+// with CELLO_TEST_WAIT=1, like the other test-only globals; production
+// isolates never define it.
+if (__test_wait_enabled())
+  globalThis.__celloStreamStateForTestOnly = (stream) =>
+    __cello.$$readableState(stream);
 // Test-only retained waits: `makeWait` holds one native unrefed wait
 // across native-event retirements (standing in for a container exec
 // wait, which needs an engine the test environment has not got), and
@@ -8354,28 +8612,16 @@ __cello.__dispatchEntrypointRpc =
 // WebSocket: the host holds the socket; these deliver events into the DO.
 // `ws` is a lightweight stub whose send/close route back to the host task
 // by wsId -- so the isolate can be hibernated between messages.
+// A hibernatable socket this isolate does not hold: a real WebSocket bound
+// to the id, accepted and targeted at the host queue, so send/close and the
+// shape are the interface's own (no own `_hibernatable` marker, #206).
 const __wsStub = __cello.__wsStub = (wsId) => {
-  // A revived socket reports the same default as a fresh one (the compat
-  // date decides), and the setter takes effect on this handle. A binary
-  // message still reaches `webSocketMessage` as an ArrayBuffer, whatever
-  // this says.
-  let binaryType = __cell.compat?.websocketStandardBinaryType
-    ? "blob"
-    : "arraybuffer";
-  return {
-    _hibernatable: true,
-    get binaryType() { return binaryType; },
-    set binaryType(value) {
-      if (value === "blob" || value === "arraybuffer") binaryType = value;
-    },
-    send: (data) => {
-      const bytes = __hostChunk(
-        data, "WebSocket.send accepts a string, ArrayBuffer, or view");
-      if (bytes !== null) __ws_send_binary(wsId, bytes);
-      else __ws_send(wsId, String(data));
-    },
-    close: (code = 1000, reason = "") => __ws_close(wsId, code, reason),
-  };
+  const socket = new WebSocket(Number(wsId));
+  const state = __wsState(socket);
+  state.accepted = true;
+  state.target = { id: state.id, scope: "" };
+  state.hibernatable = true;
+  return socket;
 };
 __cello.__wsOpen = async (scope, wsId, protocol) => {
   const actorEvent = __beginActorEvent(scope);
@@ -8404,8 +8650,8 @@ __cello.__wsMessage = async (scope, wsId, msg) => {
     const inst = await _readyInstance(scope);
     const socket = inst.__celloState._socket(wsId);
     await __ctxRun(ctxId, async () => {
-      if (!socket._hibernatable && typeof socket._dispatchMessage === "function")
-        socket._dispatchMessage(msg);
+      if (!__wsState(socket).hibernatable && socket instanceof WebSocket)
+        __wsHooks.dispatchMessage(socket, msg);
       else if (typeof inst.webSocketMessage === "function")
         await inst.webSocketMessage(socket, msg);
     });
@@ -8422,8 +8668,8 @@ __cello.__wsBinary = async (scope, wsId, data) => {
     const socket = inst.__celloState._socket(wsId);
     const bytes = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
     await __ctxRun(ctxId, async () => {
-      if (!socket._hibernatable && typeof socket._dispatchMessage === "function")
-        socket._dispatchMessage(bytes);
+      if (!__wsState(socket).hibernatable && socket instanceof WebSocket)
+        __wsHooks.dispatchMessage(socket, bytes);
       else if (typeof inst.webSocketMessage === "function")
         await inst.webSocketMessage(socket, bytes);
     });
@@ -8439,8 +8685,8 @@ __cello.__wsClosed = async (scope, wsId, code, reason, wasClean) => {
     const inst = await _readyInstance(scope);
     const socket = inst.__celloState._socket(wsId);
     await __ctxRun(ctxId, async () => {
-      if (!socket._hibernatable && typeof socket._dispatchClose === "function")
-        socket._dispatchClose(code, reason, wasClean);
+      if (!__wsState(socket).hibernatable && socket instanceof WebSocket)
+        __wsHooks.dispatchClose(socket, code, reason, wasClean);
       else if (!wasClean && typeof inst.webSocketError === "function")
         // A hibernatable socket reports an abnormal closure through
         // webSocketError, which cello listed as a handler name and never
@@ -8769,7 +9015,7 @@ const __queueEncode = (body, requestedType) => {
     }
     case "v8":
       try {
-        bytes = __sc_encode(body);
+        bytes = __scEncodeStrict(body);
       } catch (error) {
         throw __queueError("the message body cannot be cloned", error);
       }
@@ -10645,27 +10891,47 @@ const __d1BindValue = (value) => {
   throw error;
 };
 
+// The D1 interface objects publish their private-slot accessors here at
+// definition time; the statements and the database are defined in different
+// orders, so the object exists before any of them.
+const __d1Hooks = {};
+// The statement's text, parameters and owning database are private slots;
+// workerd's D1PreparedStatement exposes bind/first/run/all/raw only.
+let __d1StatementHooks;
+const __d1Statement = (statement) => __d1StatementHooks.slots(statement);
 class D1PreparedStatement {
+  #database;
+  #sql;
+  #params;
+  static #expose = (__d1StatementHooks = {
+    slots: (statement) => ({
+      sql: statement.#sql, params: statement.#params,
+    }),
+  });
   constructor(database, sql, params) {
-    Object.defineProperty(this, "_database", { value: database });
-    Object.defineProperty(this, "_sql", { value: sql });
-    Object.defineProperty(this, "_params", { value: params });
+    this.#database = database;
+    this.#sql = sql;
+    this.#params = params;
+    // Workerd's D1PreparedStatement carries its text and bound values as own
+    // enumerable data members; the slots above stay authoritative.
+    this.statement = sql;
+    this.params = params;
   }
   bind(...values) {
     return new D1PreparedStatement(
-      this._database,
-      this._sql,
+      this.#database,
+      this.#sql,
       values.map(__d1BindValue),
     );
   }
-  async _run(first) {
-    const results = await this._database._query([
-      { sql: this._sql, params: this._params, first },
+  async #run(first) {
+    const results = await __d1Query(this.#database, [
+      { sql: this.#sql, params: this.#params, first },
     ]);
     return results[0];
   }
   async all() {
-    const result = await this._run();
+    const result = await this.#run();
     return {
       success: true,
       meta: result.meta,
@@ -10678,7 +10944,7 @@ class D1PreparedStatement {
   async first(column) {
     // `first: true` keeps one row on the cell side, so only that row crosses
     // the isolate boundary and the row cap cannot fire for a first().
-    const result = await this._run(true);
+    const result = await this.#run(true);
     if (result.rows.length === 0) return null;
     const row = __d1Shape(result.columns, result.rows[0]);
     if (column === undefined) return row;
@@ -10694,13 +10960,12 @@ class D1PreparedStatement {
     return row[column];
   }
   async raw(options) {
-    const result = await this._run();
+    const result = await this.#run();
     return options && options.columnNames
       ? [result.columns, ...result.rows]
       : result.rows;
   }
 }
-
 // Object.fromEntries, not property assignment: assigning to a column named
 // `__proto__` would walk the prototype chain and silently drop the value,
 // while fromEntries defines an own property whatever the name.
@@ -10719,69 +10984,104 @@ const __d1PublicResult = (result) => ({
 const __d1PrimaryBookmark = "cello:primary";
 
 class D1DatabaseSession {
+  #database;
+  #bookmark;
+  static #expose = (() => {
+    __d1Hooks.sessionQuery = (session, statements) =>
+      session.#query(statements);
+    __d1Hooks.sessionBatch = (session, statements) =>
+      session.#batch(statements);
+  })();
   constructor(database, constraintOrBookmark) {
-    Object.defineProperty(this, "_database", { value: database });
+    this.#database = database;
     const value = constraintOrBookmark == null
       ? "first-unconstrained"
       : String(constraintOrBookmark).trim();
     if (!value) {
       throw new Error("D1_SESSION_ERROR: invalid bookmark or constraint");
     }
-    Object.defineProperty(this, "_bookmark", {
-      value: value === "first-primary" || value === "first-unconstrained" ? null : value,
-      writable: true,
-    });
+    this.#bookmark =
+      value === "first-primary" || value === "first-unconstrained"
+        ? null : value;
   }
-  _advanceBookmark() {
-    this._bookmark = __d1PrimaryBookmark;
+  #advanceBookmark() {
+    this.#bookmark = __d1PrimaryBookmark;
   }
-  async _query(statements) {
-    const results = await this._database._query(statements);
-    this._advanceBookmark();
+  async #query(statements) {
+    const results = await __d1Query(this.#database, statements);
+    this.#advanceBookmark();
     return results;
   }
   prepare(sql) {
     return new D1PreparedStatement(this, String(sql), []);
   }
-  async batch(statements) {
-    const results = await this._database._batch(statements);
-    this._advanceBookmark();
+  async #batch(statements) {
+    const results = await __d1Batch(this.#database, statements);
+    this.#advanceBookmark();
     return results;
   }
+  async batch(statements) {
+    return await this.#batch(statements);
+  }
   getBookmark() {
-    return this._bookmark;
+    return this.#bookmark;
   }
 }
 
 // Named so SDKs that sniff a binding by `constructor.name` recognise it.
+// D1 binding state and the cell RPC are private members; workerd's interface
+// exposes prepare/batch/exec/dump/withSession and the wrapped-binding tag only
+// (#206). The wrapped-binding prototype level is what workerd's D1 database
+// actually reflects: D1Database.prototype's parent is WrappedBinding.prototype,
+// which carries the tag the instance reports.
+const __d1Query = (target, statements) =>
+  target instanceof D1Database
+    ? __d1Hooks.query(target, statements)
+    : __d1Hooks.sessionQuery(target, statements);
+const __d1Batch = (target, statements) =>
+  target instanceof D1Database
+    ? __d1Hooks.batch(target, statements)
+    : __d1Hooks.sessionBatch(target, statements);
 class D1Database {
+  #databaseName;
+  static #expose = (() => {
+    __d1Hooks.query = (db, statements) => db.#query(statements);
+    __d1Hooks.batch = (db, statements) => db.#batch(statements);
+    // Test-only seam for the operator-gate suites; a shipping node has no
+    // such property, and the shape gate runs without CELLO_TEST_WAIT.
+    if (__test_wait_enabled()) {
+      Object.defineProperty(D1Database.prototype, "_stub", {
+        configurable: true, get() { return this.#stub; },
+      });
+    }
+  })();
   constructor(databaseName) {
-    Object.defineProperty(this, "_databaseName", { value: databaseName });
+    this.#databaseName = databaseName;
   }
   // Resolved per call rather than cached: a cell can move between calls, and
   // `getByName` is the same cost the Durable Object path already pays.
-  get _stub() {
-    return __cell.makeNamespace("__D1Database").getByName(this._databaseName);
+  get #stub() {
+    return __cell.makeNamespace("__D1Database").getByName(this.#databaseName);
   }
-  async _query(statements) {
+  async #query(statements) {
     try {
-      return await this._stub.__d1Query(statements);
+      return await this.#stub.__d1Query(statements);
     } catch (error) {
       if (__d1IsFamilyError(error && error.message)) throw error;
       throw __d1Error(String(error && error.message || error), error);
     }
   }
-  async _batch(statements) {
+  async #batch(statements) {
     // An empty statement set ran nothing, and upstream says so rather than
     // answering an empty result a caller reads as "every statement
     // succeeded".
     if (statements.length === 0) throw __d1Error("No SQL statements detected.");
     try {
       const encoded = statements.map((statement) => ({
-        sql: statement._sql,
-        params: statement._params,
+        sql: __d1Statement(statement).sql,
+        params: __d1Statement(statement).params,
       }));
-      const results = await this._stub.__d1Batch(encoded);
+      const results = await this.#stub.__d1Batch(encoded);
       return results.map(__d1PublicResult);
     } catch (error) {
       if (__d1IsFamilyError(error && error.message)) throw error;
@@ -10791,16 +11091,24 @@ class D1Database {
   prepare(sql) {
     return new D1PreparedStatement(this, String(sql), []);
   }
+  // Workerd defines query() but refuses it until the d1_binding_jsrpc compat
+  // flag is on; a cell does not implement that flag, so it refuses exactly as
+  // workerd does here.
+  query(_sql, _params) {
+    throw __d1Error(
+      "D1Database.query() requires the d1_binding_jsrpc compatibility " +
+      "flag. Enable d1_binding_jsrpc before calling query().");
+  }
   async exec(sql) {
     try {
-      return await this._stub.__d1Exec(String(sql));
+      return await this.#stub.__d1Exec(String(sql));
     } catch (error) {
       if (__d1IsFamilyError(error && error.message)) throw error;
       throw __d1Error(String(error && error.message || error), error);
     }
   }
   async batch(statements) {
-    return await this._batch(statements);
+    return await this.#batch(statements);
   }
   withSession(constraintOrBookmark) {
     return new D1DatabaseSession(this, constraintOrBookmark);
@@ -10812,6 +11120,14 @@ class D1Database {
     );
   }
 }
+
+// Workerd's shared parent for bindings that wrap a host object.
+function WrappedBinding() {}
+Object.defineProperty(WrappedBinding.prototype, Symbol.toStringTag, {
+  value: "WrappedBinding", configurable: true, writable: true,
+  enumerable: false,
+});
+Object.setPrototypeOf(D1Database.prototype, WrappedBinding.prototype);
 
 const __makeD1Database = __cello.__makeD1Database =
   (databaseName) => new D1Database(databaseName);
@@ -11133,7 +11449,7 @@ const __wfStepConfig = (config, name) => {
 // shrink it.
 const __wfEncodeValue = (value, what) => {
   try {
-    return __sc_encode(value);
+    return __scEncodeStrict(value);
   } catch (error) {
     const failure = __wfError(
       `${what} is not serializable: ${String(error && error.message || error)}. ` +
@@ -12527,12 +12843,18 @@ const __nodeStubFor = __cello.__nodeStubFor = (path) => {
   return stub;
 };
 __cello.__nodeStub = __nodeStubFor("node builtin");
+// Installed by the Event class below; EventTarget drives dispatch through it.
+// Both blocks share this module scope, and neither name is guest-visible.
+let __eventHooks;
 if (!globalThis.Event) {
+  // Internal dispatch hooks are module-private: workerd's Event prototype is
+  // the DOM surface only, and the reflection APIs must not name host helpers
+  // (#206). EventTarget reaches them through `__eventHooks`.
   globalThis.Event = class Event {
     // Private fields: stored in the object itself, so an Event costs no
     // side allocation and no defineProperty call at construction. The
     // public members are accessors because the DOM standard makes them
-    // read-only; EventTarget drives them through _begin/_end.
+    // read-only; EventTarget drives them through the hooks below.
     #type; #bubbles; #cancelable; #composed;
     #defaultPrevented = false;
     #eventPhase = 0;
@@ -12541,6 +12863,13 @@ if (!globalThis.Event) {
     // Workerd: events the runtime delivers are trusted; events a
     // script constructs and dispatches itself are not.
     #trusted = false;
+    static #expose = (__eventHooks = {
+      begin: (event, target) => event.#begin(target),
+      end: (event) => event.#end(),
+      trust: (event) => { event.#trusted = true; },
+      dispatching: (event) => event.#dispatching,
+      stopImmediate: (event) => event.#stopImmediate,
+    });
     constructor(type, init = {}) {
       if (arguments.length === 0)
         throw new TypeError(
@@ -12560,16 +12889,18 @@ if (!globalThis.Event) {
       this.#composed = !!options.composed;
     }
     get type() { return this.#type; }
+    get eventPhase() { return this.#eventPhase; }
+    get composed() { return this.#composed; }
     get bubbles() { return this.#bubbles; }
     get cancelable() { return this.#cancelable; }
-    get composed() { return this.#composed; }
     get defaultPrevented() { return this.#defaultPrevented; }
-    get eventPhase() { return this.#eventPhase; }
-    get target() { return this.#target; }
-    get currentTarget() { return this.#currentTarget; }
-    get isTrusted() { return this.#trusted; }
-    get timeStamp() { return 0; }
     get returnValue() { return !this.#defaultPrevented; }
+    get currentTarget() { return this.#currentTarget; }
+    get target() { return this.#target; }
+    // The DOM standard's legacy alias for target; workerd defines it.
+    get srcElement() { return this.#target; }
+    get timeStamp() { return 0; }
+    get isTrusted() { return this.#trusted; }
     // The one writable member, per the DOM standard.
     get cancelBubble() { return this.#stop; }
     set cancelBubble(value) { if (value) this.#stop = true; }
@@ -12582,11 +12913,7 @@ if (!globalThis.Event) {
       this.#stop = true;
       this.#stopImmediate = true;
     }
-    // Internal dispatch hooks used by EventTarget.
-    get _dispatching() { return this.#dispatching; }
-    get _stopImmediate() { return this.#stopImmediate; }
-    _trust() { this.#trusted = true; }
-    _begin(target) {
+    #begin(target) {
       this.#dispatching = true;
       this.#target = target;
       this.#currentTarget = target;
@@ -12597,7 +12924,7 @@ if (!globalThis.Event) {
     }
     // Workerd leaves currentTarget set after dispatch (the DOM standard
     // nulls it); only the phase is reset.
-    _end() {
+    #end() {
       this.#eventPhase = 0;
       this.#dispatching = false;
     }
@@ -12613,14 +12940,21 @@ if (!globalThis.Event) {
       Object.defineProperty(globalThis.Event.prototype, name, d);
     }
   }
+  __webidlTag(globalThis.Event, "Event");
+  __webidlPrototype(globalThis.Event);
+  __cello.$$trustEvent = (event) => __eventHooks.trust(event);
 }
 if (!globalThis.CustomEvent) {
   globalThis.CustomEvent = class CustomEvent extends Event {
+    #detail;
     constructor(type, init = {}) {
       super(type, init);
-      this.detail = init.detail === undefined ? null : init.detail;
+      this.#detail = init.detail === undefined ? null : init.detail;
     }
+    get detail() { return this.#detail; }
   };
+  __webidlTag(globalThis.CustomEvent, "CustomEvent");
+  __webidlPrototype(globalThis.CustomEvent);
 }
 if (!globalThis.ExtendableEvent) {
   // Exists as a type but is not constructable from user code.
@@ -12629,25 +12963,21 @@ if (!globalThis.ExtendableEvent) {
       throw new TypeError("Illegal constructor");
     }
   };
+  __webidlTag(globalThis.ExtendableEvent, "ExtendableEvent");
 }
 // An event-handler IDL attribute occupies one listener-list position. Replacing
 // its callback must retain that position, or listeners added after `onabort`
 // run before it and observe an order that differs from the web platform.
 const __eventHandlerEntry = Symbol("eventHandlerEntry");
-// Listener lists live beside the target, not on it: workerd's EventTarget
-// subclasses (Performance included) expose no own properties, and an own
-// `_listeners` field would put one on every one of them.
-const __eventListeners = new WeakMap();
-const __listenersOf = (target) => {
-  let list = __eventListeners.get(target);
-  if (list === undefined) __eventListeners.set(target, list = new Map());
-  return list;
-};
+// The listener map is a private slot on EventTarget (#206); these accessors are
+// installed when EventTarget is defined below and are the only way in.
+let __eventTargetListeners;
+const __eventListeners = (target) => __eventTargetListeners(target);
 const __getEventHandler = (target, type) =>
-  (__listenersOf(target).get(type) || [])
+  (__eventListeners(target).get(type) || [])
     .find((entry) => entry[__eventHandlerEntry])?.callback ?? null;
 const __setEventHandler = (target, type, callback) => {
-  const listeners = __listenersOf(target);
+  const listeners = __eventListeners(target);
   const list = listeners.get(type) || [];
   const entry = list.find((item) => item[__eventHandlerEntry]);
   if (typeof callback !== "function") {
@@ -12663,6 +12993,8 @@ const __setEventHandler = (target, type, callback) => {
 };
 if (!globalThis.EventTarget) {
   globalThis.EventTarget = class EventTarget {
+    #listeners = new Map();
+    static #expose = (__eventTargetListeners = (target) => target.#listeners);
     addEventListener(type, callback, options = {}) {
       if (callback === null || callback === undefined) return;
       if (typeof callback !== "function" &&
@@ -12681,11 +13013,14 @@ if (!globalThis.EventTarget) {
       const signal = object ? options.signal : undefined;
       if (signal && signal.aborted) return;
       const key = String(type);
-      const listeners = __listenersOf(this);
-      const list = listeners.get(key) || [];
+      const list = this.#listeners.get(key) || [];
       if (list.some((e) => e.callback === callback)) return;
       list.push({ callback, once: object && !!options.once });
-      listeners.set(key, list);
+      this.#listeners.set(key, list);
+      // A type may react to its first listener (MessagePort starts on
+      // addEventListener("message")); the hook is installed by message_channel.
+      const added = __cello.$$listenerAdded;
+      if (typeof added === "function") added(this, key);
       if (signal)
         signal.addEventListener("abort", () =>
           this.removeEventListener(key, callback), { once: true });
@@ -12696,7 +13031,7 @@ if (!globalThis.EventTarget) {
         throw new TypeError(
           "Cells does not support the 'capture' option on " +
           "removeEventListener().");
-      const list = __listenersOf(this).get(String(type));
+      const list = this.#listeners.get(String(type));
       if (!list) return;
       const index = list.findIndex((e) => e.callback === callback);
       if (index >= 0) list.splice(index, 1);
@@ -12704,15 +13039,14 @@ if (!globalThis.EventTarget) {
     dispatchEvent(event) {
       if (!(event instanceof Event))
         throw new TypeError("argument is not an Event");
-      if (event._dispatching)
+      if (__eventHooks.dispatching(event))
         throw new DOMException(
           "The event is already being dispatched.",
           "InvalidStateError");
-      event._begin(this);
-      const listeners = __listenersOf(this);
+      __eventHooks.begin(event, this);
       // Copy: a listener may add or remove listeners mid-dispatch.
-      for (const item of (listeners.get(event.type) || []).slice()) {
-        if (event._stopImmediate) break;
+      for (const item of (this.#listeners.get(event.type) || []).slice()) {
+        if (__eventHooks.stopImmediate(event)) break;
         if (item.once)
           this.removeEventListener(event.type, item.callback);
         if (typeof item.callback === "function")
@@ -12720,16 +13054,19 @@ if (!globalThis.EventTarget) {
         else item.callback.handleEvent(event);
       }
       const handler = this["on" + event.type];
-      const hasEventHandler = (listeners.get(event.type) || [])
+      const hasEventHandler = (this.#listeners.get(event.type) || [])
         .some((item) => item[__eventHandlerEntry]);
-      if (!hasEventHandler && !event._stopImmediate &&
+      if (!hasEventHandler && !__eventHooks.stopImmediate(event) &&
           typeof handler === "function")
         handler.call(this, event);
-      event._end();
+      __eventHooks.end(event);
       return !event.defaultPrevented;
     }
   };
+  __webidlTag(globalThis.EventTarget, "EventTarget");
+  __webidlPrototype(globalThis.EventTarget);
 }
+
 // The global scope is itself an EventTarget.
 if (typeof globalThis.addEventListener !== "function") {
   const globalTarget = new EventTarget();
@@ -12817,9 +13154,10 @@ if (!globalThis.MessageEvent) {
 }
 if (!globalThis.CloseEvent) {
   globalThis.CloseEvent = class CloseEvent extends Event {
+    // Own enumerable data members in workerd's order (#206).
     constructor(type, init = {}) {
       super(type, init);
-      this.code = Number(init.code || 0);
+      this.wasClean = !!init.wasClean;
       // `reason` is a USVString: a lone surrogate becomes U+FFFD rather than
       // travelling as an unpaired code unit.
       this.reason = String(init.reason || "").toWellFormed
@@ -12836,21 +13174,84 @@ if (!globalThis.CloseEvent) {
             return paired ? unit : "\uFFFD";
           },
         );
-      this.wasClean = !!init.wasClean;
+      this.code = Number(init.code || 0);
     }
   };
+  __webidlTag(globalThis.CloseEvent, "CloseEvent");
+  __webidlPrototype(globalThis.CloseEvent);
+}
+if (!globalThis.ErrorEvent) {
+  globalThis.ErrorEvent = class ErrorEvent extends Event {
+    #message; #filename; #lineno; #colno; #error;
+    constructor(type, init = {}) {
+      super(type, init);
+      this.#message = String(init.message ?? "");
+      this.#filename = String(init.filename ?? "");
+      this.#lineno = Number(init.lineno ?? 0);
+      this.#colno = Number(init.colno ?? 0);
+      this.#error = init.error;
+    }
+    get message() { return this.#message; }
+    get filename() { return this.#filename; }
+    get lineno() { return this.#lineno; }
+    get colno() { return this.#colno; }
+    get error() { return this.#error; }
+  };
+  __webidlTag(globalThis.ErrorEvent, "ErrorEvent");
+  __webidlPrototype(globalThis.ErrorEvent);
 }
 if (!globalThis.DOMException) {
   const __domExceptionInstances = new __primWeakSet();
   __cello.__isDOMExceptionInstance = (value) =>
     __weakSetHas(__domExceptionInstances, value);
-  globalThis.DOMException = class DOMException extends Error {
-    constructor(message = "", name = "Error") {
-      super(message);
-      this.name = name;
-      __weakSetAdd(__domExceptionInstances, this);
-    }
+  // The legacy `code` member maps the error name to its constant, per
+  // WebIDL; names outside the table (and every modern name) are 0.
+  const legacy = {
+    IndexSizeError: 1, HierarchyRequestError: 3, WrongDocumentError: 4,
+    InvalidCharacterError: 5, NoModificationAllowedError: 7,
+    NotFoundError: 8, NotSupportedError: 9, InUseAttributeError: 10,
+    InvalidStateError: 11, SyntaxError: 12, InvalidModificationError: 13,
+    NamespaceError: 14, InvalidAccessError: 15, TypeMismatchError: 17,
+    SecurityError: 18, NetworkError: 19, AbortError: 20,
+    URLMismatchError: 21, QuotaExceededError: 22, TimeoutError: 23,
+    InvalidNodeTypeError: 24, DataCloneError: 25,
   };
+  // A function, not a class extending Error: workerd's interface object
+  // inherits no Error static (`DOMException.captureStackTrace` is undefined),
+  // and a class's [[Prototype]] cannot be moved off Error without breaking
+  // `super()` (#207). Constructing through Error with `new.target` keeps
+  // `instanceof Error`, the stack and subclassing.
+  const __domExceptionStacks = new __primWeakMap();
+  globalThis.DOMException = function DOMException(message = "", name = "Error") {
+    if (new.target === undefined)
+      throw new TypeError(
+        "Failed to construct 'DOMException': Please use the 'new' operator.");
+    const instance = __primConstruct(Error, [message], new.target);
+    // Workerd's own shape (#207): enumerable data members in the order
+    // code, name, message, and an enumerable accessor for stack. Error
+    // already created `message` and `stack` own properties, and redefining
+    // one keeps its insertion position, so `message` is removed first and
+    // both are re-added in order. The stack string is read after `name` is
+    // set, because V8 formats its header from the error's name.
+    delete instance.message;
+    instance.code = legacy[name] ?? 0;
+    instance.name = name;
+    __primDefineProp(instance, "message", {
+      value: String(message), writable: true, enumerable: true,
+      configurable: true,
+    });
+    const stack = instance.stack;
+    delete instance.stack;
+    __weakSet(__domExceptionStacks, instance, stack);
+    __primDefineProp(instance, "stack", {
+      enumerable: true, configurable: true,
+      get() { return __weakGet(__domExceptionStacks, this); },
+      set(value) { __weakSet(__domExceptionStacks, this, value); },
+    });
+    __weakSetAdd(__domExceptionInstances, instance);
+    return instance;
+  };
+  Object.setPrototypeOf(globalThis.DOMException.prototype, Error.prototype);
   // WebIDL legacy code constants, enumerable on both the interface
   // object and its prototype, in spec order.
   {
@@ -12875,23 +13276,8 @@ if (!globalThis.DOMException) {
       Object.defineProperty(globalThis.DOMException, name, d);
       Object.defineProperty(globalThis.DOMException.prototype, name, d);
     }
-    // The legacy `code` member maps the error name to its constant, per
-    // WebIDL; names outside the table (and every modern name) are 0.
-    const legacy = {
-      IndexSizeError: 1, HierarchyRequestError: 3, WrongDocumentError: 4,
-      InvalidCharacterError: 5, NoModificationAllowedError: 7,
-      NotFoundError: 8, NotSupportedError: 9, InUseAttributeError: 10,
-      InvalidStateError: 11, SyntaxError: 12, InvalidModificationError: 13,
-      NamespaceError: 14, InvalidAccessError: 15, TypeMismatchError: 17,
-      SecurityError: 18, NetworkError: 19, AbortError: 20,
-      URLMismatchError: 21, QuotaExceededError: 22, TimeoutError: 23,
-      InvalidNodeTypeError: 24, DataCloneError: 25,
-    };
-    Object.defineProperty(globalThis.DOMException.prototype, "code", {
-      get() { return legacy[this.name] ?? 0; },
-      enumerable: true, configurable: true,
-    });
   }
+  __webidlTag(globalThis.DOMException, "DOMException");
 }
 // The realm's DOMException, captured before tenant code can replace the
 // global: error classification must not follow a Worker's own global.
@@ -12901,10 +13287,20 @@ const __primDOMException = globalThis.DOMException;
 __cello.__primDOMException = __primDOMException;
 if (!globalThis.AbortSignal) {
   const __abortBrand = Symbol("abortSignal");
+  // A constructed signal is the only thing the clone codec may refuse as one;
+  // a forged prototype flattens to plain data (#221).
+  const __abortSignalInstances = new __primWeakSet();
+  __cello.$$isAbortSignalInstance = (value) =>
+    __weakSetHas(__abortSignalInstances, value);
   globalThis.AbortSignal = class AbortSignal extends EventTarget {
-    // The Headers/Blob clone-poisoning brand: V8's structured
-    // clone throws on functions, so a live signal reaches the
-    // RPC lift instead of silently flattening to plain data.
+    #aborted = false;
+    #reason;
+    static #expose = (__abortSignalImpl = (signal, reason) => {
+      if (signal.#aborted) return;
+      signal.#aborted = true;
+      signal.#reason = reason;
+      signal.dispatchEvent(new Event("abort"));
+    });
     constructor() {
       // Per spec AbortSignal has no constructor: it is only reachable
       // through AbortController, AbortSignal.abort/timeout/any. The internal
@@ -12913,11 +13309,11 @@ if (!globalThis.AbortSignal) {
         throw new TypeError("Illegal constructor");
       }
       super();
-      this.aborted = false;
-      this.reason = undefined;
-      this.__celloHost = __rpcNoClone;
+      __weakSetAdd(__abortSignalInstances, this);
     }
-    throwIfAborted() { if (this.aborted) throw this.reason; }
+    get aborted() { return this.#aborted; }
+    get reason() { return this.#reason; }
+    throwIfAborted() { if (this.#aborted) throw this.#reason; }
     static abort(reason = new DOMException("The operation was aborted", "AbortError")) {
       const c = new AbortController(); c.abort(reason); return c.signal;
     }
@@ -12958,7 +13354,7 @@ if (!globalThis.AbortSignal) {
       return c.signal;
     }
   };
-  Object.defineProperty(globalThis.AbortSignal.prototype, "onabort", {
+  __primDefineProp(globalThis.AbortSignal.prototype, "onabort", {
     configurable: true,
     enumerable: true,
     get() {
@@ -12972,36 +13368,53 @@ if (!globalThis.AbortSignal) {
       __setEventHandler(this, "abort", value);
     },
   });
+  __webidlTag(globalThis.AbortSignal, "AbortSignal");
+  __webidlPrototype(globalThis.AbortSignal);
+  __webidlStatics(globalThis.AbortSignal);
+  __webidlLength(globalThis.AbortSignal);
+  __cello.$$abortSignal = __abortSignal;
   globalThis.AbortController = class AbortController {
-    constructor() { this.signal = new AbortSignal(__abortBrand); }
+    #signal;
+    constructor() { this.#signal = new AbortSignal(__abortBrand); }
+    get signal() { return this.#signal; }
     abort(reason = new DOMException("The operation was aborted", "AbortError")) {
-      __abortSignal(this.signal, reason);
+      __abortSignal(this.#signal, reason);
     }
   };
+  __webidlTag(globalThis.AbortController, "AbortController");
+  __webidlPrototype(globalThis.AbortController);
+  __webidlLength(globalThis.AbortController);
 }
 if (!globalThis.Blob) {
-  // Same clone-poisoning brand as Headers: an enumerable
-  // function-valued property makes V8's structured clone throw, so
-  // a Blob reaches the RPC lift instead of silently flattening.
-  const __blobNoClone = () => {};
   // A constructed Blob is the only thing the clone codec may treat as one;
-  // a guest can reach `Blob.prototype` but not this set.
+  // a guest can reach `Blob.prototype` but not this set (#221). The bytes,
+  // size and type are private slots, so a Worker sees the Blob surface only
+  // (#170, #206).
   const __blobInstances = new __primWeakSet();
   __cello.__isBlobInstance = (value) => __weakSetHas(__blobInstances, value);
   globalThis.Blob = class Blob {
+    #bytes; #size = 0; #type = "";
+    static #expose = (() => {
+      __cello.$$blobBytes = (blob) => blob.#bytes;
+      __cello.$$setBlobBytes = (blob, bytes) => {
+        blob.#bytes = bytes;
+        blob.#size = bytes.byteLength;
+      };
+      // blob() re-serializes the content-type, so the type must be stored
+      // verbatim rather than through the constructor's lower-casing.
+      __cello.$$setBlobType = (blob, type) => {
+        blob.#type = type;
+      };
+    })();
     constructor(parts = [], options = {}) {
-      // size is assigned before type so both land in the order the
-      // inspect output below reports them.
       if (options && options.endings !== undefined)
         throw new Error(
           "The 'endings' field on 'Options' is not implemented.");
-      this.size = 0;
       // A type outside U+0020..U+007E is not a valid MIME type and is
       // dropped rather than stored.
       const rawType = String(options.type || "");
-      this.type = /^[\u0020-\u007e]*$/.test(rawType)
+      this.#type = /^[\u0020-\u007e]*$/.test(rawType)
         ? rawType.toLowerCase() : "";
-      this.__celloHost = __blobNoClone;
       __weakSetAdd(__blobInstances, this);
       // Two passes. First convert every part in order -- string
       // conversion runs user code (Symbol.toPrimitive), which may
@@ -13014,7 +13427,7 @@ if (!globalThis.Blob) {
       // argument limit on multi-megabyte parts.
       const sources = [];
       for (const part of parts) {
-        if (part instanceof Blob) sources.push(part._bytes);
+        if (part instanceof Blob) sources.push(__cello.$$blobBytes(part));
         else if (part instanceof ArrayBuffer ||
                  ArrayBuffer.isView(part)) sources.push(part);
         else sources.push(new TextEncoder().encode(String(part)));
@@ -13038,18 +13451,16 @@ if (!globalThis.Blob) {
         bytes.set(chunk, offset);
         offset += chunk.byteLength;
       }
-      // Non-enumerable: the backing store is not part of the object's
-      // observable shape (inspect, JSON, spread).
-      Object.defineProperty(this, "_bytes", {
-        value: bytes, writable: true, configurable: true,
-      });
-      this.size = total;
+      this.#bytes = bytes;
+      this.#size = total;
     }
-    async arrayBuffer() { return this._bytes.slice().buffer; }
-    async bytes() { return this._bytes.slice(); }
-    async text() { return new TextDecoder().decode(this._bytes); }
+    get size() { return this.#size; }
+    get type() { return this.#type; }
+    async arrayBuffer() { return this.#bytes.slice().buffer; }
+    async bytes() { return this.#bytes.slice(); }
+    async text() { return new TextDecoder().decode(this.#bytes); }
     stream() {
-      const bytes = this._bytes;
+      const bytes = this.#bytes;
       return new ReadableStream({
         start(controller) {
           if (bytes.byteLength) controller.enqueue(bytes.slice());
@@ -13067,10 +13478,11 @@ if (!globalThis.Blob) {
       };
       const a = norm(start, 0), b = norm(end, this.size);
       return new Blob(
-        [this._bytes.subarray(a, Math.max(a, b))], { type });
+        [this.#bytes.subarray(a, Math.max(a, b))], { type });
     }
-    get [Symbol.toStringTag]() { return "Blob"; }
   };
+  __webidlTag(globalThis.Blob, "Blob");
+  __webidlPrototype(globalThis.Blob);
 }
 if (!globalThis.File) {
   const __fileInstances = new __primWeakSet();
@@ -13101,19 +13513,14 @@ if (!globalThis.File) {
     }
     get name() { return this.#name; }
     get lastModified() { return this.#lastModified; }
-    get [Symbol.toStringTag]() { return "File"; }
     [Symbol.for("nodejs.util.inspect.custom")]() {
       return `File { name: '${this.name}', ` +
         `lastModified: ${this.lastModified}, size: ${this.size}, ` +
         `type: '${this.type}' }`;
     }
   };
-  for (const key of ["name", "lastModified"]) {
-    const desc =
-      Object.getOwnPropertyDescriptor(File.prototype, key);
-    desc.enumerable = true;
-    Object.defineProperty(File.prototype, key, desc);
-  }
+  __webidlTag(globalThis.File, "File");
+  __webidlPrototype(globalThis.File);
 }
 if (!globalThis.FormData) {
 // Byte offsets the multipart scanner compares against. A part body is
@@ -13310,11 +13717,20 @@ __cello.__parseFormData = (bytes, contentType) => {
       },
     );
   };
+  // The entry list is a private slot: `Object.keys(new FormData())` used to
+  // expose the live backing array, so a worker could forge entries by
+  // pushing into it (#170, #206).
+  const __formDataInstances = new __primWeakSet();
+  __cello.$$isFormDataInstance = (value) =>
+    __weakSetHas(__formDataInstances, value);
   globalThis.FormData = class FormData {
-    constructor() { this._entries = []; }
+    #entries = [];
+    constructor() {
+      __weakSetAdd(__formDataInstances, this);
+    }
     append(name, value, filename) {
       const key = String(name);
-      this._entries.push(
+      this.#entries.push(
         [key, __formDataValue(value, filename, key)]);
     }
     set(name, value, filename) {
@@ -13322,47 +13738,47 @@ __cello.__parseFormData = (bytes, contentType) => {
       value = __formDataValue(value, filename, key);
       // Spec: replace the first match in place, keeping its position,
       // and drop any later matches.
-      const first = this._entries.findIndex(([k]) => k === key);
-      if (first < 0) { this._entries.push([key, value]); return; }
-      this._entries[first] = [key, value];
-      for (let i = this._entries.length - 1; i > first; i--)
-        if (this._entries[i][0] === key) this._entries.splice(i, 1);
+      const first = this.#entries.findIndex(([k]) => k === key);
+      if (first < 0) { this.#entries.push([key, value]); return; }
+      this.#entries[first] = [key, value];
+      for (let i = this.#entries.length - 1; i > first; i--)
+        if (this.#entries[i][0] === key) this.#entries.splice(i, 1);
     }
     get(name) {
-      const row = this._entries.find(([key]) => key === String(name));
+      const row = this.#entries.find(([key]) => key === String(name));
       return row ? row[1] : null;
     }
     getAll(name) {
-      return this._entries.filter(([key]) => key === String(name)).map(([, value]) => value);
+      return this.#entries.filter(([key]) => key === String(name)).map(([, value]) => value);
     }
-    has(name) { return this._entries.some(([key]) => key === String(name)); }
+    has(name) { return this.#entries.some(([key]) => key === String(name)); }
     delete(name) {
       const key = String(name);
       // Splice in place: the iterators below read the live list, so the
       // array identity must survive a delete during iteration.
-      for (let i = this._entries.length - 1; i >= 0; i--)
-        if (this._entries[i][0] === key) this._entries.splice(i, 1);
+      for (let i = this.#entries.length - 1; i >= 0; i--)
+        if (this.#entries[i][0] === key) this.#entries.splice(i, 1);
     }
     // Iteration is live: the iterator holds an index and re-reads the
     // entry list, so entries appended during iteration are visited and
     // an exhausted iterator resumes if entries are added later. A
     // generator cannot do this -- once it returns it is done forever.
-    _iterate(pick) {
+    #iterate(pick) {
       const self = this;
       let index = 0;
       const iterator = {
         next() {
-          if (index >= self._entries.length)
+          if (index >= self.#entries.length)
             return { value: undefined, done: true };
-          return { value: pick(self._entries[index++]), done: false };
+          return { value: pick(self.#entries[index++]), done: false };
         },
         [Symbol.iterator]() { return iterator; },
       };
       return iterator;
     }
-    entries() { return this._iterate((e) => [e[0], e[1]]); }
-    keys() { return this._iterate((e) => e[0]); }
-    values() { return this._iterate((e) => e[1]); }
+    entries() { return this.#iterate((e) => [e[0], e[1]]); }
+    keys() { return this.#iterate((e) => e[0]); }
+    values() { return this.#iterate((e) => e[1]); }
     [Symbol.iterator]() { return this.entries(); }
     forEach(callback, thisArg) {
       if (typeof callback !== "function")
@@ -13373,21 +13789,24 @@ __cello.__parseFormData = (bytes, contentType) => {
         callback.call(thisArg, value, key, this);
     }
   };
+  // WebIDL enumerability, the interface tag and a zero-length constructor,
+  // matching workerd's reflected shape (#171, #206).
+  for (const key of Object.getOwnPropertyNames(FormData.prototype)) {
+    if (key === "constructor") continue;
+    const descriptor = Object.getOwnPropertyDescriptor(FormData.prototype, key);
+    if (descriptor === undefined || descriptor.enumerable) continue;
+    descriptor.enumerable = true;
+    Object.defineProperty(FormData.prototype, key, descriptor);
+  }
+  Object.defineProperty(FormData.prototype, Symbol.toStringTag, {
+    value: "FormData", configurable: true, writable: true, enumerable: false,
+  });
+  Object.defineProperty(FormData, "length", {
+    value: 0, configurable: true, writable: false,
+  });
 }
 // Node's Buffer lives in src/js/node_buffer.js, compiled
 // lazily (LAZY_GLOBALS / LAZY_MODULES) on first use.
-if (!globalThis.ErrorEvent) {
-  globalThis.ErrorEvent = class ErrorEvent extends Event {
-    constructor(type, init = {}) {
-      super(type, init);
-      this.message = String(init.message ?? "");
-      this.filename = String(init.filename ?? "");
-      this.lineno = Number(init.lineno ?? 0);
-      this.colno = Number(init.colno ?? 0);
-      this.error = init.error;
-    }
-  };
-}
 // Web API globals a real bundle references at module scope but that the
 // prelude doesn't provide. Stub as empty classes (guarded so we never
 // clobber a real prelude implementation). Enough to LOAD; every name in
@@ -13415,9 +13834,25 @@ for (const n of ["BroadcastChannel"]) {
   };
 }
 const __sockets = __cello.__sockets = new Map();
+// Installed by the class below; the runtime's own paths (the DO hibernation
+// hooks, the response and pair plumbing) drive a socket through these, so no
+// host helper and no host field is a guest-visible member (#206).
+let __wsHooks;
+const __wsState = (ws) => __wsHooks.state(ws);
 globalThis.WebSocket = class WebSocket extends EventTarget {
+  #s;
+  static #expose = (__wsHooks = {
+    state: (ws) => ws.#s,
+    dispatchMessage: (ws, data) => ws.#dispatchMessage(data),
+    dispatchClose: (ws, code, reason, wasClean) =>
+      ws.#dispatchClose(code, reason, wasClean),
+    flushPending: (ws) => ws.#flushPending(),
+    flushToPeer: (ws) => ws.#flushToPeer(),
+    startPump: (ws) => ws.#startPump(),
+  });
   // The spec names, which workerd exposes and real bundles use. cello only
-  // had the READY_STATE_* aliases, which no other runtime defines.
+  // had the READY_STATE_* aliases, which no other runtime defines. Static
+  // fields are enumerable, as workerd's interface statics are.
   static CONNECTING = 0;
   static OPEN = 1;
   static CLOSING = 2;
@@ -13434,39 +13869,47 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
     // operation goes out through `__ws_*` on this id rather than to a peer
     // in this heap.
     const outbound = dialed || boundTarget !== null;
-    this._outbound = outbound;
-    this._boundTarget = boundTarget;
-    this._bound = false;
-    this._pendingClose = null;
-    this._id = outbound ? __ws_alloc() : Number(id);
-    this._attachment = undefined;
-    this._target = null;
-    this._accepted = false;
-    // Accepting for hibernation is a second, distinct acceptance: workerd
-    // refuses `acceptWebSocket()` once either form ran.
-    this._hibernationAccepted = false;
-    this._hibernatable = false;
-    this._pending = [];
-    // The other end of an in-isolate upgrade (a WebSocketPair served
-    // over a same-script service binding); frames route to it
-    // directly instead of through the host connection.
-    this._loopback = null;
-    this.readyState = outbound ? 0 : 1;
-    this._binaryType = __cell.compat?.websocketStandardBinaryType
-      ? "blob"
-      : "arraybuffer";
-    // A server-side socket has no URL, and reports null rather than an empty
-    // string -- workerd's inspect output pins this. A socket that came back
-    // from an upgrade has none either: nothing in this isolate dialed it.
-    this.url = dialed ? id : null;
-    this.protocol = "";
-    this.extensions = "";
+    this.#s = {
+      outbound,
+      boundTarget,
+      bound: false,
+      pendingClose: null,
+      id: outbound ? __ws_alloc() : Number(id),
+      attachment: undefined,
+      target: null,
+      accepted: false,
+      // Accepting for hibernation is a second, distinct acceptance:
+      // workerd refuses `acceptWebSocket()` once either form ran.
+      hibernationAccepted: false,
+      hibernatable: false,
+      pending: [],
+      // The other end of an in-isolate upgrade (a WebSocketPair served over
+      // a same-script service binding); frames route to it directly instead
+      // of through the host connection.
+      loopback: null,
+      peer: null,
+      tags: [],
+      polled: false,
+      pumping: false,
+      readyState: outbound ? 0 : 1,
+      binaryType: __cell.compat?.websocketStandardBinaryType
+        ? "blob"
+        : "arraybuffer",
+      // A server-side socket has no URL, and reports null rather than an
+      // empty string -- workerd's inspect output pins this. A socket that
+      // came back from an upgrade has none either: nothing in this isolate
+      // dialed it.
+      url: dialed ? id : null,
+      protocol: "",
+      extensions: "",
+    };
+    const state = this.#s;
     if (boundTarget !== null) {
       // The caller drives this socket itself, exactly as a Worker drives one
       // it opened. The host pipe is not built until `accept()`, so a
       // response passed straight back out is left alone.
-      this._polled = true;
-      this._target = boundTarget;
+      state.polled = true;
+      state.target = boundTarget;
     }
     if (dialed) {
       // workerd validates the URL in the constructor and throws
@@ -13490,7 +13933,7 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
       // and it lives and dies with the request, which is the lifetime
       // Cloudflare gives one too.
       const scope = __currentActorScope();
-      this._polled = !scope;
+      state.polled = !scope;
       const requested = typeof protocols === "string"
         ? [protocols]
         : Array.from(protocols, String);
@@ -13508,29 +13951,43 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
           "WebSocket Constructor: The subprotocols must be unique.",
           "SyntaxError");
       }
-      __sockets.set(this._id, this);
-      const connection = __ws_connect(this._id, scope, id, JSON.stringify(requested));
+      __sockets.set(state.id, this);
+      const connection = __ws_connect(state.id, scope, id, JSON.stringify(requested));
       __registerWaitUntil(connection);
-      if (this._polled) this._startPump();
+      if (state.polled) this.#startPump();
       connection.then((protocol) => {
-        if (this.readyState === WebSocket.READY_STATE_CLOSING) {
-          if (this._pendingClose) {
-            const [code, reason] = this._pendingClose;
-            __ws_close(this._id, code, reason);
+        if (state.readyState === WebSocket.READY_STATE_CLOSING) {
+          if (state.pendingClose) {
+            const [code, reason] = state.pendingClose;
+            __ws_close(state.id, code, reason);
           }
           return;
         }
-        if (this.readyState !== WebSocket.READY_STATE_CONNECTING) return;
-        this.protocol = protocol;
-        this.readyState = WebSocket.READY_STATE_OPEN;
+        if (state.readyState !== WebSocket.READY_STATE_CONNECTING) return;
+        state.protocol = protocol;
+        state.readyState = WebSocket.READY_STATE_OPEN;
         this.dispatchEvent(new Event("open"));
       }, (error) => {
-        this.readyState = WebSocket.READY_STATE_CLOSED;
-        __sockets.delete(this._id);
+        state.readyState = WebSocket.READY_STATE_CLOSED;
+        __sockets.delete(state.id);
         this.dispatchEvent(new ErrorEvent("error", { message: String(error?.message || error), error }));
-        this._dispatchClose(1006, "", false);
+        this.#dispatchClose(1006, "", false);
       });
     }
+  }
+  get readyState() { return this.#s.readyState; }
+  // No frame is buffered across the host op: send() either reaches the host
+  // synchronously or queues on an unbound pair, so workerd's always-zero
+  // answer is the honest one.
+  get bufferedAmount() { return 0; }
+  get url() { return this.#s.url; }
+  get protocol() { return this.#s.protocol; }
+  get extensions() { return this.#s.extensions; }
+  get binaryType() { return this.#s.binaryType; }
+  // The spec ignores an unrecognised value rather than throwing.
+  set binaryType(value) {
+    if (value === "blob" || value === "arraybuffer")
+      this.#s.binaryType = value;
   }
   // The pump ends only when the socket closes, so it must NOT be registered
   // as waitUntil work: that would hold the request open for as long as the
@@ -13538,99 +13995,100 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
   // request has retired. Its `__ws_next` ops are driven while the request
   // runs and normally resolve with the host's 1001 "request ended" close.
   // They resolve as 1006 only if the sender disappears without a close frame.
-  _startPump() {
-    if (this._pumping) return;
-    this._pumping = true;
-    this._pump().catch(() => {});
+  #startPump() {
+    const state = this.#s;
+    if (state.pumping) return;
+    state.pumping = true;
+    this.#pump().catch(() => {});
   }
   // Drain the host queue for an isolate-polled socket. Each `__ws_next` is an
   // ordinary async op the request owns; a request that retires with the
   // socket still open closes it, which ends this loop with a close frame.
-  async _pump() {
+  async #pump() {
+    const state = this.#s;
     for (;;) {
-      const frame = await __ws_next(this._id);
+      const frame = await __ws_next(state.id);
       const tag = frame[0];
       const body = frame.subarray(1);
       if (tag === 0) {
-        this._dispatchMessage(new TextDecoder().decode(body));
+        this.#dispatchMessage(new TextDecoder().decode(body));
       } else if (tag === 1) {
-        this._dispatchMessage(
+        this.#dispatchMessage(
           body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength),
         );
       } else if (tag === 2) {
-        if (this.readyState === WebSocket.READY_STATE_CONNECTING) {
-          this.protocol = new TextDecoder().decode(body);
-          this.readyState = WebSocket.READY_STATE_OPEN;
+        if (state.readyState === WebSocket.READY_STATE_CONNECTING) {
+          state.protocol = new TextDecoder().decode(body);
+          state.readyState = WebSocket.READY_STATE_OPEN;
           this.dispatchEvent(new Event("open"));
         }
       } else {
         const info = JSON.parse(new TextDecoder().decode(body));
-        this._dispatchClose(info.code, info.reason, info.wasClean);
+        this.#dispatchClose(info.code, info.reason, info.wasClean);
         return;
       }
     }
   }
   // Deliver whatever this end queued before it had somewhere to send.
-  _flushToPeer() {
-    const peer = this._loopback;
+  #flushToPeer() {
+    const state = this.#s;
+    const peer = state.loopback;
     if (!peer) return;
-    for (const frame of this._pending.splice(0)) {
+    for (const frame of state.pending.splice(0)) {
       if (frame[0] === "send") {
-        queueMicrotask(() => peer._dispatchMessage(frame[1]));
+        queueMicrotask(() => __wsHooks.dispatchMessage(peer, frame[1]));
       } else if (frame[0] === "send-binary") {
         const data = frame[1];
         const bytes = data instanceof ArrayBuffer
           ? data
           : data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
-        queueMicrotask(() => peer._dispatchMessage(bytes));
+        queueMicrotask(() => __wsHooks.dispatchMessage(peer, bytes));
       } else {
-        queueMicrotask(() => peer._dispatchClose(frame[1], frame[2], true));
+        queueMicrotask(() =>
+          __wsHooks.dispatchClose(peer, frame[1], frame[2], true));
       }
     }
   }
-  get binaryType() { return this._binaryType; }
-  // The spec ignores an unrecognised value rather than throwing.
-  set binaryType(value) {
-    if (value === "blob" || value === "arraybuffer") this._binaryType = value;
-  }
   accept() {
-    this._accepted = true;
+    const state = this.#s;
+    state.accepted = true;
     // A pair used directly, without being returned through a 101 response,
     // still has to carry frames once both ends are accepted. cello only
     // linked a pair on the upgrade path, so such a pair queued forever.
-    if (this._peer && this._peer._accepted && !this._loopback) {
-      this._loopback = this._peer;
-      this._peer._loopback = this;
-      this._flushToPeer();
-      this._peer._flushToPeer();
+    if (state.peer && __wsState(state.peer).accepted && !state.loopback) {
+      state.loopback = state.peer;
+      __wsState(state.peer).loopback = this;
+      this.#flushToPeer();
+      __wsHooks.flushToPeer(state.peer);
     }
     // A socket obtained from a `fetch()` upgrade is already connected and
     // delivers nothing until it is accepted; this is where it starts.
-    if (this._outbound && this.readyState === WebSocket.READY_STATE_CONNECTING) {
+    if (state.outbound && state.readyState === WebSocket.READY_STATE_CONNECTING) {
       // Bind before the pump: the op registers this socket's queue on this
       // thread, so the first `__ws_next` cannot run ahead of it.
-      if (this._boundTarget !== null && !this._bound) {
-        this._bound = true;
+      if (state.boundTarget !== null && !state.bound) {
+        state.bound = true;
         __ws_bind_target(
-          this._id,
-          JSON.stringify(this._boundTarget),
+          state.id,
+          JSON.stringify(state.boundTarget),
           __currentActorScope(),
         );
       }
-      this.readyState = WebSocket.READY_STATE_OPEN;
-      if (this._polled) this._startPump();
+      state.readyState = WebSocket.READY_STATE_OPEN;
+      if (state.polled) this.#startPump();
     }
   }
   send(data) {
-    if (this.readyState !== WebSocket.READY_STATE_OPEN)
+    const state = this.#s;
+    if (state.readyState !== WebSocket.READY_STATE_OPEN)
       throw new DOMException("WebSocket is not open", "InvalidStateError");
     // Workerd (web-socket.c++ send): a socket no accept() or
     // state.acceptWebSocket() has claimed has no transport on either end,
     // and sending is an error rather than a frame dropped without a trace.
     // A socket that a 101 response released, one the host joined, or one the
     // state handed out from `getWebSockets()` is already accepted.
-    if (!this._outbound && !this._accepted && !this._target &&
-        !this._hibernatable && !this._loopback)
+    if (!state.outbound && !state.accepted && !state.target &&
+        !state.hibernatable && !state.loopback)
       throw new TypeError(
         "You must call one of accept() or state.acceptWebSocket() on this " +
         "WebSocket before sending messages.");
@@ -13639,27 +14097,27 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
       data, "WebSocket.send accepts a string, ArrayBuffer, or view");
     const binary = bytes !== null;
     const text = binary ? null : String(data);
-    if (this._loopback) {
-      const peer = this._loopback;
-      // `_dispatchMessage` converts an ArrayBuffer per `binaryType`, so hand
+    if (state.loopback) {
+      const peer = state.loopback;
+      // `#dispatchMessage` converts an ArrayBuffer per `binaryType`, so hand
       // it the copy's buffer, as `data.slice(0)` did before #130.
       const message = binary ? bytes.slice().buffer : text;
-      queueMicrotask(() => peer._dispatchMessage(message));
+      queueMicrotask(() => __wsHooks.dispatchMessage(peer, message));
       return;
     }
     // The pending queue belongs to an inbound pair socket that has been
     // accepted but not yet bound to a host transport. An outbound socket is
     // already bound -- queueing here would silently swallow its frames.
-    if (!this._outbound && this._accepted && !this._target) {
+    if (!state.outbound && state.accepted && !state.target) {
       // Copy at send: the frame waits in the queue, and workerd snapshots the
       // bytes the caller passed rather than aliasing its buffer (#130).
-      this._pending.push([
+      state.pending.push([
         binary ? "send-binary" : "send", binary ? bytes.slice() : text,
       ]);
       return;
     }
-    if (binary) __ws_send_binary(this._id, bytes);
-    else __ws_send(this._id, text);
+    if (binary) __ws_send_binary(state.id, bytes);
+    else __ws_send(state.id, text);
   }
   close(code = 1000, reason = "") {
     // workerd parity, not the WHATWG-only 1000/3000-4999 rule: an endpoint
@@ -13684,73 +14142,72 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
         "WebSocket close reason must not exceed 123 bytes",
         "SyntaxError");
     }
+    const state = this.#s;
     // Outbound sockets follow the WebSocket spec: closing a closed socket is a
     // no-op. Inbound sockets must NOT take that shortcut -- a Durable Object
     // answers a peer-initiated close from inside `webSocketClose`, by which
-    // point `_dispatchClose` has already marked this side closed, and its
+    // point `#dispatchClose` has already marked this side closed, and its
     // reply carries the reason the client is entitled to see.
-    if (this._outbound && this.readyState === WebSocket.READY_STATE_CLOSED) {
+    if (state.outbound && state.readyState === WebSocket.READY_STATE_CLOSED) {
       return;
     }
-    const connecting = this.readyState === WebSocket.READY_STATE_CONNECTING;
-    this.readyState = WebSocket.READY_STATE_CLOSING;
-    if (this._outbound && connecting) {
-      this._pendingClose = [code, reason];
+    const connecting = state.readyState === WebSocket.READY_STATE_CONNECTING;
+    state.readyState = WebSocket.READY_STATE_CLOSING;
+    if (state.outbound && connecting) {
+      state.pendingClose = [code, reason];
       return;
     }
-    if (this._outbound) {
-      __ws_close(this._id, code, reason);
+    if (state.outbound) {
+      __ws_close(state.id, code, reason);
       return;
     }
-    this.readyState = 3;
-    if (this._loopback) {
-      const peer = this._loopback;
-      queueMicrotask(() => peer._dispatchClose(code, reason, true));
+    state.readyState = 3;
+    if (state.loopback) {
+      const peer = state.loopback;
+      queueMicrotask(() => __wsHooks.dispatchClose(peer, code, reason, true));
       return;
     }
-    if (this._accepted && !this._target) {
-      this._pending.push(["close", code, reason]);
+    if (state.accepted && !state.target) {
+      state.pending.push(["close", code, reason]);
       return;
     }
-    __ws_close(this._id, code, reason);
+    __ws_close(state.id, code, reason);
   }
-  _flushPending() {
-    const pending = this._pending.splice(0);
+  #flushPending() {
+    const state = this.#s;
+    const pending = state.pending.splice(0);
     for (const frame of pending) {
-      if (frame[0] === "send") __ws_send(this._id, frame[1]);
+      if (frame[0] === "send") __ws_send(state.id, frame[1]);
       else if (frame[0] === "send-binary") {
-        // `_pending` holds an internal view: WebSocket.send read the guest's
-        // bytes from the internal slots when it queued the frame (#130).
-        __ws_send_binary(this._id, frame[1]);
+        // The queue holds an internal view: send() read the guest's bytes
+        // from the internal slots when it queued the frame (#130).
+        __ws_send_binary(state.id, frame[1]);
       }
-      else __ws_close(this._id, frame[1], frame[2]);
+      else __ws_close(state.id, frame[1], frame[2]);
     }
   }
   serializeAttachment(value) {
     // Structured clone, not JSON: Cloudflare accepts anything cloneable
     // here, so a Date must come back a Date and a Map a Map.
-    this._attachment = value;
-    __ws_attachment_set(this._id, __sc_encode(value));
+    const state = this.#s;
+    state.attachment = value;
+    __ws_attachment_set(state.id, __scEncodeStrict(value));
   }
-  deserializeAttachment() { return this._attachment; }
-  _dispatchMessage(data) {
-    if (this._binaryType === "blob" && data instanceof ArrayBuffer) {
+  deserializeAttachment() { return this.#s.attachment; }
+  #dispatchMessage(data) {
+    const state = this.#s;
+    if (state.binaryType === "blob" && data instanceof ArrayBuffer) {
       data = new Blob([data]);
     }
     const event = new MessageEvent("message", { data });
-    event._trust();
+    __cello.$$trustEvent(event);
     this.dispatchEvent(event);
   }
-  _dispatchClose(code, reason, wasClean) {
-    if (this.readyState === WebSocket.READY_STATE_CLOSED) return;
-    this.readyState = WebSocket.READY_STATE_CLOSED;
-    __sockets.delete(this._id);
-    // An abnormal closure fires `error` before `close`. Code written against
-    // the standard onerror never ran otherwise, which matters most for an
-    // outbound socket: its peer is a remote server that can simply vanish.
-    // An abnormal closure fires `error` before `close`. Code written against
-    // the standard onerror never ran otherwise, which matters most for an
-    // outbound socket: its peer is a remote server that can simply vanish.
+  #dispatchClose(code, reason, wasClean) {
+    if (this.#s.readyState === WebSocket.READY_STATE_CLOSED) return;
+    const state = this.#s;
+    state.readyState = WebSocket.READY_STATE_CLOSED;
+    __sockets.delete(state.id);
     // An abnormal closure fires `error` before `close`. Code written against
     // the standard onerror never ran otherwise, which matters most for an
     // outbound socket: its peer is a remote server that can simply vanish.
@@ -13762,10 +14219,24 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
       }));
     }
     const event = new CloseEvent("close", { code, reason, wasClean });
-    event._trust();
+    __cello.$$trustEvent(event);
     this.dispatchEvent(event);
   }
 };
+// Workerd also carries the state constants on the prototype, enumerable.
+for (const [name, value] of [
+  ["READY_STATE_CONNECTING", 0], ["CONNECTING", 0],
+  ["READY_STATE_OPEN", 1], ["OPEN", 1],
+  ["READY_STATE_CLOSING", 2], ["CLOSING", 2],
+  ["READY_STATE_CLOSED", 3], ["CLOSED", 3],
+]) {
+  Object.defineProperty(globalThis.WebSocket.prototype, name, {
+    value, writable: false, enumerable: true, configurable: false,
+  });
+}
+__webidlTag(globalThis.WebSocket, "WebSocket");
+__webidlPrototype(globalThis.WebSocket);
+__webidlLength(globalThis.WebSocket);
 const __makeSocket = __cello.__makeSocket = (id) => new WebSocket(id);
 const __socketFromRow = __cello.__socketFromRow = (row) => {
   let ws = __sockets.get(Number(row.id));
@@ -13773,13 +14244,14 @@ const __socketFromRow = __cello.__socketFromRow = (row) => {
     ws = __makeSocket(row.id);
     __sockets.set(Number(row.id), ws);
   }
-  ws._tags = row.tags || [];
-  ws._hibernatable = true;
+  const wsState = __wsState(ws);
+  wsState.tags = row.tags || [];
+  wsState.hibernatable = true;
   if (row.attachment != null) {
     try {
-      ws._attachment = __sc_decode(new Uint8Array(row.attachment));
+      wsState.attachment = __sc_decode(new Uint8Array(row.attachment));
     } catch {
-      ws._attachment = undefined;
+      wsState.attachment = undefined;
     }
   }
   return ws;
@@ -13801,8 +14273,8 @@ globalThis.WebSocketPair = function WebSocketPair() {
   const id = __ws_alloc();
   const client = __makeSocket(id);
   const server = __makeSocket(id);
-  client._peer = server;
-  server._peer = client;
+  __wsState(client).peer = server;
+  __wsState(server).peer = client;
   // Indexed AND iterable: `const [client, server] = new WebSocketPair()` is
   // the form most Cloudflare code uses. No own `length` -- workerd's pair is
   // `{0, 1}`, so Object.keys/spread see exactly the two sockets.
@@ -14402,13 +14874,13 @@ if (!globalThis.structuredClone) {
 
   defineHostType(Blob.prototype, function() {
     return {
-      type: "Blob", bytes: this._bytes,
+      type: "Blob", bytes: __cello.$$blobBytes(this),
       mimeType: this.type,
     };
   }, brandOf("__isBlobInstance", Blob));
   defineHostType(File.prototype, function() {
     return {
-      type: "File", bytes: this._bytes,
+      type: "File", bytes: __cello.$$blobBytes(this),
       mimeType: this.type, name: this.name,
       lastModified: this.lastModified,
     };
@@ -14459,14 +14931,16 @@ if (!globalThis.structuredClone) {
     // a forged prototype clones as plain data as workerd does; a genuine
     // instance keeps the runtime's "Unsupported object type" refusal.
     const unsupported = [
-      [Request, (v) => __primHasOwn(v, "_bodyBytes")],
-      [Response, (v) => __primHasOwn(v, "_bodyBytes")],
-      [Headers, (v) => __primHasOwn(v, "__celloHost")],
-      [FormData, (v) => __primHasOwn(v, "_entries")],
+      [Request, (v) => __cello.$$isRequestInstance(v)],
+      [Response, (v) => __cello.$$isResponseInstance(v)],
+      [Headers, (v) => __cello.$$isHeadersInstance(v)],
+      [FormData, (v) => __cello.$$isFormDataInstance(v)],
       [URL, brandOf("__isUrlInstance", URL)],
       [URLSearchParams, brandOf("__isUrlSearchParamsInstance", URLSearchParams)],
       [typeof MessagePort === "function" ? MessagePort : undefined,
-        (v) => __instanceOf(v, MessagePort) && __primHasOwn(v, "_portBuffer")],
+        (v) => typeof __cello.$$isMessagePortInstance === "function" &&
+          __cello.$$isMessagePortInstance(v)],
+      [AbortSignal, (v) => __cello.$$isAbortSignalInstance(v)],
     ];
     for (const [constructor, brand] of unsupported) {
       if (typeof constructor !== "function") continue;
@@ -15336,28 +15810,31 @@ __cello.__readResponse = (r) => {
     return { error: __ERROR_RESPONSE_MESSAGE };
   }
   let workerSocketId = 0;
-  let wsTarget = r._wsTarget || (r.webSocket && r.webSocket._target) || null;
+  let wsTarget = __responseState(r).wsTarget ||
+    (r.webSocket && __wsState(r.webSocket).target) || null;
   if (r.status === 101 && r.webSocket && wsTarget === null) {
-    const server = r.webSocket._peer;
-    if (server && server._accepted) {
-      workerSocketId = server._id;
+    const server = __wsState(r.webSocket).peer;
+    if (server && __wsState(server).accepted) {
+      const serverState = __wsState(server);
+      workerSocketId = serverState.id;
       // Install the host queue before the pump asks for its first frame. The
       // target marker makes sends use that queue instead of remaining in the
       // pair's pre-upgrade buffer.
       __ws_prepare_worker_handoff(workerSocketId);
-      server._target = { id: workerSocketId, scope: "" };
-      server._polled = true;
+      serverState.target = { id: workerSocketId, scope: "" };
+      serverState.polled = true;
       __sockets.set(workerSocketId, server);
-      server._startPump();
-      server._flushPending();
+      __wsHooks.startPump(server);
+      __wsHooks.flushPending(server);
     }
   }
   let bodyStreamId;
   let pumpEndsCtx = false;
-  if (r._bodyBytes === null) {
-    if (typeof r.body?.__celloStreamId === "number" &&
+  if (__responseState(r).bytes === null) {
+    const hostStreamId = __cello.$$httpStreamId(r.body);
+    if (typeof hostStreamId === "number" &&
         !r.__celloRequestControllers) {
-      bodyStreamId = r.body.__celloStreamId;
+      bodyStreamId = hostStreamId;
     } else {
       bodyStreamId = __bridgeResponseStream(
         r.body,
@@ -15380,7 +15857,7 @@ __cello.__readResponse = (r) => {
       workerSocketId,
     };
   }
-  const bytes = r._bodyBytes;
+  const bytes = __responseState(r).bytes;
   endFetchCtx();
   return {
     status: r.status,

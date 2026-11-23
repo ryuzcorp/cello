@@ -1076,23 +1076,44 @@ function kvService(host) {
   };
 
   class KvNamespace {
+    // The namespace resolver and cell name are private slots, and the RPC
+    // stub and bulk read are private members: workerd's binding exposes the
+    // six KV methods and the `KvNamespace` tag only (#206).
+    #namespace;
+    #cellName;
     // `namespace()` answers the namespace of KV cells, and `cellName` names this
     // namespace's one cell (`cello_logic::kv::cell_name`).
+    static #expose = (() => {
+      // Test-only seams for the operator-gate suites: the cell stub and the
+      // namespace resolver are not guest-visible in a shipping node, and the
+      // shape gate runs without CELLO_TEST_WAIT.
+      if (typeof __test_wait_enabled !== "function" || !__test_wait_enabled())
+        return;
+      Object.defineProperty(KvNamespace.prototype, "_stub", {
+        configurable: true, get() { return this.#stub; },
+      });
+      Object.defineProperty(KvNamespace.prototype, "_namespace", {
+        configurable: true, get() { return this.#namespace; },
+      });
+      Object.defineProperty(KvNamespace.prototype, "_cellName", {
+        configurable: true, get() { return this.#cellName; },
+      });
+    })();
     constructor(namespace, cellName) {
-      Object.defineProperty(this, "_namespace", { value: namespace });
-      Object.defineProperty(this, "_cellName", { value: cellName });
+      this.#namespace = namespace;
+      this.#cellName = cellName;
     }
 
     // Resolved per call rather than cached: a cell can move between calls, and
     // `getByName` costs what the Durable Object path already pays.
-    get _stub() {
-      return this._namespace().getByName(this._cellName);
+    get #stub() {
+      return this.#namespace().getByName(this.#cellName);
     }
 
-    async _read(keys, options, withMetadata, op) {
+    async #read(keys, options, withMetadata, op) {
       const { type } = __kvReadOptions(options);
       for (const key of keys) __kvCheckKey(key, op);
-      const rows = await this._stub.__kvGet({
+      const rows = await this.#stub.__kvGet({
         keys,
         withMetadata,
         now: Date.now(),
@@ -1118,16 +1139,16 @@ function kvService(host) {
     // with the prototype chain.
     async get(key, options) {
       if (Array.isArray(key)) {
-        const rows = await this._read(__kvBulkKeys(key), options, false, "GET_BULK");
+        const rows = await this.#read(__kvBulkKeys(key), options, false, "GET_BULK");
         return new Map(rows.map((row) => [row.key, row.value]));
       }
-      const [row] = await this._read([String(key)], options, false, "GET");
+      const [row] = await this.#read([String(key)], options, false, "GET");
       return row.value;
     }
 
     async getWithMetadata(key, options) {
       if (Array.isArray(key)) {
-        const rows = await this._read(__kvBulkKeys(key), options, true, "GET_BULK");
+        const rows = await this.#read(__kvBulkKeys(key), options, true, "GET_BULK");
         // Upstream answers a missing key with `null`, not an object whose
         // value is null: a caller tells "absent" from "stored null" that
         // way, and a Map entry of `{value: null, metadata: null}` would
@@ -1139,7 +1160,7 @@ function kvService(host) {
           ]),
         );
       }
-      const [row] = await this._read([String(key)], options, true, "GET");
+      const [row] = await this.#read([String(key)], options, true, "GET");
       return {
         value: row.value,
         metadata: row.metadata,
@@ -1169,7 +1190,7 @@ function kvService(host) {
         options && options.expiration,
         options && options.expirationTtl,
       );
-      await this._stub.__kvPut({
+      await this.#stub.__kvPut({
         entries: [{ key: name, value: encoded.value, tag: encoded.tag, metadata, expiresAt }],
       });
     }
@@ -1177,22 +1198,14 @@ function kvService(host) {
     async delete(key) {
       const name = String(key);
       __kvCheckKey(name, "DELETE");
-      await this._stub.__kvDelete({ keys: [name] });
-    }
-
-    // Upstream takes one key or an array, and caps the array at the same 100 a
-    // bulk get takes.
-    async deleteBulk(keys) {
-      const names = Array.isArray(keys) ? __kvBulkKeys(keys) : [String(keys)];
-      for (const name of names) __kvCheckKey(name, "DELETE");
-      await this._stub.__kvDelete({ keys: names });
+      await this.#stub.__kvDelete({ keys: [name] });
     }
 
     async list(options) {
       const prefix = options && options.prefix ? String(options.prefix) : "";
       const limit = __kvListLimit(options && options.limit);
       const after = options && options.cursor ? __kvCursor.decode(String(options.cursor)) : "";
-      const page = await this._stub.__kvList({ prefix, limit, after, now: Date.now() });
+      const page = await this.#stub.__kvList({ prefix, limit, after, now: Date.now() });
       const keys = page.keys.map((entry) => {
         const key = { name: entry.name };
         if (entry.metadata !== null) key.metadata = JSON.parse(entry.metadata);
@@ -1209,6 +1222,21 @@ function kvService(host) {
       };
     }
   }
+
+  // Workerd's reflected shape: enumerable prototype members and the
+  // `KvNamespace` interface tag (#171, #206).
+  for (const key of Object.getOwnPropertyNames(KvNamespace.prototype)) {
+    if (key === "constructor") continue;
+    const descriptor =
+      Object.getOwnPropertyDescriptor(KvNamespace.prototype, key);
+    if (descriptor === undefined || descriptor.enumerable) continue;
+    descriptor.enumerable = true;
+    Object.defineProperty(KvNamespace.prototype, key, descriptor);
+  }
+  Object.defineProperty(KvNamespace.prototype, Symbol.toStringTag, {
+    value: "KvNamespace", configurable: true, writable: true,
+    enumerable: false,
+  });
 
   // The bulk ceiling belongs to the binding, and a CLI chunks beneath it rather
   // than inheriting it. An empty array is refused because upstream refuses it:

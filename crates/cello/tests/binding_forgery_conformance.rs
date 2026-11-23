@@ -585,7 +585,19 @@ fn binding_forgery_conformance() {
     assert_eq!(own["value"], "own-r2-value", "{own}");
     let noforge = get_json(&node, "/r2-noforge");
     assert_eq!(noforge["ok"], true, "{noforge}");
-    assert_eq!(noforge["ctor"], "Object", "{noforge}");
+    assert_eq!(noforge["ctor"], "R2Bucket", "{noforge}");
+    assert_eq!(noforge["threw"], true, "{noforge}");
+    assert!(
+        noforge["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Illegal constructor"),
+        "{noforge}"
+    );
+    assert!(
+        !noforge.to_string().contains("own-r2-value"),
+        "/r2-noforge leaks nothing: {noforge}"
+    );
     let own = get_json(&node, "/svc-own");
     assert_eq!(own["ok"], true, "{own}");
     assert_eq!(own["pong"], true, "{own}");

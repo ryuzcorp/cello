@@ -10,7 +10,9 @@
 // read path copies nothing.
 //
 // Compiled on first access (see LAZY_GLOBALS); a bundle that never names
-// either global never pays for this file.
+// either global never pays for this file. The readable's controller lives
+// in the stream's private state and the pair in TransformStream's, so an
+// instance carries no own fields (#170, #206).
 return (() => {
 
 const NOT_BYTES =
@@ -22,6 +24,8 @@ const RELEASED =
 const ONE_READ =
   'This ReadableStream only supports a single pending read request ' +
   'at a time.';
+
+const __rsState = (stream) => __cello.$$readableState(stream);
 
 // No copy: a write is only observable once it has been read, so the
 // writer cannot safely reuse the buffer before then either.
@@ -65,7 +69,8 @@ function _readSettled(promise) {
 // The pipe itself: at most one unconsumed write and one pending read.
 // Implements the `_pullInto` surface ReadableStreamBYOBReader drives
 // (see byte_streams.js), so the global BYOB reader works on the
-// readable unchanged.
+// readable unchanged. Not a guest-visible object: it lives only in the
+// readable's private state.
 class InternalController {
   _chunk = null;     // unread remainder of the in-flight write
   _consumed = null;  // settles the sink write once _chunk drains
@@ -76,6 +81,12 @@ class InternalController {
   _writable = null;
 
   _invalidate() {}   // no BYOB-request surface on internal streams
+
+  _releasePending(err) {
+    for (const d of this._pendingPullIntos)
+      if (d.req) d.req.reject(err);
+    this._pendingPullIntos = [];
+  }
 
   _hasPending() {
     return this._readReq !== null ||
@@ -130,14 +141,14 @@ class InternalController {
   }
 
   _read() {
-    const s = this._stream;
-    if (s._errored) return Promise.reject(s._error);
+    const s = __rsState(this._stream);
+    if (s.errored) return Promise.reject(s.error);
     if (this._chunk !== null) {
       const v = this._chunk;
       this._doneChunk();
       return Promise.resolve(_readResult(v, false));
     }
-    if (s._closed)
+    if (s.closed)
       return Promise.resolve(_readResult(undefined, true));
     if (this._hasPending())
       return Promise.reject(new TypeError(ONE_READ));
@@ -147,8 +158,8 @@ class InternalController {
   }
 
   _pullInto(view, min) {
-    const s = this._stream;
-    if (s._errored) return Promise.reject(s._error);
+    const s = __rsState(this._stream);
+    if (s.errored) return Promise.reject(s.error);
     if (this._hasPending())
       return Promise.reject(new TypeError(ONE_READ));
     const elementSize = view.BYTES_PER_ELEMENT ?? 1; // DataView: 1
@@ -169,7 +180,7 @@ class InternalController {
       if (d.filled >= d.minFill)
         return Promise.resolve(_readResult(this._view(d), false));
     }
-    if (s._closed)
+    if (s.closed)
       // A post-close BYOB read hands the (transferred) buffer back as
       // a zero-length view; a readAtLeast cut short by close returns
       // what it got with done still false.
@@ -183,8 +194,7 @@ class InternalController {
 
   // sink.close -- only reachable with no write in flight.
   _close() {
-    const s = this._stream;
-    s._finishClose();
+    __cello.$$finishCloseStream(this._stream);
     const r = this._readReq;
     if (r !== null) {
       this._readReq = null;
@@ -200,11 +210,11 @@ class InternalController {
   // Error the readable side (writer abort, bad write, length
   // violation).
   _errorRd(e) {
-    const s = this._stream;
-    if (s._closed || s._errored) return;
-    s._errored = true;
-    s._error = e;
-    s._rejectClosed(e);
+    const s = __rsState(this._stream);
+    if (s.closed || s.errored) return;
+    s.errored = true;
+    s.error = e;
+    __cello.$$rejectClosedStream(this._stream, e);
     const r = this._readReq;
     if (r !== null) { this._readReq = null; r.reject(e); }
     const pending = this._pendingPullIntos;
@@ -222,12 +232,12 @@ class InternalController {
   // reader.cancel / readable.cancel: close the read side, convert the
   // reason, and reject the writer's pending write and close with it.
   _cancel(reason) {
-    const s = this._stream;
-    if (s._errored) return Promise.reject(s._error);
-    if (!s._closed) {
+    const s = __rsState(this._stream);
+    if (s.errored) return Promise.reject(s.error);
+    if (!s.closed) {
       const e = toError(reason);
-      s._disturbed = true;
-      s._finishClose();
+      s.disturbed = true;
+      __cello.$$finishCloseStream(this._stream);
       const r = this._readReq;
       if (r !== null) {
         this._readReq = null;
@@ -238,7 +248,7 @@ class InternalController {
       for (const d of pending)
         d.req.resolve(_readResult(undefined, true));
       if (this._reader) this._reader._settleClosed(null);
-      this._writable._errorStream(e);
+      __cello.$$errorStream(this._writable, e);
       if (this._consumed !== null) {
         const c = this._consumed;
         this._chunk = null;
@@ -254,54 +264,63 @@ class InternalController {
 // (rejected by releaseLock) and single-pending-read reads. Subclassing
 // keeps the shared reader prototype free of internal-stream branches.
 class InternalDefaultReader extends ReadableStreamDefaultReader {
-  _released = false;
-  _closedRes = null;
-  _closedRej = null;
-
+  #s;
   constructor(stream) {
     super(stream);
-    this._s = stream;
-    this._c = stream._ictl;
-    this._closedP = new Promise((res, rej) => {
-      this._closedRes = res;
-      this._closedRej = rej;
+    const s = __rsState(stream);
+    const state = this.#s = {
+      stream,
+      c: s.ictl,
+      closedRes: null,
+      closedRej: null,
+      closedP: null,
+      released: false,
+    };
+    state.closedP = new Promise((res, rej) => {
+      state.closedRes = res;
+      state.closedRej = rej;
     });
-    this._closedP.catch(() => {});
-    if (stream._closed) this._settleClosed(null);
-    else if (stream._errored) this._settleClosed(stream._error);
-    else this._c._reader = this;
+    state.closedP.catch(() => {});
+    if (s.closed) this._settleClosed(null);
+    else if (s.errored) this._settleClosed(s.error);
+    else state.c._reader = this;
   }
 
   _settleClosed(e) {
-    if (this._closedRes === null) return;
-    if (e === null) this._closedRes();
-    else this._closedRej(e);
-    this._closedRes = null;
-    this._closedRej = null;
+    const state = this.#s;
+    if (state.closedRes === null) return;
+    if (e === null) state.closedRes();
+    else state.closedRej(e);
+    state.closedRes = null;
+    state.closedRej = null;
   }
 
   read() {
-    if (this._released)
+    const state = this.#s;
+    if (state.released)
       return _readSettled(Promise.reject(new TypeError(RELEASED)));
-    this._s._disturbed = true;
-    return _readSettled(this._c._read());
+    __rsState(state.stream).disturbed = true;
+    return _readSettled(state.c._read());
   }
 
   cancel(reason) {
-    if (this._released)
+    const state = this.#s;
+    if (state.released)
       return Promise.reject(new TypeError(RELEASED));
-    return this._c._cancel(reason);
+    return state.c._cancel(reason);
   }
 
   get closed() {
-    if (this._released)
+    const state = this.#s;
+    if (state.released)
       return Promise.reject(new TypeError(RELEASED));
-    return this._closedP;
+    return state.closedP;
   }
 
   releaseLock() {
-    if (this._released) return;
-    const c = this._c;
+    const state = this.#s;
+    if (state.released) return;
+    const c = state.c;
     const err = new TypeError(RELEASED);
     if (c._readReq !== null) {
       c._readReq.reject(err);
@@ -309,25 +328,27 @@ class InternalDefaultReader extends ReadableStreamDefaultReader {
     }
     if (c._reader === this) c._reader = null;
     this._settleClosed(err);
-    this._s._locked = false;
-    this._s._reader = null;
-    this._released = true;
+    const s = __rsState(state.stream);
+    s.locked = false;
+    s.reader = null;
+    state.released = true;
   }
 }
 
-// Instance overrides so shared prototype paths stay unbranched.
-function internalGetReader(options) {
+// Installed per internal transform readable, so the shared prototype paths
+// stay unbranched.
+function internalGetReader(stream, options) {
   if (options !== undefined && options !== null &&
       options.mode !== undefined) {
     if (String(options.mode) !== 'byob')
       throw new TypeError(`Invalid reader mode '${options.mode}'`);
-    return new ReadableStreamBYOBReader(this);
+    return new ReadableStreamBYOBReader(stream);
   }
-  return new InternalDefaultReader(this);
+  return new InternalDefaultReader(stream);
 }
 
-function internalCancel(reason) {
-  return this._ictl._cancel(reason);
+function internalCancel(stream, reason) {
+  return __rsState(stream).ictl._cancel(reason);
 }
 
 // FixedLengthStream's expected length, handed to the base constructor
@@ -342,16 +363,13 @@ class IdentityTransformStream {
     const ctl = new InternalController();
     const readable = new ReadableStream();
     ctl._stream = readable;
-    readable._ictl = ctl;
-    Object.defineProperties(readable, {
-      getReader: { value: internalGetReader, writable: true,
-                   configurable: true },
-      _cancel: { value: internalCancel, writable: true,
-                 configurable: true },
-    });
+    const s = __rsState(readable);
+    s.ictl = ctl;
+    s.readerHook = internalGetReader;
+    s.cancelHook = internalCancel;
     // FixedLengthStream implies Content-Length when its readable is a
     // fetch body.
-    if (limit !== undefined) readable._expectedLength = limit;
+    if (limit !== undefined) s.expectedLength = limit;
     let seen = 0;
     // Workerd reports a length failure on the readable side only: the write
     // or close that trips it resolves, and the error is stored so a repeated
@@ -398,24 +416,26 @@ class IdentityTransformStream {
     // abort() must not deadlock behind a write parked in _deliver: the
     // writable machinery waits for the in-flight write before running
     // the sink abort, so unpark it with the abort reason.
-    const abort_ = writable._abort.bind(writable);
-    writable._abort = (reason) => {
-      const p = abort_(reason);
-      if (writable._state === 'erroring' && ctl._consumed !== null) {
+    __cello.$$writableStreamState(writable).abortHook = (reason) => {
+      const st = __cello.$$writableStreamState(writable);
+      if (st.state === 'erroring' && ctl._consumed !== null) {
         const c = ctl._consumed;
         ctl._chunk = null;
         ctl._consumed = null;
         c.reject(reason);
       }
-      return p;
     };
-    this.readable = readable;
-    this.writable = writable;
+    // Workerd's IdentityTransformStream is a TransformStream subclass; the
+    // base constructor must never run, so the chain is wired directly and
+    // the pair installed in TransformStream's private state.
+    __cello.$$setTransformPair(
+      this, readable, writable);
   }
+
+  // Workerd inherits readable/writable from TransformStream; the pair is
+  // installed above, so no own accessors are needed.
 }
 
-// Workerd's IdentityTransformStream is a TransformStream subclass; the
-// base constructor must never run, so the chains are wired directly.
 Object.setPrototypeOf(IdentityTransformStream.prototype,
                       TransformStream.prototype);
 Object.setPrototypeOf(IdentityTransformStream, TransformStream);
@@ -435,12 +455,10 @@ class FixedLengthStream extends IdentityTransformStream {
   }
 }
 
-for (const [cls, name] of [
-  [IdentityTransformStream, 'IdentityTransformStream'],
-  [FixedLengthStream, 'FixedLengthStream'],
-])
-  Object.defineProperty(cls.prototype, Symbol.toStringTag,
-                        { value: name, configurable: true });
+// WebIDL reflection: each prototype carries only its interface tag, and
+// the readable/writable accessors come from TransformStream (#171, #206).
+__cello.$$webidl(IdentityTransformStream, 'IdentityTransformStream');
+__cello.$$webidl(FixedLengthStream, 'FixedLengthStream');
 
 return { IdentityTransformStream, FixedLengthStream };
 })()

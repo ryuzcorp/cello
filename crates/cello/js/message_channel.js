@@ -2,8 +2,44 @@
 // (src/workerd/api/messagechannel.c++): ports entangle in pairs, a port
 // buffers messages until it has a message listener, close() closes both
 // ports and fires "close" on each, and transfer lists are refused.
+//
+// Port state lives in a module-private WeakMap, so a Worker reflects the
+// MessagePort surface only: `Object.keys(port)` is empty and the prototype
+// names no host helper (#206).
 (function () {
   const kCreate = Symbol("cello.MessagePort.create");
+  const _states = new WeakMap();
+  const _state = (port) => {
+    const state = _states.get(port);
+    if (state === undefined) throw new TypeError("Illegal invocation");
+    return state;
+  };
+
+  const _startPort = (port) => {
+    const state = _state(port);
+    if (state.started || state.closed) return;
+    state.started = true;
+    const pending = state.buffer;
+    state.buffer = [];
+    for (const data of pending) _deliver(port, data);
+  };
+
+  const _deliver = (port, data) => {
+    const state = _state(port);
+    if (state.closed) return;
+    if (!state.started) {
+      state.buffer.push(data);
+      return;
+    }
+    // Deferred like Workerd's delivery task: a handler attached in the
+    // same turn as postMessage still sees the message.
+    queueMicrotask(() => {
+      if (state.closed) return;
+      const event = new MessageEvent("message", { data });
+      __cello.$$trustEvent(event);
+      port.dispatchEvent(event);
+    });
+  };
 
   class MessagePort extends EventTarget {
     constructor(token = undefined) {
@@ -11,20 +47,16 @@
       if (token !== kCreate) {
         throw new TypeError("Illegal constructor");
       }
-      this._peer = null;
-      this._started = false;
-      this._portClosed = false;
-      this._portBuffer = [];
-      this._messageHandler = null;
+      _states.set(this, {
+        peer: null, started: false, closed: false, buffer: [], handler: null,
+      });
     }
 
-    get [Symbol.toStringTag]() { return "MessagePort"; }
-
-    get onmessage() { return this._messageHandler; }
+    get onmessage() { return _state(this).handler; }
     set onmessage(handler) {
-      this._messageHandler = typeof handler === "function" ? handler : null;
+      _state(this).handler = typeof handler === "function" ? handler : null;
       // Assigning a message handler starts the port, per the spec.
-      this._startPort();
+      _startPort(this);
     }
 
     postMessage(value, options = undefined) {
@@ -44,50 +76,23 @@
           "DataCloneError");
       }
       const cloned = structuredClone(value);
-      const peer = this._peer;
-      if (this._portClosed || !peer || peer._portClosed) return;
-      peer._deliver(cloned);
+      const state = _state(this);
+      const peer = state.peer;
+      if (state.closed || !peer || _state(peer).closed) return;
+      _deliver(peer, cloned);
     }
 
-    _deliver(data) {
-      if (this._portClosed) return;
-      if (!this._started) {
-        this._portBuffer.push(data);
-        return;
-      }
-      // Deferred like Workerd's delivery task: a handler attached in the
-      // same turn as postMessage still sees the message.
-      queueMicrotask(() => {
-        if (this._portClosed) return;
-        const event = new MessageEvent("message", { data });
-        event._trust();
-        this.dispatchEvent(event);
-      });
-    }
-
-    _startPort() {
-      if (this._started || this._portClosed) return;
-      this._started = true;
-      const pending = this._portBuffer;
-      this._portBuffer = [];
-      for (const data of pending) this._deliver(data);
-    }
-
-    start() { this._startPort(); }
-
-    addEventListener(type, ...rest) {
-      super.addEventListener(type, ...rest);
-      if (String(type) === "message") this._startPort();
-    }
+    start() { _startPort(this); }
 
     close() {
-      if (this._portClosed) return;
-      this._portClosed = true;
-      this._portBuffer.length = 0;
-      const peer = this._peer;
-      if (peer && !peer._portClosed) peer.close();
+      const state = _state(this);
+      if (state.closed) return;
+      state.closed = true;
+      state.buffer.length = 0;
+      const peer = state.peer;
+      if (peer && !_state(peer).closed) peer.close();
       const event = new Event("close");
-      event._trust();
+      __cello.$$trustEvent(event);
       this.dispatchEvent(event);
     }
   }
@@ -96,15 +101,44 @@
     constructor() {
       const port1 = new MessagePort(kCreate);
       const port2 = new MessagePort(kCreate);
-      port1._peer = port2;
-      port2._peer = port1;
-      Object.defineProperties(this, {
-        port1: { value: port1, enumerable: true },
-        port2: { value: port2, enumerable: true },
+      _state(port1).peer = port2;
+      _state(port2).peer = port1;
+      // Workerd's own-property order is port2 then port1, which JSON and
+      // Object.keys both observe.
+      this.port2 = port2;
+      this.port1 = port1;
+    }
+  }
+
+  // WebIDL reflection: prototype members enumerable, tag a data property.
+  const webidl = (ctor, tag) => {
+    for (const key of Object.getOwnPropertyNames(ctor.prototype)) {
+      if (key === "constructor") continue;
+      const descriptor = Object.getOwnPropertyDescriptor(ctor.prototype, key);
+      if (descriptor === undefined || descriptor.enumerable) continue;
+      descriptor.enumerable = true;
+      Object.defineProperty(ctor.prototype, key, descriptor);
+    }
+    if (tag !== undefined) {
+      Object.defineProperty(ctor.prototype, Symbol.toStringTag, {
+        value: tag, configurable: true, writable: true, enumerable: false,
       });
     }
-    get [Symbol.toStringTag]() { return "MessageChannel"; }
-  }
+  };
+  webidl(MessagePort, "MessagePort");
+  webidl(MessageChannel, "MessageChannel");
+  Object.defineProperty(MessagePort, "length", {
+    value: 0, configurable: true, writable: false,
+  });
+
+  __cello.$$isMessagePortInstance = (value) => _states.has(value);
+
+  // EventTarget tells this hook when a listener arrives, so `start()` runs on
+  // addEventListener("message") without MessagePort overriding the method
+  // (workerd's prototype does not declare one).
+  __cello.$$listenerAdded = (target, type) => {
+    if (type === "message" && target instanceof MessagePort) _startPort(target);
+  };
 
   globalThis.MessagePort = MessagePort;
   globalThis.MessageChannel = MessageChannel;

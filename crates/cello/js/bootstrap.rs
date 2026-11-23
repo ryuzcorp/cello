@@ -227,9 +227,20 @@ pub(super) fn run_internal_script<'s>(
     };
     // The global receiver keeps top-level `this` what a script had.
     let receiver = scope.get_current_context().global(scope).into();
-    function
-        .call(scope, receiver, &arguments.values)
-        .ok_or_else(|| anyhow!("bootstrap run {name}"))
+    // Carry the thrown value into the error: a bootstrap failure otherwise
+    // reports only which script it was, not what it hit.
+    let tc = std::pin::pin!(v8::TryCatch::new(scope));
+    let tc = &mut tc.init();
+    match function.call(tc, receiver, &arguments.values) {
+        Some(value) => Ok(value),
+        None => {
+            let thrown = tc
+                .exception()
+                .map(|value| value.to_rust_string_lossy(&*tc))
+                .unwrap_or_else(|| "<none>".into());
+            Err(anyhow!("bootstrap run {name}: {thrown}"))
+        }
+    }
 }
 
 #[cfg(all(test, cello_internal_tests))]

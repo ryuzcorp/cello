@@ -92,19 +92,27 @@ struct TestNode {
 impl TestNode {
     fn boot(project: &Path) -> Self {
         // Port zero: the OS assigns the worker port, so parallel boots never
-        // claim the same one; discovery below learns it.
-        let mut child = cello_command(project, [("NO_COLOR".to_string(), "1".to_string())])
-            .arg("dev")
-            .arg(project)
-            .arg("--port")
-            .arg("0")
-            .arg("--no-watch")
-            .arg("--clean")
-            .arg("--logs")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn cello dev");
+        // claim the same one; discovery below learns it. `CELLO_TEST_WAIT=1`
+        // defines the test-only stream-state hook the fixture needs to close
+        // a tee branch's controller underneath the tee (#170).
+        let mut child = cello_command(
+            project,
+            [
+                ("NO_COLOR".to_string(), "1".to_string()),
+                ("CELLO_TEST_WAIT".to_string(), "1".to_string()),
+            ],
+        )
+        .arg("dev")
+        .arg(project)
+        .arg("--port")
+        .arg("0")
+        .arg("--no-watch")
+        .arg("--clean")
+        .arg("--logs")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn cello dev");
         let mut stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         std::thread::spawn(move || {

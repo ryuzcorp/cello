@@ -366,32 +366,41 @@
     if (token !== _KEY_CONSTRUCTION) {
       throw new TypeError("Illegal constructor");
     }
-    _KEY_SLOTS.set(this, {
+    const slots = {
       type,
       algorithm,
       extractable: Boolean(extractable),
       usages: Object.freeze(Array.from(usages || [])),
       material,
-    });
-    // Own enumerable accessors, so `Object.keys(key)` lists the four
-    // attributes as workerd's own properties do; each read answers from
-    // the slots, never from guest-writable state.
-    const getter = (read) => ({
-      get() { return read(_keySlots(this)); },
-      enumerable: true,
-      configurable: true,
-    });
+    };
+    _KEY_SLOTS.set(this, slots);
+    // Workerd's own-property shape: four enumerable data members in the
+    // order usages, algorithm, extractable, type (#206). These are detached
+    // copies for reflection only -- every operation reads the slots, so a
+    // guest assignment cannot change what a key does (#197 review F2).
     Object.defineProperties(this, {
-      type: getter((slots) => slots.type),
-      algorithm: getter((slots) => _copyKeyAlgorithm(slots.algorithm)),
-      extractable: getter((slots) => slots.extractable),
-      usages: getter((slots) => Object.freeze(Array.from(slots.usages))),
+      usages: {
+        value: Object.freeze(Array.from(slots.usages)),
+        writable: true, enumerable: true, configurable: true,
+      },
+      algorithm: {
+        value: _copyKeyAlgorithm(slots.algorithm),
+        writable: true, enumerable: true, configurable: true,
+      },
+      extractable: {
+        value: slots.extractable,
+        writable: true, enumerable: true, configurable: true,
+      },
+      type: {
+        value: slots.type,
+        writable: true, enumerable: true, configurable: true,
+      },
     });
   }
   Object.defineProperty(CryptoKey, "length", { value: 0 });
   Object.defineProperty(CryptoKey.prototype, Symbol.toStringTag, {
-    configurable: true,
-    get() { return "CryptoKey"; },
+    value: "CryptoKey", configurable: true, writable: true,
+    enumerable: false,
   });
 
   function _makeKey(type, algorithm, extractable, usages, material) {
@@ -893,13 +902,13 @@
       const requested = _requestedAlgorithmName(algorithm);
       _requireCryptoKey("deriveBits", 2, baseKey);
       _checkKeyUsage(baseKey, requested, "deriveBits");
-      return this._deriveBits(algorithm, baseKey, length);
+      return this.#deriveBits(algorithm, baseKey, length);
     }
 
     // The derivation itself, shared by `deriveBits` and `deriveKey` so the
     // latter checks only its own `deriveKey` usage and does not re-require
     // `deriveBits` on the same base key (workerd does not either).
-    async _deriveBits(algorithm, baseKey, length) {
+    async #deriveBits(algorithm, baseKey, length) {
       const name = _algorithmName(algorithm);
       if (name === "HKDF" || name === "PBKDF2") {
         const bits = Number(length);
@@ -975,7 +984,7 @@
             ? ({ "SHA-384": 1024, "SHA-512": 1024 }[
               _hashName(derived?.hash)] ?? 512)
             : null);
-      const bits = await this._deriveBits(algorithm, baseKey, length);
+      const bits = await this.#deriveBits(algorithm, baseKey, length);
       return this.importKey(
         "raw", bits, derived, extractable, usages);
     }
@@ -1232,13 +1241,13 @@
       const name = _algorithmName(algorithm);
       _checkKeyUsage(key, requested, "encrypt");
       if (_AES_MODES.has(name)) _aesValidate(name, algorithm, true);
-      return this._encrypt(algorithm, key, bytes);
+      return this.#encrypt(algorithm, key, bytes);
     }
 
     // The encrypted primitive, shared by `encrypt` and `wrapKey`: wrapping
     // checks the `wrapKey` usage, so it cannot re-enter the public method and
     // be refused for lacking `encrypt` on the same key.
-    async _encrypt(algorithm, key, bytes) {
+    async #encrypt(algorithm, key, bytes) {
       const name = _algorithmName(algorithm);
       if (_AES_MODES.has(name)) {
         return _aes(name, algorithm, key, bytes, true);
@@ -1296,7 +1305,7 @@
           throw _operationError("AES-KW wrapKey failed");
         }
       }
-      return this._encrypt(wrapAlgorithm, wrappingKey, raw);
+      return this.#encrypt(wrapAlgorithm, wrappingKey, raw);
     }
 
     async unwrapKey(
@@ -1331,7 +1340,7 @@
           : raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength);
         return this.importKey(format, keyData, algorithm, extractable, usages);
       }
-      const raw = await this._decrypt(unwrapAlgorithm, unwrappingKey, wrappedBytes);
+      const raw = await this.#decrypt(unwrapAlgorithm, unwrappingKey, wrappedBytes);
       const keyData = format === "jwk"
         ? JSON.parse(new TextDecoder().decode(raw))
         : raw;
@@ -1346,10 +1355,10 @@
       const name = _algorithmName(algorithm);
       _checkKeyUsage(key, requested, "decrypt");
       if (_AES_MODES.has(name)) _aesValidate(name, algorithm, false);
-      return this._decrypt(algorithm, key, bytes);
+      return this.#decrypt(algorithm, key, bytes);
     }
 
-    async _decrypt(algorithm, key, bytes) {
+    async #decrypt(algorithm, key, bytes) {
       const name = _algorithmName(algorithm);
       if (_AES_MODES.has(name)) {
         return _aes(name, algorithm, key, bytes, false);
@@ -1431,6 +1440,11 @@
   // the reason a Worker can hash a body it never has to hold whole -- though
   // Cello buffers here, as its Hash already does.
   class DigestStream extends WritableStream {
+    // The digest promise and the hashing state live in a private slot: a
+    // DigestStream is a Web API object, so a Worker holding one sees the
+    // WritableStream surface plus `digest`/`bytesWritten` and nothing else
+    // (#170, #206). Workerd reflects both as prototype accessors.
+    #s;
     constructor(algorithm) {
       const name = _algorithmName(algorithm);
       // DigestStream takes the CRC checksums too; `subtle.digest` does not.
@@ -1480,15 +1494,12 @@
       // that is disposed. Neither should raise an unhandled rejection just
       // because nobody awaited `digest`.
       digest.catch(() => {});
-      Object.defineProperties(this, {
-        digest: { value: digest, enumerable: true },
-        bytesWritten: { get: () => BigInt(state.written), enumerable: true },
-      });
-      this.__celloDigestState = state;
+      this.#s = { digest, state };
     }
-    get [Symbol.toStringTag]() { return "DigestStream"; }
+    get digest() { return this.#s.digest; }
+    get bytesWritten() { return BigInt(this.#s.state.written); }
     [Symbol.dispose]() {
-      const state = this.__celloDigestState;
+      const state = this.#s.state;
       if (state.disposed) return; // disposing twice is a no-op
       state.disposed = true;
       state.chunks.length = 0;
@@ -1499,11 +1510,24 @@
       this.abort(error).catch(() => {});
     }
   }
+  __cello.$$webidl(DigestStream, "DigestStream");
 
   crypto.DigestStream = DigestStream;
   globalThis.DigestStream = DigestStream;
   globalThis.CryptoKey = CryptoKey;
   globalThis.SubtleCrypto = SubtleCrypto;
+  for (const ctor of [CryptoKey, SubtleCrypto]) {
+    for (const key of Object.getOwnPropertyNames(ctor.prototype)) {
+      if (key === "constructor") continue;
+      const descriptor = Object.getOwnPropertyDescriptor(ctor.prototype, key);
+      if (descriptor === undefined || descriptor.enumerable) continue;
+      descriptor.enumerable = true;
+      Object.defineProperty(ctor.prototype, key, descriptor);
+    }
+    Object.defineProperty(ctor.prototype, Symbol.toStringTag, {
+      value: ctor.name, configurable: true, writable: true, enumerable: false,
+    });
+  }
   globalThis.crypto = crypto;
   // `node_crypto.js` hands a parsed key to Web Crypto through
   // `KeyObject.toCryptoKey()`, so it reports the same dictionary. It built

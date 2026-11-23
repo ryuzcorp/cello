@@ -28,6 +28,24 @@
 // buffer ending in an unpaired lead surrogate and an odd
 // byte yielded two U+FFFD in JS and one on the host.
 (function () {
+    // WebIDL reflection shared by the prelude interfaces: prototype members
+    // are enumerable and the interface tag is a data property (workerd's
+    // shape), where class syntax defines both differently (#206, #171).
+    __cello.$$webidl = (ctor, tag) => {
+        for (const key of Object.getOwnPropertyNames(ctor.prototype)) {
+            if (key === 'constructor') continue;
+            const descriptor =
+                Object.getOwnPropertyDescriptor(ctor.prototype, key);
+            if (descriptor === undefined || descriptor.enumerable ||
+                !descriptor.configurable) continue;
+            descriptor.enumerable = true;
+            Object.defineProperty(ctor.prototype, key, descriptor);
+        }
+        Object.defineProperty(ctor.prototype, Symbol.toStringTag, {
+            value: tag, configurable: true, writable: true,
+            enumerable: false,
+        });
+    };
     const _tdLabel = $$textDecoderLabel;
     const _tdNew = $$textDecoderNew;
     const _tdDecode = $$textDecoderDecode;
@@ -237,13 +255,13 @@
                     + " a BufferSource",
                 );
             }
-            return this._decodeNative(b, stream);
+            return this.#decodeNative(b, stream);
         }
         // One op per decode(), for every label. Streaming state (a split
         // multibyte sequence, a BOM, ISO-2022-JP mode) lives in the
         // native decoder; a fatal error frees it, matching Workerd -- the
         // next decode starts clean.
-        _decodeNative(b, stream) {
+        #decodeNative(b, stream) {
             let id = this.#nativeId;
             // A complete buffer with no stream around it
             // needs no decoder that outlives the call, so
@@ -269,11 +287,7 @@
             }
         }
     };
-    // Web IDL toStringTag.
-    Object.defineProperty(globalThis.TextEncoder.prototype,
-      Symbol.toStringTag,
-      { value: 'TextEncoder', configurable: true });
-    Object.defineProperty(globalThis.TextDecoder.prototype,
-      Symbol.toStringTag,
-      { value: 'TextDecoder', configurable: true });
+    // Web IDL reflection: enumerable members plus the interface tag.
+    __cello.$$webidl(globalThis.TextEncoder, 'TextEncoder');
+    __cello.$$webidl(globalThis.TextDecoder, 'TextDecoder');
 })();

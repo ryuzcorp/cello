@@ -52,11 +52,9 @@ globalThis.TextDecoderStream = class TextDecoderStream
   get fatal() { return this.#dec.fatal; }
   get ignoreBOM() { return this.#dec.ignoreBOM; }
 };
-// Workerd's streams carry their own tag instead of inheriting
-// TransformStream's.
-for (const [cls, name] of [
-  [globalThis.TextEncoderStream, "TextEncoderStream"],
-  [globalThis.TextDecoderStream, "TextDecoderStream"],
-])
-  Object.defineProperty(cls.prototype, Symbol.toStringTag,
-    { value: name, configurable: true });
+
+// WebIDL reflection: enumerable prototype accessors and the interface's own
+// data tag, as workerd reflects them (#171, #206). The tag is the interface's
+// own rather than TransformStream's inherited one, as in workerd.
+__cello.$$webidl(globalThis.TextEncoderStream, 'TextEncoderStream');
+__cello.$$webidl(globalThis.TextDecoderStream, 'TextDecoderStream');
