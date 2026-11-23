@@ -1,6 +1,6 @@
 ---
 title: Changelog
-description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.8.
+description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to the unreleased changes.
 ---
 ## Unreleased
 
@@ -249,6 +249,64 @@ checks, the validation probes, the IV and tag ranges, the key-isolation
 attacks, and the digest, HMAC, AES-GCM, ECDSA, Ed25519, `getRandomValues`,
 `timingSafeEqual` and `DigestStream` values the earlier sweep already
 measured as agreeing.
+
+Durable Objects and WebSockets now match workerd 1.20261121.1 on the
+divergences the differential harness found. **One change is breaking:** a
+WebSocket's `binaryType` now defaults to `"blob"` for a compatibility date on
+or after 2026-03-17, so a binary message arrives as a `Blob` and
+`new Uint8Array(event.data)` reads nothing. A Worker that wants an
+`ArrayBuffer` sets `socket.binaryType = "arraybuffer"`; a deployment with an
+older compatibility date keeps the old `ArrayBuffer` default. The rest is
+behaviour a Worker already wrote against and silently did not get: `setAlarm()`
+without an `alarm()` handler or with a non-Date throws, `send()` before
+`accept()` throws, a Durable Object stub rejection is the handler's own error
+without `rejected:` or host stack frames, and Queue settle methods are no
+longer own enumerable properties.
+
+Durable Object and WebSocket fixes:
+
+- **`binaryType` follows the standard default** (#192). A freshly accepted
+  socket, whether a `WebSocketPair` end or one from a `fetch()` upgrade,
+  reports `"blob"`, and a binary message is a `Blob` until the Worker sets
+  `"arraybuffer"`; setting it switches the very next message. This is
+  workerd's `websocket_standard_binary_type`, implied from compatibility date
+  2026-03-17; `websocket_standard_binary_type` opts in early and
+  `no_websocket_standard_binary_type` opts out. Hibernation is unchanged:
+  `webSocketMessage(ws, message)` always receives an `ArrayBuffer`, whatever
+  the socket's `binaryType`.
+- **`setAlarm()` validates like workerd** (#149). A class with no `alarm()`
+  handler, a non-Date/number argument, a non-finite instant, and a time at or
+  before the Unix epoch each throw workerd's `TypeError`; a call in the
+  constructor is still allowed because the handler may be added later.
+- **`send()` before `accept()` throws** (#150). An inbound socket that neither
+  `accept()` nor `state.acceptWebSocket()` claimed no longer accepts a frame
+  and drops it silently.
+- **A stub rejection is the handler's error** (#151). `stub.fetch()` rejects
+  with the handler's own error name and message (a `TypeError` stays a
+  `TypeError`), with the caller's stack, instead of `rejected: Error: …` plus
+  Cello host frames.
+- **`put(key, undefined)` is refused and clone failures are
+  `DataCloneError`** (#181). A single put no longer writes nothing for
+  `undefined` and leaves an older value behind; a function, symbol, or proxy
+  value fails with workerd's `DataCloneError`, and a batch put still accepts
+  `undefined` values.
+- **`acceptWebSocket()`, `setWebSocketAutoResponse()`, and
+  `WebSocketPair` match workerd** (#183). Accepting an already accepted
+  socket is an error; clearing the auto-response takes no argument, not
+  `null`; and a pair is `{0, 1}` with no own `length`.
+- **Queue settle methods are prototype members** (#185). `Object.keys`,
+  spread, `JSON.stringify`, and `structuredClone` of a batch or message see
+  only `queue`/`messages`/`metadata` and
+  `id`/`timestamp`/`body`/`attempts`.
+- **A boolean SQL bind stores the text `true`/`false`** (#154).
+- **A SQL cursor has no own enumerable fields** (#191). `Object.keys(cursor)`
+  is empty and its internals no longer leak. Its `rowsRead`/`rowsWritten`
+  still count Cello's DML rows rather than libsql's b-tree rows, so a DDL
+  statement reports 0/0 where workerd reports 1/2; see
+  [Durable Objects](../services/durable-objects.md).
+
+The differential gate gained 19 cases across the `do`, `ws`, `ws-hib`, and
+`queues` fixtures, including a raw-frame WebSocket probe.
 
 ## v0.2.8
 

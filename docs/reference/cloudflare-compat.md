@@ -268,6 +268,17 @@ The `tail` and `email` handlers are unavailable.
 
 ### [WebSockets](https://developers.cloudflare.com/workers/runtime-apis/websockets/)
 
+- `binaryType` defaults to `"blob"` for a compatibility date on or after
+  2026-03-17, so a binary message arrives as a `Blob`; an older date keeps
+  `"arraybuffer"`, and `websocket_standard_binary_type` /
+  `no_websocket_standard_binary_type` forces either. Setting
+  `"arraybuffer"` switches the next message. Hibernation does not follow it:
+  `webSocketMessage(ws, message)` always receives an `ArrayBuffer`.
+- `send()` on a socket that neither `accept()` nor
+  `state.acceptWebSocket()` claimed throws, instead of dropping the frame.
+- Accepting an already accepted socket with `acceptWebSocket()` throws, and
+  `setWebSocketAutoResponse(null)` throws; call it with no argument to
+  clear the pair. A `new WebSocketPair()` has no own `length`.
 - An outbound Worker socket closes when its event and `waitUntil` work
   end. A socket returned in the response stays open.
 - Each isolate-polled input queue has a 1 MiB budget for non-terminal
@@ -470,7 +481,8 @@ Cello honors these compatibility flags:
 - `js_rpc`
 - `fetcher_no_get_put_delete`
 - `sqlite_vec`
-- `websocket_standard_binary_type`
+- `websocket_standard_binary_type`, implied for compatibility dates on or
+  after 2026-03-17; `no_websocket_standard_binary_type` opts out
 - The static-assets navigation flags
 
 Cello accepts every other flag without effect.

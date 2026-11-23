@@ -125,4 +125,18 @@ export const cases = [
   { name: "crypto-values", fixture: "crypto", path: "/values" },
   { name: "crypto-key-isolation", fixture: "crypto", path: "/isolation" },
   { name: "clone-genuine-host-objects", fixture: "crypto", path: "/clone-genuine" },
+  // Durable Objects and WebSockets: the bindings-sweep probes that agree, plus
+  // the behaviour each fixed divergence pins.
+  ...["/ids", "/alarm-handler", "/thrower", "/stub-errors", "/storage-basics",
+    "/storage-list", "/storage-delete", "/storage-keys", "/sql", "/sql-types",
+    "/alarms", "/websockets", "/block-concurrency", "/storage-sync",
+    "/transaction", "/ws-message-types"].map((path) => ({
+    name: `do${path}`,
+    fixture: "do",
+    path,
+  })),
+  { name: "ws-pair", fixture: "ws", path: "/pair" },
+  { name: "ws-upgrade", fixture: "ws", websocket: "/ws" },
+  { name: "ws-hibernation", fixture: "ws-hib", websocket: { path: "/ws", close: false } },
+  { name: "queues-shape", fixture: "queues", path: "/shape" },
 ];

@@ -1,0 +1,22 @@
+{
+  "name": "do-ws",
+  "main": "worker.js",
+  "compatibility_date": "2026-11-01",
+  "no_bundle": true,
+  "kv_namespaces": [{ "binding": "LOG", "id": "do-ws-log" }],
+  "queues": {
+    "producers": [{ "binding": "Q", "queue": "do-ws-queue" }],
+    "consumers": [{ "queue": "do-ws-queue", "max_batch_size": 10, "max_batch_timeout": 1 }]
+  },
+  "durable_objects": {
+    "bindings": [
+      { "name": "PLAIN", "class_name": "Plain" },
+      { "name": "TIMER", "class_name": "Timer" },
+      { "name": "THROWER", "class_name": "Thrower" },
+      { "name": "SHAPER", "class_name": "Shaper" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Plain", "Timer", "Thrower", "Shaper"] }
+  ]
+}

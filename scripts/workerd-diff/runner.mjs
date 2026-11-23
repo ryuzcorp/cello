@@ -363,7 +363,12 @@ function websocketFrameRecord(frame) {
  * server frame up to and including its close, so a case never depends on
  * wall time -- it resolves on the frames, not on a delay.
  */
-function websocketExchange(addr, path) {
+function websocketExchange(addr, spec) {
+  const path = typeof spec === "string" ? spec : spec.path;
+  // Workerd's hibernation path answers no close frame of its own: a
+  // hibernatable socket's close is the application's to send, so the probe
+  // ends after the message replies there.
+  const sendClose = typeof spec === "string" ? true : spec.close !== false;
   return new Promise((resolve, reject) => {
     const socket = createConnection(hostPort(addr));
     let received = Buffer.alloc(0);
@@ -382,6 +387,29 @@ function websocketExchange(addr, path) {
       requestDeadlineMs,
     );
     socket.on("error", (error) => finish(error));
+    // One frame at a time, each sent only after every earlier reply arrived:
+    // close is last, so the transcript holds the reply to each probe whatever
+    // order a runtime's output pump settles messages in.
+    let stage = 0;
+    const advance = (frames) => {
+      if (stage === 0) {
+        stage = 1;
+        socket.write(websocketFrame(1, "hi"));
+      }
+      if (stage === 1 && frames.length >= 1) {
+        stage = 2;
+        socket.write(websocketFrame(2, Buffer.from([1, 2, 250])));
+      }
+      if (stage === 2 && frames.length >= 2) {
+        stage = 3;
+        socket.write(websocketFrame(2, Buffer.from([9, 8])));
+      }
+      if (stage === 3 && frames.length >= 3) {
+        stage = 4;
+        if (sendClose) socket.write(websocketFrame(8, Buffer.from([0x03, 0xe8])));
+        else finish(null, { ...handshake, frames: frames.map(websocketFrameRecord) });
+      }
+    };
     socket.on("data", (chunk) => {
       received = Buffer.concat([received, chunk]);
       try {
@@ -395,15 +423,17 @@ function websocketExchange(addr, path) {
             headers[line.slice(0, at).trim().toLowerCase()] = line.slice(at + 1).trim();
           }
           for (const name of volatileHeaders) delete headers[name];
+          // These two values are case-insensitive tokens: fastwebsockets (and
+          // thus cello) writes them lowercase, workerd capitalizes them.
+          for (const name of ["connection", "upgrade"]) {
+            if (headers[name] !== undefined) headers[name] = headers[name].toLowerCase();
+          }
           handshake = { status: Number(head[0].split(" ")[1]), headers };
           received = received.subarray(split + 4);
-          socket.write(websocketFrame(1, "hi"));
-          socket.write(websocketFrame(2, Buffer.from([1, 2, 250])));
-          socket.write(websocketFrame(2, Buffer.from([9, 8])));
-          socket.write(websocketFrame(8, Buffer.from([0x03, 0xe8])));
         }
         const frames = websocketFrames(received);
-        if (frames.some((frame) => frame.opcode === 8)) {
+        advance(frames);
+        if (stage === 4 && frames.some((frame) => frame.opcode === 8)) {
           finish(null, { ...handshake, frames: frames.map(websocketFrameRecord) });
         }
       } catch (error) {
@@ -452,7 +482,11 @@ async function runOn(boot, fixture, items) {
     for (const item of items) {
       const transcript = [];
       try {
-        for (const spec of item.requests) transcript.push(record(await exchange(node.addr, spec)));
+        if (item.websocket !== undefined) {
+          transcript.push(await websocketExchange(node.addr, item.websocket));
+        } else {
+          for (const spec of item.requests) transcript.push(record(await exchange(node.addr, spec)));
+        }
       } catch (error) {
         transcript.push({ error: String(error.message ?? error) });
       }
@@ -493,6 +527,13 @@ if (run.length === 0) {
   process.exit(2);
 }
 for (const item of run) {
+  if (item.websocket !== undefined) {
+    if (item.requests !== undefined || item.path !== undefined) {
+      console.error(`${item.name}: a websocket case names a path or requests as well`);
+      process.exit(2);
+    }
+    continue;
+  }
   item.requests = item.requests ?? (item.path ? [{ path: item.path }] : []);
   if (item.requests.length === 0) {
     console.error(`${item.name}: no request to send`);
@@ -521,15 +562,17 @@ for (const [fixture, items] of byFixture) {
   for (const item of items) {
     process.stdout.write(`${item.name} ... `);
     executed += 1;
-    // A route answering anything but 200 never exercised its behaviour.
-    const unexpected = [...fromWorkerd[item.name], ...fromCello[item.name]].find((entry) => entry.status !== 200);
+    // A route answering anything but 200 (101 for a WebSocket upgrade) never
+    // exercised its behaviour.
+    if (process.env.SHOW_TRANSCRIPTS) console.log(`\n  workerd: ${JSON.stringify(fromWorkerd[item.name])}\n  cello:   ${JSON.stringify(fromCello[item.name])}`);
+    const wantStatus = item.websocket !== undefined ? 101 : 200;
+    const unexpected = [...fromWorkerd[item.name], ...fromCello[item.name]].find((entry) => entry.status !== wantStatus);
     if (unexpected) {
       console.log("ERROR");
-      console.log(`  a request answered ${unexpected.status}, not 200`);
+      console.log(`  a request answered ${unexpected.status}, not ${wantStatus}`);
       failures.push(item.name);
       continue;
     }
-    if (process.env.SHOW_TRANSCRIPTS) console.log(`\n  workerd: ${JSON.stringify(fromWorkerd[item.name])}\n  cello:   ${JSON.stringify(fromCello[item.name])}`);
     const diff = differences(fromWorkerd[item.name], fromCello[item.name]);
     if (diff.length === 0) {
       console.log("ok");
