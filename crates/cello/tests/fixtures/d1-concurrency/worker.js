@@ -473,31 +473,35 @@ export default {
       await setup.ready;
       // Foreign checkpoint, like the forward route above — but the second
       // branch is left unread while the first streams through. Past the
-      // host's per-branch skew cap the pump fails the lagging branch, so
-      // reading it here must reject while the forwarded size stays whole.
+      // host's per-branch skew cap the pump fails a copy, and which copy is
+      // decided by scheduling: until a copy's consumer takes its first byte
+      // it is indistinguishable from an unread copy, so the budget may end
+      // the forwarded copy or the local one. The route reports each copy's
+      // outcome instead of assuming one, and it reads the local copy even
+      // after the fetch failed: that keeps consuming the request body, so
+      // the handler never returns while the client is still uploading.
       const host = new URL(request.url).host;
       const [first, second] = request.body.tee();
-      const echoed = await fetch(`http://${host}/echo-size`, {
-        method: "POST",
-        body: first,
-      });
-      const { size } = await echoed.json();
+      const readBranch = async (branch) => {
+        try {
+          const rest = await new Response(branch).arrayBuffer();
+          return { ok: true, size: rest.byteLength };
+        } catch (error) {
+          return { ok: false, error: String(error?.message ?? error) };
+        }
+      };
+      let downstream;
       try {
-        const rest = await new Response(second).arrayBuffer();
-        return Response.json({
-          ok: true,
-          forwarded: size,
-          skewed: false,
-          local: rest.byteLength,
+        const echoed = await fetch(`http://${host}/echo-size`, {
+          method: "POST",
+          body: first,
         });
+        const { size } = await echoed.json();
+        downstream = { ok: true, size };
       } catch (error) {
-        return Response.json({
-          ok: true,
-          forwarded: size,
-          skewed: true,
-          error: String(error?.message ?? error),
-        });
+        downstream = { ok: false, error: String(error?.message ?? error) };
       }
+      return Response.json({ ok: true, downstream, local: await readBranch(second) });
     }
 
     if (url.pathname === "/r2-tee-chain") {

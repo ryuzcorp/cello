@@ -150,6 +150,14 @@ fn request_timeout(
 
 /// POST `body` with an explicit length, for routes that must see a streamed
 /// request body rather than held bytes.
+///
+/// The response is read on a second thread while the body is still going
+/// out: a handler may answer — or fail — before the client finished
+/// writing, and a half-duplex client would turn that legitimate early
+/// response into a broken-pipe error on its own write. The response is the
+/// route contract, so it wins over a write error; a request that never
+/// reached the route shows up as a wrong status or body, never as a
+/// silent pass.
 fn post_bytes(
     addr: &str,
     path: &str,
@@ -160,17 +168,38 @@ fn post_bytes(
     stream
         .set_read_timeout(Some(timeout))
         .map_err(|error| format!("timeout: {error}"))?;
+    let mut reader = stream
+        .try_clone()
+        .map_err(|error| format!("clone: {error}"))?;
+    let reading = std::thread::spawn(move || {
+        let mut raw = Vec::new();
+        let result = reader.read_to_end(&mut raw);
+        (result, raw)
+    });
     let wire = format!(
         "POST {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
         body.len()
     );
-    stream
+    let writing = stream
         .write_all(wire.as_bytes())
-        .map_err(|error| format!("write head: {error}"))?;
-    stream
-        .write_all(body)
-        .map_err(|error| format!("write body: {error}"))?;
-    read_response(&mut stream)
+        .map_err(|error| format!("write head: {error}"))
+        .and_then(|()| {
+            stream
+                .write_all(body)
+                .map_err(|error| format!("write body: {error}"))
+        });
+    let (read, raw) = reading.join().expect("response reader");
+    if let Err(error) = read {
+        return Err(match &writing {
+            Ok(()) => format!("read: {error}"),
+            Err(write) => format!("{write}; read: {error}"),
+        });
+    }
+    let raw = String::from_utf8(raw).map_err(|error| format!("utf8: {error}"))?;
+    parse_response(&raw).map_err(|error| match &writing {
+        Ok(()) => error,
+        Err(write) => format!("{error} ({write})"),
+    })
 }
 
 fn read_response(stream: &mut TcpStream) -> Result<(u16, String), String> {
@@ -179,6 +208,11 @@ fn read_response(stream: &mut TcpStream) -> Result<(u16, String), String> {
         .read_to_end(&mut raw)
         .map_err(|error| format!("read: {error}"))?;
     let raw = String::from_utf8(raw).map_err(|error| format!("utf8: {error}"))?;
+    parse_response(&raw)
+}
+
+/// Status and body of one raw HTTP/1.1 response.
+fn parse_response(raw: &str) -> Result<(u16, String), String> {
     let (head, body) = raw
         .split_once("\r\n\r\n")
         .ok_or_else(|| format!("no header/body split in {raw:?}"))?;
@@ -777,10 +811,23 @@ fn attribution_request_tee_skew_kills_lagging_branch() {
     let fixture = copy_fixture("attr-r2tee-skew");
     let node = TestNode::boot(fixture.path(), "attr-r2tee-skew");
 
-    // 40 MiB exceeds the host's 32 MiB request-shared skew cap. The waiter reads
-    // only the first branch (through the subrequest fetch) and leaves the
-    // second untouched, so the pump must fail the lagging branch instead of
-    // buffering it without bound — while the first still flows to completion.
+    // 40 MiB exceeds the host's 32 MiB request-shared skew cap, so the pump
+    // must end a copy instead of buffering past the cap. Two properties are
+    // scheduling-dependent, so the test pins what survives rather than
+    // which copy loses:
+    //
+    // * the budget fails a copy whose consumer has taken no byte yet, and
+    //   until the forwarded fetch pulls its first byte it cannot tell that
+    //   copy from the local one. So the forwarded copy may be the one the
+    //   budget ends, and the outbound `fetch` then rejects with the skew.
+    // * once that happens, the local copy spent the fetch with no reader and
+    //   may itself have reached the cap before the handler starts draining
+    //   it, in which case both copies report the skew.
+    //
+    // What is deterministic, and what this test guards: the handler answers,
+    // at least one copy reports the skew cap, and every copy that reports
+    // success carries the whole 40 MiB — a copy that reads as the end of the
+    // stream while short of it is the bug this pins.
     let start = spawn_get(&node.public, "/r2-tee-start");
     await_attr_started(&node, "r2tee");
     let payload = vec![b'x'; 40 << 20];
@@ -793,13 +840,21 @@ fn attribution_request_tee_skew_kills_lagging_branch() {
     assert_eq!(started["ok"], true, "{started}");
     let out = join_json(skew, "r2tee skew");
     assert_eq!(out["ok"], true, "{out}");
-    assert_eq!(out["forwarded"], 40 << 20, "{out}");
-    assert_eq!(out["skewed"], true, "{out}");
-    let error = out["error"].as_str().unwrap_or_default();
-    assert!(
-        error.contains("behind its sibling"),
-        "lagging branch must report the skew cap: {out}"
-    );
+    let mut skewed = 0;
+    for key in ["downstream", "local"] {
+        let branch = &out[key];
+        if branch["ok"] == false {
+            let error = branch["error"].as_str().unwrap_or_default();
+            assert!(
+                error.contains("behind its sibling"),
+                "{key} must report the skew cap: {out}"
+            );
+            skewed += 1;
+        } else {
+            assert_eq!(branch["size"], 40 << 20, "{key} must arrive whole: {out}");
+        }
+    }
+    assert!(skewed >= 1, "the budget must end a copy: {out}");
 }
 
 #[test]
