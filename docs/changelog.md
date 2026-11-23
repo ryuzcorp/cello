@@ -1,8 +1,37 @@
 ---
 title: Changelog
-description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to the unreleased changes.
+description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.9.
 ---
-## Unreleased
+## v0.2.9
+
+Cello now answers like workerd 1.20261121.1 across the Fetch API, streams,
+Web Crypto, Durable Objects, WebSockets, the KV/R2/D1/Cache bindings and the
+global surface. Three differential sweeps filed 68 divergences; this release
+fixes every High and Medium one and the cheap Low ones, and the
+`scripts/workerd-diff` gate now runs 201 cases that all agree. Web API objects
+keep their state in private slots, so `Object.keys`, `JSON.stringify` and
+`Object.prototype.toString` see what workerd shows and no host internals.
+There are no configuration or bucket-format changes; the development store
+gains two nullable columns (backward compatible, see below).
+
+**Breaking changes.** Check each one before upgrading:
+
+- **No run-time code generation (#194).** `eval()`, `new Function()` and
+  compiling wasm from bytes throw, exactly as on workerd.
+- **WebSocket `binaryType` defaults to `"blob"` (#192)** for a compatibility
+  date on or after 2026-03-17.
+- **Removed globals and methods** that workerd does not define:
+  `DigestStream` (the global alias), `FileReader`, `Temporal`,
+  `DurableObjectRoutingError` (#204), KV's `deleteBulk()` and the `Error`
+  statics on `DOMException` (#207).
+- **A `CryptoKey` can't be cloned** (`DataCloneError`), and non-extractable
+  keys can't be exported through `KeyObject` (#197–#199).
+- **Stricter Fetch validation.** An incoming request has redirect mode
+  `manual` and immutable headers (#161, #169). `Response` validates its
+  status, status text and null-body statuses (#163, #165, #167). `new Request`
+  refuses a relative URL and a GET/HEAD body (#175, #176).
+
+Every change follows, grouped by the work that produced it.
 
 The missing-API workerd differences are fixed: every `MessageEvent`, the
 `Cache`/`CacheStorage` method surface, brotli compression, `FixedLengthStream`
@@ -158,8 +187,8 @@ budget ends. A third change is breaking: a Worker can no longer generate code
 at run time (#194), described below. The differential gate gained six cases
 from those fixes and fourteen Request/body cases from the changes below,
 plus 25 binding cases, six Web Crypto cases, 23 Durable Object and
-WebSocket cases, 66 Fetch API cases and nine missing-API cases (all below),
-193 in total. No configuration or
+WebSocket cases, 66 Fetch API cases and nine missing-API cases (all below);
+with the shape and stream-edge cases above, the gate runs 201. No configuration or
 bucket-format changes; the development store gains two nullable
 columns, which is backward compatible (see below). The `eval`,
 `Function` and wasm runtime-compilation changes are listed after the stream
@@ -600,10 +629,6 @@ calls).
 - **`request.headers = …` reports workerd's message** (#169):
   `TypeError: Cannot assign to read only property 'headers' of object
   '#<Request>'`.
-
-Still divergent and left for the slices that own them: the internal-own-key and
-`[object Object]` tag differences (#170, #171) and the incoming GET body stream
-(#174).
 
 **Breaking:** four globals workerd does not define are removed (#204):
 `DigestStream` (a global alias; `crypto.DigestStream` remains), `FileReader`
