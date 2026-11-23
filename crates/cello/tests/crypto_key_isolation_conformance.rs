@@ -397,4 +397,24 @@ fn crypto_key_state_lives_in_internal_slots() {
         Some(false),
         "CryptoKey was cloned: {strict}"
     );
+    // A genuine File keeps its content, name and type through structuredClone
+    // (the serializer must read the instance, not the registry entry).
+    let file = strict.get("cloneFile").expect("file clone probe");
+    assert_eq!(
+        (
+            file.get("isFile").and_then(|v| v.as_bool()),
+            file.get("name").and_then(|v| v.as_str()),
+            file.get("type").and_then(|v| v.as_str()),
+            file.get("size").and_then(|v| v.as_u64()),
+            file.get("text").and_then(|v| v.as_str()),
+        ),
+        (
+            Some(true),
+            Some("a.txt"),
+            Some("text/plain"),
+            Some(2),
+            Some("hi")
+        ),
+        "a cloned File lost its content: {strict}"
+    );
 }
