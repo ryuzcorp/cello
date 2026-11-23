@@ -2,6 +2,53 @@
 title: Changelog
 description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.8.
 ---
+## Unreleased
+
+Two more `WritableStream` divergences from workerd are fixed, and the
+tee-skew conformance test no longer assumes which of a tee's copies the skew
+budget ends. The differential gate gained three cases (45 in total). No
+configuration, data, or bucket-format changes.
+
+- **A `WritableStream` refuses each state with workerd's own message**
+  (#132). A second `writer.close()` on a closed stream reported the shared
+  `TypeError: Stream already closed/errored` from the same early path as an
+  errored stream; workerd answers `TypeError: This WritableStream has been
+  closed.`. A `close()` while a close is already in flight now rejects with
+  `TypeError: Cannot close a writer that is already being closed` instead of
+  `Stream already closing`, and `writer.write()` no longer shares one
+  `Cannot write to a closing/closed stream` for two states: it reports
+  `TypeError: This WritableStream has been closed.` on a closed stream and
+  workerd's `TypeError: This ReadableStream is closed.` while a close is in
+  flight. `close()` and `write()` on an errored or erroring stream keep
+  rejecting with the stored error, which #129 fixed and workerd agrees with.
+  The gate gained the `writable-close-states` and `writable-write-states`
+  cases; both compared against workerd 1.20261121.1.
+- **`writer.abort()` on an errored stream resolves, and every call gets its
+  own promise** (#133). The chunk header recorded an "abort() on an errored
+  stream rejects with the stored error" deviation as workerd's behaviour, but
+  workerd resolves it — the error already reached `writer.closed` and every
+  other consumer, so aborting changes nothing. Repeated `abort()` also
+  returned the request's own promise, while workerd hands each call a fresh
+  promise (all of them settling alike, and the sink's `abort` still running
+  at most once). Aborting while the stream is still erroring keeps rejecting
+  with the stored error and still skips the sink abort, as measured. The
+  header now states the measured behaviour instead of the old claim, and the
+  gate gained the `writable-abort-states` case.
+- **The tee-skew conformance test pins what survives, not which copy loses**
+  (#134). The test uploaded 40 MiB through a request-body tee whose forwarded
+  copy fed a subrequest, left the local copy unread, and asserted the local
+  copy was the one the 32 MiB skew budget ends. The budget fails a copy whose
+  consumer has taken no byte yet and cannot tell the forwarded copy from the
+  local one before its first byte, so under load the forwarded `fetch()`
+  sometimes rejected with the skew error; the fixture then returned before
+  reading the rest of the request body and the half-duplex test client failed
+  its upload with `Broken pipe` (5 of 10 runs under CPU load). The fixture now
+  reports each copy's outcome and always reads the local copy to the end, the
+  client reads the response while it uploads, and the test asserts the
+  scheduling-independent contract: the handler answers, at least one copy
+  reports the skew cap, and every copy that reports success carries the whole
+  40 MiB.
+
 ## v0.2.8
 
 A Worker's outbound `fetch()` no longer cuts a live response body at

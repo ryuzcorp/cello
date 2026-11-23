@@ -86,7 +86,11 @@ services, APIs, and Wrangler configuration.
   past 32 MiB — the budget the host tee of a platform body uses — the
   branch that is behind fails its next read with `tee branch fell more than
   32 MiB behind its sibling; read both branches concurrently`, while the
-  branch being read keeps flowing to the end. The chunk size alone fails no
+  branch being read keeps flowing to the end. A copy a `fetch()` is streaming
+  can itself be the copy the budget ends if it has taken no byte yet — until
+  then it is indistinguishable from an unread copy — and that `fetch()` then
+  rejects with the same message instead of carrying a truncated body. The
+  chunk size alone fails no
   branch, but a branch that has not read an oversize chunk yet holds all of
   it and fails for lag, so with chunks larger than the budget both branches
   must be read concurrently. A chunk is charged its size — a string 2 bytes
