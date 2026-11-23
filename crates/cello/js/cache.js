@@ -134,7 +134,10 @@
 
     get [Symbol.toStringTag]() { return "Cache"; }
 
-    async put(request, response) {
+    // Workerd's interface methods have length 0 (JSG does not count IDL
+    // arguments), so every signature here is a rest parameter.
+    async put(...args) {
+      const [request, response] = args;
       const key = asKey(request);
       if (!(response instanceof Response)) {
         throw new TypeError(
@@ -175,11 +178,12 @@
       );
     }
 
-    async match(request, options = undefined) {
-      refuseUnimplemented(options, "ignoreSearch");
-      refuseUnimplemented(options, "ignoreVary");
+    async match(...args) {
+      const request = args[0];
+      refuseUnimplemented(args[1], "ignoreSearch");
+      refuseUnimplemented(args[1], "ignoreVary");
       const key = asKey(request);
-      const ignoreMethod = options?.ignoreMethod === true;
+      const ignoreMethod = args[1]?.ignoreMethod === true;
       const found = __cache_match(
         this._namespace,
         key.url,
@@ -202,11 +206,12 @@
       return new Response(body, init);
     }
 
-    async delete(request, options = undefined) {
-      refuseUnimplemented(options, "ignoreSearch");
-      refuseUnimplemented(options, "ignoreVary");
+    async delete(...args) {
+      const request = args[0];
+      refuseUnimplemented(args[1], "ignoreSearch");
+      refuseUnimplemented(args[1], "ignoreVary");
       const key = asKey(request);
-      const ignoreMethod = options?.ignoreMethod === true;
+      const ignoreMethod = args[1]?.ignoreMethod === true;
       return __cache_delete(
         this._namespace,
         key.url,
@@ -249,7 +254,8 @@
 
     get [Symbol.toStringTag]() { return "CacheStorage"; }
 
-    async open(cacheName) {
+    async open(...args) {
+      const cacheName = args[0];
       if (String(cacheName).length >= 1024) {
         throw new TypeError("Cache name is too long.");
       }
