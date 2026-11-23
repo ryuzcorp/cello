@@ -585,6 +585,75 @@ const routes = {
     }));
   },
 
+  async "/iterable-string-body"() {
+    // Issue #126: an iterable becomes the body stream whatever its chunks
+    // are -- the chunk type is checked by the consumer, not the constructor --
+    // so a string chunk rejects every read with the body-stream TypeError
+    // instead of being stringified into "alpha,beta".
+    const settle = (fn) => Promise.resolve().then(fn).then((value) => value, errorInfo);
+    const response = await settle(() => new Response(["alpha", "beta"]).text());
+    const request = await settle(() => new Request("https://diff.test/", {
+      method: "POST", body: ["alpha", "beta"],
+    }).text());
+    const set = await settle(() => new Response(new Set(["alpha", "beta"])).text());
+    // An async iterable is a body stream too, so a string chunk rejects the
+    // same way rather than failing with a cello-only message.
+    const asyncIterable = await settle(() => new Response((async function* () {
+      yield "alpha";
+      yield "beta";
+    })()).text());
+    const asyncBytes = await settle(() => new Response((async function* () {
+      yield encoder.encode("ab");
+      yield encoder.encode("cd");
+    })()).text());
+    // An iterable of bytes is still concatenated eagerly.
+    const bytes = await settle(() => new Response([
+      encoder.encode("ab"), encoder.encode("cd"),
+    ]).text());
+    // Precedence is unchanged: a non-iterable object with its own toString
+    // stringifies, and so does a primitive.
+    const custom = await settle(() => new Response({ toString: () => "custom" }).text());
+    const primitive = await settle(() => new Response(42).text());
+    return report({
+      response, request, set, asyncIterable, asyncBytes, bytes, custom,
+      primitive,
+    });
+  },
+
+  async "/body-read-twice"() {
+    // Issue #127: a body can be consumed once, so a second read throws
+    // workerd's TypeError rather than serving the buffered bytes again.
+    const settle = (promise) => promise.then((value) => value, errorInfo);
+    const response = new Response("abc");
+    const responseFirst = await response.text();
+    const responseSecond = await settle(response.text());
+    const request = new Request("https://diff.test/", { method: "POST", body: "abc" });
+    const requestFirst = await request.text();
+    const requestSecond = await settle(request.text());
+    // json() and bytes() are the same consumer.
+    const json = new Response('{"a":1}');
+    const jsonFirst = await json.json();
+    const jsonSecond = await settle(json.json());
+    const byteBody = new Response("abc");
+    const bytesFirst = [...(await byteBody.bytes())];
+    const bytesSecond = await settle(byteBody.bytes());
+    // A streaming body is consumed the same way.
+    const streamed = new Response(byteStream(["abc"]));
+    const streamedFirst = await streamed.text();
+    const streamedSecond = await settle(streamed.text());
+    // A null body carries nothing, so it stays readable and unused.
+    const empty = new Response(null);
+    const emptyFirst = await empty.text();
+    const emptySecond = await empty.text();
+    return report({
+      responseFirst, responseSecond, responseBodyUsed: response.bodyUsed,
+      requestFirst, requestSecond, requestBodyUsed: request.bodyUsed,
+      jsonFirst, jsonSecond, bytesFirst, bytesSecond,
+      streamedFirst, streamedSecond,
+      emptyFirst, emptySecond, emptyBodyUsed: empty.bodyUsed,
+    });
+  },
+
   async "/sse"() {
     const body = new ReadableStream({
       start: (c) => {

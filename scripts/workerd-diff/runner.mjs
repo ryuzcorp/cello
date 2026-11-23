@@ -9,6 +9,7 @@
 
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { cp, mkdtemp, readFile, rm } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
@@ -137,9 +138,21 @@ function waitListening(addr) {
 
 /** Boots workerd for the fixture; resolves with its address and a stop hook. */
 async function bootWorkerd(dir) {
+  // A fixture that needs an instance-only service (the Cache API's backend,
+  // which a deployment config cannot define) ships a `workerd.capnp` and is
+  // booted from it; such services are experimental. Every other fixture uses
+  // the `wrangler.json` both runtimes share.
+  const instanceConfig = join(dir, "workerd.capnp");
+  const fromInstanceConfig = existsSync(instanceConfig);
   const child = spawn(
     workerdBin,
-    ["serve", "wrangler.json", "-s", "http=127.0.0.1:0", "--control-fd", "3"],
+    [
+      "serve",
+      fromInstanceConfig ? "workerd.capnp" : "wrangler.json",
+      "-s", "http=127.0.0.1:0",
+      "--control-fd", "3",
+      ...(fromInstanceConfig ? ["--experimental"] : []),
+    ],
     { cwd: dir, stdio: ["ignore", "ignore", "pipe", "pipe"] },
   );
   let stderr = "";

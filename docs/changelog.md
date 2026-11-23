@@ -4,13 +4,18 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
 ---
 ## Unreleased
 
-Two stream fixes: `fetch()` no longer puts a live response body on a total
-deadline (a control plane proxying its own SSE through a Worker was cut at
-the budget), and one workerd `TransformStream` divergence found by the
-differential harness (`writer.close()` after the readable side of a
-`TransformStream` was cancelled now rejects with the cancel reason instead of
-a generic `TypeError`). No configuration, data, or bucket-format changes
-beyond the new `CELLO_HTTP_STREAM_IDLE_S` knob.
+Two stream fixes and four workerd divergences are fixed. `fetch()` no longer
+puts a live response body on a total deadline (a control plane proxying its
+own SSE through a Worker was cut at the budget), and one workerd
+`TransformStream` divergence found by the differential harness is fixed
+(`writer.close()` after the readable side of a `TransformStream` was cancelled
+now rejects with the cancel reason instead of a generic `TypeError`). Three
+more body divergences from the same harness are fixed too: an iterable body is
+a lazy stream of its own chunks instead of being stringified or drained, a body
+can be consumed only once (including by `fetch()`), and `cache.put()` stores a
+body of string chunks as its UTF-8 bytes. Beyond the new
+`CELLO_HTTP_STREAM_IDLE_S` knob there are no configuration, data, or
+bucket-format changes.
 
 - **`writer.close()` after a readable cancel rejects with the cancel
   reason** (#129). Cancelling a `TransformStream`'s readable errors its
@@ -23,6 +28,30 @@ beyond the new `CELLO_HTTP_STREAM_IDLE_S` knob.
   `FixedLengthStream` cancel reaches the same path with workerd's converted
   `Error`. The differential gate gained the `transform-close-after-cancel`
   case.
+- **An iterable body is a stream of its chunks, not a stringified value**
+  (#126). `new Response(["alpha", "beta"])` (or the same on a `Request`, a
+  `Set`, or any other sync or async iterable) stringified to `"alpha,beta"`
+  because the constructor fell through to the string-coercion path whenever a
+  chunk was not bytes. Workerd makes the iterable the body stream regardless
+  of chunk type and validates each chunk at consumption, so it rejected every
+  read with `TypeError: This ReadableStream did not return bytes.`; Cello now
+  does the same. An iterable of buffers or views still concatenates eagerly,
+  and a non-iterable object with its own `toString` still stringifies.
+- **A body can be consumed once** (#127). A buffered body re-served its bytes
+  on every `text()`, `json()`, `formData()`, `blob()`, `arrayBuffer()`, or
+  `bytes()` call, so a Worker that read a body twice (or through two
+  consumers) silently worked, while workerd throws
+  `TypeError: Body has already been used. It can only be used once. Use tee()
+  first if you need to read it twice.` Both `Response` and `Request` now
+  reject a second read with workerd's error, whether the first read was a
+  buffered consumer or a reader on the body stream. A `null` body carries
+  nothing and stays readable, as in workerd.
+- **`cache.put()` takes a string chunk as its UTF-8 bytes** (#128). The capped
+  drain summed `chunk.byteLength`, which is `NaN` for a string, then copied
+  into an empty target and threw `RangeError: offset is out of bounds` without
+  storing anything. A `put()` now consumes the body the way the host does: a
+  string chunk is encoded as UTF-8, and any other chunk goes through the same
+  window-safe byte check every Body consumer uses.
 
 - **`fetch()` no longer puts a live response body on a total deadline**
   (#136). `CELLO_FETCH_TIMEOUT_S` was applied as reqwest's total request
