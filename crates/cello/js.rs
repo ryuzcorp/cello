@@ -5946,6 +5946,29 @@ fn queue_batch_value<'s>(
     Ok(value.into())
 }
 
+/// Whether a Queue dispatch failed because the target isolate had no room for
+/// the batch, rather than because anything in the consumer ran and failed.
+///
+/// Two errors qualify and neither ran consumer code: the isolate's
+/// backing-store budget refused one of the batch's message bodies (the
+/// per-isolate `ArrayBuffer` cap, `CELLO_V8_EXTERNAL_LIMIT_MB`), or the node
+/// had no stateless slot to admit the event into. Both leave the message
+/// entirely undelivered, so the broker releases the lease without spending an
+/// attempt.
+///
+/// A handler that throws, a `message.retry()`, `batch.retryAll()` and a lease
+/// that expires unsettled all reach the broker as settlements or expiries,
+/// never as this error, so they keep spending attempts.
+pub fn is_queue_capacity_refusal(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<array_buffer_budget::HostStoreRefusal>()
+        .is_some()
+        || matches!(
+            error.downcast_ref::<crate::engine_api::AdmitError>(),
+            Some(crate::engine_api::AdmitError::Refused(_))
+        )
+}
+
 /// Start a queue consumer's first turn. The batch body bytes move directly
 /// into V8, and only the small settlement record crosses back out.
 fn begin_queue(

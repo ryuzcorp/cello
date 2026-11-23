@@ -2829,6 +2829,18 @@ async fn dispatch_queue_batch(app: AppHandle, call: QueueDispatchReq) {
     };
     let result = match result {
         Ok(result) => result,
+        Err(error) if cello::js::is_queue_capacity_refusal(&error) => {
+            let released = release_refused_batch(app, &scope, &queue, &lease_id, &leases).await;
+            tracing::warn!(
+                %scope,
+                %queue,
+                %script,
+                %error,
+                released,
+                "Queue batch refused for want of isolate capacity; its lease was released without spending a delivery attempt"
+            );
+            return;
+        }
         Err(error) => {
             tracing::warn!(%scope, %queue, %script, %error, "Queue dispatch failed; its lease will expire");
             return;
@@ -2896,6 +2908,78 @@ async fn dispatch_queue_batch(app: AppHandle, call: QueueDispatchReq) {
             %error,
             "Queue settlement dispatcher dropped; its lease will expire"
         ),
+    }
+}
+
+/// Hand a refused batch's lease back to the queue cell without spending a
+/// delivery attempt.
+///
+/// The request carries the settlement's own fence — the lease id plus every
+/// member's identity, sequence and generation — so a release that lost a race
+/// with a newer lease clears nothing. A failed release is logged and the lease
+/// is left to expire, which costs the attempt this path exists to save; the
+/// message itself is never dropped.
+async fn release_refused_batch(
+    app: AppHandle,
+    scope: &str,
+    queue: &str,
+    lease_id: &str,
+    leases: &[cello::host_channels::QueueLeaseRef],
+) -> bool {
+    let body = serde_json::json!({ "leaseId": lease_id, "leases": leases });
+    let body = cello::js::RequestBody::Bytes(body.to_string().into_bytes().into());
+    let (reply, receive) = oneshot::channel();
+    dispatch_do_call(
+        app,
+        DoCallReq {
+            request_id: None,
+            cancel: None,
+            deliver_abort_to_handler: false,
+            scope: scope.to_string(),
+            name: None,
+            url: "https://queue.cello.internal/__qRefuse".to_string(),
+            method: "POST".to_string(),
+            body_guard: cello::js::RequestBodyGuard::of(&body),
+            body,
+            headers: vec![("content-type".to_string(), "application/json".to_string())],
+            reply,
+            order: None,
+            parent: None,
+            operator_ingress: false,
+        },
+    )
+    .await;
+    match receive.await {
+        Ok(Ok(response)) => {
+            let released = (200..300).contains(&response.status);
+            if !released {
+                tracing::warn!(
+                    %scope,
+                    %queue,
+                    status = response.status,
+                    "Queue refusal release was refused; its lease will expire"
+                );
+            }
+            released
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(
+                %scope,
+                %queue,
+                %error,
+                "Queue refusal release routing failed; its lease will expire"
+            );
+            false
+        }
+        Err(error) => {
+            tracing::warn!(
+                %scope,
+                %queue,
+                %error,
+                "Queue refusal release dispatcher dropped; its lease will expire"
+            );
+            false
+        }
     }
 }
 

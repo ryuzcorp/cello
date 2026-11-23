@@ -272,13 +272,19 @@ export default {
         }
         case 'queue-settle-open': {
           // Host-driven settlement stays open: a body with no lease 409s
-          // instead of 403ing.
-          const res = await env.Q._stub.fetch("http://cell/__qSettle", {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({}),
-          });
-          return { status: res.status, body: (await res.text()).slice(0, 200) };
+          // instead of 403ing. The refusal release rides the same seam and
+          // must answer the same way.
+          const post = async (path) => {
+            const res = await env.Q._stub.fetch(`http://cell${path}`, {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({}),
+            });
+            return { status: res.status, body: (await res.text()).slice(0, 200) };
+          };
+          const settle = await post("/__qSettle");
+          const refuse = await post("/__qRefuse");
+          return { status: settle.status, body: settle.body, refuseStatus: refuse.status };
         }
         case 'queue-binding-ok': {
           await env.Q.send({ hello: "queue" });
