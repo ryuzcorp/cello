@@ -150,7 +150,7 @@
   function _requireCryptoKey(method, index, key) {
     // Internal-slot membership, not `instanceof`: a forged object with
     // `CryptoKey.prototype` in its chain has no slots and is refused.
-    if (!_KEY_SLOTS.has(key)) {
+    if (!_KEY_SLOTS_APPLY(_KEY_SLOTS_HAS, _KEY_SLOTS, [key])) {
       throw _argumentTypeError(method, index, "CryptoKey");
     }
     return key;
@@ -333,13 +333,17 @@
   const _KEY_SLOTS = new WeakMap();
   const _KEY_CONSTRUCTION = Symbol("CryptoKey construction");
 
-  // Captured for the host storage predicate: a guest may patch the prototype.
+  // Captured for the host storage predicate: a guest may patch the prototype
+  // or `Reflect`, and the predicate runs while the graph may be poisoned.
   const _KEY_SLOTS_HAS = WeakMap.prototype.has;
+  const _KEY_SLOTS_GET = WeakMap.prototype.get;
+  const _KEY_SLOTS_SET = WeakMap.prototype.set;
+  const _KEY_SLOTS_APPLY = Reflect.apply;
   __cello.$$isCryptoKey = (value) =>
     value !== null && typeof value === "object" &&
-    Reflect.apply(_KEY_SLOTS_HAS, _KEY_SLOTS, [value]);
+    _KEY_SLOTS_APPLY(_KEY_SLOTS_HAS, _KEY_SLOTS, [value]);
   function _keySlots(key) {
-    const slots = _KEY_SLOTS.get(key);
+    const slots = _KEY_SLOTS_APPLY(_KEY_SLOTS_GET, _KEY_SLOTS, [key]);
     if (slots === undefined) throw new TypeError("Illegal invocation");
     return slots;
   }
@@ -377,7 +381,7 @@
       usages: Object.freeze(Array.from(usages || [])),
       material,
     };
-    _KEY_SLOTS.set(this, slots);
+    _KEY_SLOTS_APPLY(_KEY_SLOTS_SET, _KEY_SLOTS, [this, slots]);
     // Workerd's own-property shape: four enumerable, non-writable data
     // members in the order usages, algorithm, extractable, type (#206).
     // The values are mutable copies for reflection only -- every operation
@@ -954,7 +958,8 @@
         throw _notSupported("unsupported derive algorithm: " + name);
       }
       const publicKey = algorithm?.public;
-      if (!_KEY_SLOTS.has(publicKey) || _keySlots(publicKey).type !== "public") {
+      if (!_KEY_SLOTS_APPLY(_KEY_SLOTS_HAS, _KEY_SLOTS, [publicKey]) ||
+          _keySlots(publicKey).type !== "public") {
         throw new TypeError(name + " requires a public key in algorithm.public");
       }
       // X25519 carries no `namedCurve`, so it cannot ride the curve match
@@ -1544,6 +1549,11 @@
   // The clone reviver and node:crypto construct and read keys through these;
   // guest modules cannot reach `__cello`, and the slots never leave it.
   __cello.$$makeCryptoKey = _makeKey;
-  __cello.$$cryptoKeyMaterial = (key) => _KEY_SLOTS.get(key)?.material;
-  __cello.$$isCryptoKey = (key) => _KEY_SLOTS.has(key);
+  // Both readers are captured intrinsics: the clone reviver runs under a
+  // guest that may have patched `WeakMap.prototype.get`.
+  __cello.$$cryptoKeyMaterial = (key) =>
+    _KEY_SLOTS_APPLY(_KEY_SLOTS_GET, _KEY_SLOTS, [key])?.material;
+  // `$$isCryptoKey` stays the capture-intrinsic version defined above the
+  // slot map's first reader: the host storage predicate calls it on every
+  // stored value, under a guest that may have patched the prototype.
 })();

@@ -144,8 +144,13 @@ removals are listed again in the breaking-changes section below.
   values with workerd's `DataCloneError` text, and so does `storage.put()` on
   both the single-key and batch paths: the refusal sits in the host
   serializer's own delegate, driven by a module-private, brand-only predicate,
-  so it stores nothing and runs no guest code. A stream still crosses a caller
-  boundary as a `DataCloneError`, exactly as before.
+  so it stores nothing and runs no guest code. The predicate reads only
+  intrinsics captured at bootstrap, so a Worker that patches
+  `WeakMap.prototype.has`/`Reflect.apply` under a pollution prelude still gets
+  the refusal (or the success) instead of running its own code from inside the
+  serializer. A stream still crosses a caller boundary as a `DataCloneError`,
+  exactly as before, and a client that disconnects mid-stream still aborts the
+  producer's `request.signal` through the private response state.
 
 Two more `WritableStream` divergences from workerd are fixed, and the
 tee-skew conformance test no longer assumes which of a tee's copies the skew

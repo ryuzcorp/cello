@@ -197,12 +197,13 @@ const __rsState = (stream) => {
   return state;
 };
 // Captured: the host storage predicate calls this while a guest may have
-// patched `WeakMap.prototype.has`.
+// patched `WeakMap.prototype.has` or `Reflect.apply`.
 const __rsStatesHas = WeakMap.prototype.has;
+const __rsBrandApply = Reflect.apply;
 const __rsIs = (value) =>
   ((typeof value === 'object' && value !== null) ||
    typeof value === 'function')
-    ? Reflect.apply(__rsStatesHas, _readableStates, [value]) : false;
+    ? __rsBrandApply(__rsStatesHas, _readableStates, [value]) : false;
 
 // Resolve one pending read request from queue.
 function __resolveRead(st) {
@@ -1165,7 +1166,6 @@ globalThis.ByteLengthQueuingStrategy =
 // through these hooks; tenant code cannot reach `__cello`.
 __cello.$$readableState = __rsState;
 // Brand for the clone codec: a constructed stream, not a forged prototype.
-__cello.$$isReadableStream = __rsIs;
 __cello.$$isReadableStream = __rsIs;
 __cello.$$finishCloseStream = (stream) =>
   __finishClose(__rsState(stream));

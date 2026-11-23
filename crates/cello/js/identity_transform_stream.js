@@ -429,7 +429,8 @@ class IdentityTransformStream {
     // base constructor must never run, so the chain is wired directly and
     // the pair installed in TransformStream's private state.
     __cello.$$setTransformPair(
-      this, readable, writable);
+      this, readable, writable,
+      limit !== undefined ? 'FixedLengthStream' : 'IdentityTransformStream');
   }
 
   // Workerd inherits readable/writable from TransformStream; the pair is

@@ -93,7 +93,8 @@ class CompressionStream {
   constructor(format) {
     const ts = make(format, false, 'CompressionStream',
                     arguments.length === 0);
-    __cello.$$setTransformPair(this, ts.readable, ts.writable);
+    __cello.$$setTransformPair(this, ts.readable, ts.writable,
+                               'CompressionStream');
   }
 }
 
@@ -101,7 +102,8 @@ class DecompressionStream {
   constructor(format) {
     const ts = make(format, true, 'DecompressionStream',
                     arguments.length === 0);
-    __cello.$$setTransformPair(this, ts.readable, ts.writable);
+    __cello.$$setTransformPair(this, ts.readable, ts.writable,
+                               'DecompressionStream');
   }
 }
 

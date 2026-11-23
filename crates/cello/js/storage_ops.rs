@@ -1321,9 +1321,7 @@ pub(super) fn serialize_storage_value(
     // `handler_rejection` reads `__primDOMException`: no prototype member, no
     // guest-reachable name. A realm without it (early bootstrap) falls back to
     // plain V8 serialization.
-    let Some(host_name) = super::internal_function(scope, "__storageHostName").ok() else {
-        return None;
-    };
+    let host_name = super::internal_function(scope, "__storageHostName").ok()?;
     let serializer = v8::ValueSerializer::new(scope, Box::new(StorageValueDelegate { host_name }));
     serializer.write_header();
     if !serializer.write_value(context, value).unwrap_or(false) {

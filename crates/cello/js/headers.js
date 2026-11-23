@@ -64,10 +64,11 @@ function _checkValue(value) {
 // instance, so the set stays module-private (#170).
 const _headersInstances = new WeakSet();
 // Captured: the host storage predicate calls this while a guest may have
-// patched `WeakSet.prototype.has`.
+// patched `WeakSet.prototype.has` or `Reflect.apply`.
 const _headersHas = WeakSet.prototype.has;
+const _headersApply = Reflect.apply;
 __cello.$$isHeadersInstance = (value) =>
-  Reflect.apply(_headersHas, _headersInstances, [value]);
+  _headersApply(_headersHas, _headersInstances, [value]);
 
 // The spec's header list, plus the sorted pair list derived from it.
 //

@@ -1227,7 +1227,11 @@ const __cloneHostName = (value) => {
   if (__brandCheck("$$isCryptoKey")(value)) return "CryptoKey";
   if (__brandCheck("$$isReadableStream")(value)) return "ReadableStream";
   if (__brandCheck("$$isWritableStream")(value)) return "WritableStream";
-  if (__brandCheck("$$isTransformStream")(value)) return "TransformStream";
+  // The pair state carries the concrete interface name, so a clone refusal
+  // reports `FixedLengthStream` as itself, not its `TransformStream` base.
+  if (__brandCheck("$$isTransformStream")(value)) {
+    return __cello.$$transformTypeName(value);
+  }
   if (__brandCheck("$$isR2Bucket")(value)) return "R2Bucket";
   return null;
 };
@@ -15001,16 +15005,21 @@ if (!globalThis.structuredClone) {
       [globalThis.WritableStream, brandFn("$$isWritableStream"),
         "WritableStream can only be serialized for RPC"],
       [globalThis.TransformStream, brandFn("$$isTransformStream"),
-        'Could not serialize object of type "TransformStream". This type ' +
-        "does not support serialization."],
+        (value) => 'Could not serialize object of type "' +
+          __cello.$$transformTypeName(value) + '". This type does not ' +
+          "support serialization."],
       [globalThis.R2Bucket, brandFn("$$isR2Bucket"),
         "An R2 bucket binding cannot be serialized."],
     ];
     for (const [constructor, brand, message] of unsupported) {
       if (typeof constructor !== "function") continue;
+      // A message may be a function of the value: the subclass refuses under
+      // its own interface name, as workerd reports it.
       defineHostType(constructor.prototype,
         message === undefined ? null : function() {
-          throw new DOMException(message, "DataCloneError");
+          throw new DOMException(
+            typeof message === "function" ? message(this) : message,
+            "DataCloneError");
         }, brand);
     }
 
@@ -15898,14 +15907,19 @@ __cello.__readResponse = (r) => {
   let bodyStreamId;
   let pumpEndsCtx = false;
   if (__responseState(r).bytes === null) {
+    // The controllers live in the response's private state now (#206):
+    // `__attachResponseRequestCancellation` records them there, and reading
+    // the removed own field here left the pump with none, so a client
+    // disconnect never aborted the producer behind a streamed response.
+    const responseState = __responseState(r);
     const hostStreamId = __cello.$$httpStreamId(r.body);
     if (typeof hostStreamId === "number" &&
-        !r.__celloRequestControllers) {
+        responseState.requestControllers === undefined) {
       bodyStreamId = hostStreamId;
     } else {
       bodyStreamId = __bridgeResponseStream(
         r.body,
-        r.__celloRequestControllers,
+        responseState.requestControllers,
         endFetchCtx,
       );
       pumpEndsCtx = true;
