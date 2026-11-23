@@ -30,7 +30,7 @@ By default no script reads another script's entries. Set `CELLO_CACHE_SCOPE=depl
 ## Use the supported API
 
 - `caches.default` is the default namespace. `caches.open(name)` returns the named namespace, creating it on first use. `open("default")` is a different namespace from `caches.default`.
-- `put(request, response)` stores the response under the request URL when the response is cacheable, and resolves `undefined` whether it stored or not. It consumes the response body, and it snapshots the status, headers, and body. It throws for a non-GET request, a 206 response, or a `Vary: *` response, as Cloudflare's does.
+- `put(request, response)` stores the response under the request URL when the response is cacheable, and resolves `undefined` whether it stored or not. It consumes the response body, and it snapshots the status, headers, and body. A body of string chunks stores their UTF-8 bytes, as Cloudflare's does. It throws for a non-GET request, a 206 response, or a `Vary: *` response, as Cloudflare's does.
 - `match(request, { ignoreMethod })` answers the stored response, or `undefined` on a miss. A conditional request with a matching `If-None-Match` or a covering `If-Modified-Since` gets a 304 with no body; a satisfiable `Range` gets a 206 slice (or a multipart body for several ranges); an unsatisfiable `Range` gets a 416. Every answer built from a stored entry carries `CF-Cache-Status: HIT`, and no answer carries `Cache-Tag`. Each `match` builds a fresh response, so two reads never share a body.
 - `delete(request, { ignoreMethod })` purges one entry and reports whether one was there. Like Cloudflare's, it purges the cache the Worker runs against — this node's — and no other.
 

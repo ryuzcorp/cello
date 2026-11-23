@@ -1,4 +1,4 @@
-// Modified by Ryuz Corp (Cello): per-node Cache API store.
+// Modified by Ryuz Corp (Cello): per-node Cache API store; put() takes a string chunk as its UTF-8 bytes (#128).
 // The Workers Cache API over a per-node in-memory store.
 //
 // `caches.default` and every `caches.open(name)` namespace share one
@@ -39,6 +39,20 @@
   // before the refusal.
   const MAX_ENTRY_BYTES = 16 * 1024 * 1024;
 
+  // The host consumes a `put()` body as bytes, so a chunk is taken the way
+  // the response path writes one out: a string chunk as its UTF-8 encoding
+  // (both runtimes store `"alphabeta"` for two string chunks, #128), and any
+  // other chunk through `__bodyChunk`, which reads a view's window from its
+  // internal slots and rejects a chunk that is not bytes. Without the
+  // coercion a string chunk made `size` NaN, the target array empty, and the
+  // copy threw `RangeError: offset is out of bounds` with nothing stored.
+  const encoder = new TextEncoder();
+  // Captured at install time: the harness declares `__bodyChunk` in its own
+  // script scope, so it reaches this script only through `__cello`.
+  const bodyChunk = __cello.__bodyChunk;
+  const chunkBytes = (value) =>
+    typeof value === "string" ? encoder.encode(value) : bodyChunk(value);
+
   // Drain a response body with an explicit byte budget, like the KV value
   // drain: chunk by chunk, aborting as soon as the body alone exceeds the
   // per-entry cap. A body past the cap can never store -- the entry
@@ -62,7 +76,8 @@
       for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
-        size += value.byteLength;
+        const chunk = chunkBytes(value);
+        size += chunk.byteLength;
         if (size > MAX_ENTRY_BYTES) {
           // Over cap: stop pulling and release the producer. The reader
           // stays locked, as after __drainBody, so the consumed body can
@@ -71,7 +86,7 @@
             "cache.put: response body exceeds the 16 MiB entry limit"));
           return null;
         }
-        chunks.push(value);
+        chunks.push(chunk);
       }
     } catch (error) {
       await reader.cancel(error).catch(() => {});
@@ -83,8 +98,9 @@
       body.set(chunk, offset);
       offset += chunk.byteLength;
     }
-    // Memoize, as __drainBody does: later reads of the put response see
-    // the same bytes.
+    // Memoize, as __drainBody does: the put consumed the body, so a later
+    // read is refused as used, but the bytes stay behind the stream for the
+    // host paths that read them.
     response._bodyBytes = body;
     response._body = undefined;
     return body;

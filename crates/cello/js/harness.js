@@ -1,4 +1,4 @@
-// Modified by Ryuz Corp (Cello): ctx.container.images; clone() of streaming and disturbed bodies; bodyUsed observes the body stream; body streams reject non-byte chunks (#115, #117); __cello$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event; context end aborts finished uploads; tenant egress policy; D1 export; D1 export operator gate; D1 batch; test-only fake close/signal completion; binding-forgery enforcement; Queue/KV operator fetch gate; Queue/KV stub-RPC allowlists; Queue DLQ host-op forward; Queue send/DLQ cell-side validation; trusted-RPC target pin; Queue operator internal re-checks; receiver-held RPC streams.; dropped timer ops fire their callback early so sleepers settle (upstream #317); unrefed AbortSignal.timeout timer (upstream #306); loader-fetch 101 webSocket join (upstream #305); nodejs process.env population (upstream #296); writable request /tmp files (upstream #280); Worker WebSocket close codes (upstream #279); Symbol.dispose on plain RPC results (upstream #260); workflow alarm forgets budget-orphaned drives (upstream #299); env.CELLO_NODE host-wins re-assertion on loader env (upstream #219); getCurrentTraceparent handler trace context (upstream #313).
+// Modified by Ryuz Corp (Cello): ctx.container.images; clone() of streaming and disturbed bodies; bodyUsed observes the body stream; body streams reject non-byte chunks (#115, #117); a body is consumed once (#127); iterable bodies keep their chunks (#126); __cello$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event; context end aborts finished uploads; tenant egress policy; D1 export; D1 export operator gate; D1 batch; test-only fake close/signal completion; binding-forgery enforcement; Queue/KV operator fetch gate; Queue/KV stub-RPC allowlists; Queue DLQ host-op forward; Queue send/DLQ cell-side validation; trusted-RPC target pin; Queue operator internal re-checks; receiver-held RPC streams.; dropped timer ops fire their callback early so sleepers settle (upstream #317); unrefed AbortSignal.timeout timer (upstream #306); loader-fetch 101 webSocket join (upstream #305); nodejs process.env population (upstream #296); writable request /tmp files (upstream #280); Worker WebSocket close codes (upstream #279); Symbol.dispose on plain RPC results (upstream #260); workflow alarm forgets budget-orphaned drives (upstream #299); env.CELLO_NODE host-wins re-assertion on loader env (upstream #219); getCurrentTraceparent handler trace context (upstream #313).
 // The DO object model and the Cloudflare-compatible runtime surface, run
 // once per isolate by `js.rs::install_harness` after the Web-API prelude.
 // Lived as a 4,000-line raw string inside js.rs until 2026-07-29; it is a
@@ -118,21 +118,15 @@ function __multipartBody(form) {
   }
   return { bytes, type: `multipart/form-data; boundary=${boundary}` };
 }
-function __chunkBytes(chunk) {
-  if (chunk instanceof ArrayBuffer) return new Uint8Array(chunk);
-  if (ArrayBuffer.isView(chunk))
-    return new Uint8Array(
-      chunk.buffer, chunk.byteOffset, chunk.byteLength);
-  throw new TypeError(
-    "Iterable bodies must produce ArrayBuffer or " +
-    "ArrayBufferView chunks");
-}
-// Workerd's "gen" bodies: async iterables become a body stream;
-// sync iterables of buffers/views concatenate eagerly. Called only
-// for object bodies that are not streams or Blobs -- an object with
-// a custom toString/@@toPrimitive stringifies instead, unless it is
-// an array or async-iterable (Workerd's precedence). Returns null
-// for the string-coercion path.
+// Workerd's "gen" bodies: an async iterable becomes a body stream that yields
+// its values; a sync iterable of buffers/views concatenates eagerly. Called
+// only for object bodies that are not streams or Blobs -- an object with a
+// custom toString/@@toPrimitive stringifies instead, unless it is an array or
+// async-iterable (Workerd's precedence). The iterable wins whatever its
+// chunks are: the constructor does not look at a chunk's type, so an
+// iterable holding a string is a body whose every read rejects with the
+// body-stream TypeError, not a value stringified into "alpha,beta" (#126).
+// Returns null for the string-coercion path.
 function __iterableBody(body) {
   if (body instanceof ArrayBuffer || ArrayBuffer.isView(body))
     return null;
@@ -143,7 +137,9 @@ function __iterableBody(body) {
       async pull(controller) {
         const result = await iterator.next();
         if (result.done) { controller.close(); return; }
-        controller.enqueue(__chunkBytes(result.value));
+        // The raw value, not a coercion: a consumer validates it, as it
+        // validates a chunk of any other body stream (#117, #126).
+        controller.enqueue(result.value);
       },
       cancel(reason) {
         if (typeof iterator.return === "function")
@@ -156,12 +152,13 @@ function __iterableBody(body) {
        body[Symbol.toPrimitive] !== undefined))
     return null;
   if (typeof body[Symbol.iterator] !== "function") return null;
+  const values = [];
+  for (const chunk of body) values.push(chunk);
   const chunks = [];
   let length = 0;
-  for (const chunk of body) {
-    if (!(chunk instanceof ArrayBuffer) && !ArrayBuffer.isView(chunk))
-      return null;
-    const view = __chunkBytes(chunk);
+  for (const chunk of values) {
+    if (__bodyChunkKind(chunk) === 0) return __chunkBodyStream(values);
+    const view = __bodyChunk(chunk);
     chunks.push(view);
     length += view.byteLength;
   }
@@ -173,6 +170,17 @@ function __iterableBody(body) {
   }
   return bytes;
 }
+// A body stream over an iterable's raw chunks, pulled one per read: the shape
+// workerd gives an iterable body, so the first consumer validates each chunk.
+function __chunkBodyStream(values) {
+  let next = 0;
+  return new ReadableStream({
+    pull(controller) {
+      if (next >= values.length) { controller.close(); return; }
+      controller.enqueue(values[next++]);
+    },
+  }, { highWaterMark: 0 });
+}
 // Workerd's message for a body stream that yields a chunk which is not
 // bytes. Every Body consumer rejects with this TypeError; without the check
 // a string chunk reaches the byte math below as `length +=
@@ -181,6 +189,13 @@ function __iterableBody(body) {
 // the fix. An ArrayBuffer and every view are bytes, as in workerd (a view
 // contributes its visible window, not its backing buffer).
 const __BODY_NOT_BYTES = "This ReadableStream did not return bytes.";
+// Workerd's message for a Body consumer that takes an already-used body. A
+// body is consumed once; the buffered path used to serve `_bodyBytes` again,
+// so a second `text()`/`json()`/`arrayBuffer()`/`bytes()` silently returned
+// the payload while workerd throws (#127).
+const __BODY_USED =
+  "Body has already been used. It can only be used once. " +
+  "Use tee() first if you need to read it twice.";
 // A chunk's window is read from internal slots only: a guest can define own
 // `buffer`, `byteOffset` and `byteLength` properties on a view, and reading
 // them off the chunk pads the body, reads the wrong window, or throws from
@@ -448,17 +463,18 @@ globalThis.Response = class Response {
     return response;
   }
   async _consume() {
-    if (this._bodyBytes !== null) {
-      if (this.body !== null && this.body._cancelled)
-        throw new TypeError(
-          "Body has already been used. It can only be used once. " +
-          "Use tee() first if you need to read it multiple times.");
-      return this._bodyBytes;
+    // A body can be taken once. `bodyUsed` covers both halves: a buffered
+    // body a consumer already took (`_bodyUsed`) and a stream a reader
+    // disturbed, including one cancelled. A null body has nothing to consume
+    // and stays unused, as workerd's does.
+    if (this.body !== null) {
+      if (this.bodyUsed) throw new TypeError(__BODY_USED);
+      __markBodyUsed(this);
     }
+    if (this._bodyBytes !== null) return this._bodyBytes;
     return __drainBody(this);
   }
   async text() {
-    __markBodyUsed(this);
     return new TextDecoder().decode(await this._consume());
   }
   async json() { return JSON.parse(await this.text()); }
@@ -466,17 +482,14 @@ globalThis.Response = class Response {
     // The undecoded bytes, not `text()`: a UTF-8 decode replaces each invalid
     // sequence in a binary file part with one U+FFFD, so both the bytes and
     // the length change.
-    __markBodyUsed(this);
     return __cello.__parseFormData(
       await this._consume(), this.headers.get('content-type'));
   }
   async arrayBuffer() {
-    __markBodyUsed(this);
     return (await this._consume()).slice().buffer;
   }
   // Fetch's bytes(): the undecoded body as a fresh Uint8Array.
   async bytes() {
-    __markBodyUsed(this);
     return (await this._consume()).slice();
   }
   async blob() {
@@ -643,11 +656,16 @@ globalThis.Request = class Request {
     this._headersInit = undefined;
   }
   async _consume() {
+    // One consumption, as on Response: a buffered body is served once and a
+    // disturbed stream rejects, with workerd's TypeError (#127).
+    if (this.body !== null) {
+      if (this.bodyUsed) throw new TypeError(__BODY_USED);
+      __markBodyUsed(this);
+    }
     if (this._bodyBytes !== null) return this._bodyBytes;
     return __drainBody(this);
   }
   async text() {
-    __markBodyUsed(this);
     const bytes = await this._consume();
     return this._body ??= new TextDecoder().decode(bytes);
   }
@@ -656,17 +674,14 @@ globalThis.Request = class Request {
     // The undecoded bytes, not `text()`: a UTF-8 decode replaces each invalid
     // sequence in a binary file part with one U+FFFD, so both the bytes and
     // the length change.
-    __markBodyUsed(this);
     return __cello.__parseFormData(
       await this._consume(), this.headers.get('content-type'));
   }
   async arrayBuffer() {
-    __markBodyUsed(this);
     return (await this._consume()).slice().buffer;
   }
   // Fetch's bytes(): the undecoded body as a fresh Uint8Array.
   async bytes() {
-    __markBodyUsed(this);
     return (await this._consume()).slice();
   }
   async blob() {
@@ -696,6 +711,10 @@ globalThis.Request = class Request {
 // `bodyUsed` must not be able to un-use a body.
 const __markBodyUsed = (target) => { target._bodyUsed = true; };
 __cello.__markBodyUsed = __markBodyUsed;
+// The isolated scripts after the harness (cache.js) run in their own scope,
+// so the byte-window helper is reachable only through `__cello`. cache.js
+// captures it when it installs, before any Worker code runs.
+__cello.__bodyChunk = __bodyChunk;
 const __defineBodyUsed = (ctor) => {
   Object.defineProperty(ctor.prototype, "bodyUsed", {
     configurable: true,
@@ -769,10 +788,8 @@ const __subrequestBody = async (req, absent = false) => {
   if (req._bodyBytes !== null)
     return { body: req._bodyBytes, streamId: undefined };
   const streamId = req.body?.__celloStreamId;
-  if (streamId === undefined) {
-    __markBodyUsed(req);
+  if (streamId === undefined)
     return { body: await req._consume(), streamId: undefined };
-  }
   // The receiver now owns the one host source. Lock the wrapper so a later
   // read fails instead of racing the receiver, and expose the transfer through
   // the standard Body flag.

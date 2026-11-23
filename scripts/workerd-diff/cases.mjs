@@ -48,4 +48,11 @@ export const cases = [
   { name: "string-chunks", fixture: "streams", path: "/string-chunks" },
   { name: "string-chunks-response", fixture: "streams", path: "/string-chunks-response" },
   { name: "body-chunk-shadows", fixture: "streams", path: "/body-chunk-shadows" },
+  { name: "iterable-string-body", fixture: "streams", path: "/iterable-string-body" },
+  { name: "body-read-twice", fixture: "streams", path: "/body-read-twice" },
+  {
+    name: "cache-put-string-chunks",
+    fixture: "cache",
+    path: "/cache-put-string-chunks",
+  },
 ];
