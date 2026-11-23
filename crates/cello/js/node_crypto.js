@@ -325,7 +325,7 @@
       this.info = info;
       // key: bytes, or a CryptoKey (from a KeyObject or WebCrypto).
       this.key = copyU8(
-        key instanceof CryptoKey ? key.__celloMaterial.bytes : key);
+        key instanceof CryptoKey ? __cello.$$cryptoKeyMaterial(key).bytes : key);
       this.chunks = [];
     }
     update(data) {
@@ -484,14 +484,14 @@
   const keyEquals = (a, b) => {
     if (a === b) return true;
     if (!a.extractable || !b.extractable) return false;
-    const ab = a.__celloMaterial?.bytes, bb = b.__celloMaterial?.bytes;
+    const ab = __cello.$$cryptoKeyMaterial(a)?.bytes, bb = __cello.$$cryptoKeyMaterial(b)?.bytes;
     if (!ab || !bb || ab.byteLength !== bb.byteLength) return false;
     let diff = 0;
     for (let i = 0; i < ab.byteLength; i++) diff |= ab[i] ^ bb[i];
     return diff === 0;
   };
   const keyMaterial = (key) => {
-    const bytes = key.__celloMaterial?.bytes;
+    const bytes = __cello.$$cryptoKeyMaterial(key)?.bytes;
     if (!bytes) {
       throw new Error(
         "key material is not exportable through node:crypto yet");
@@ -632,7 +632,7 @@
         String(error?.message ?? error).replace(/^crypto: /, ""));
     }
   };
-  const asymmetricMaterial = (key) => key.__celloMaterial ?? {};
+  const asymmetricMaterial = (key) => __cello.$$cryptoKeyMaterial(key) ?? {};
   // The generation op does not carry a curve yet, so it always generates
   // P-256. Keep that limitation separate from imported-key conversion, which
   // accepts every curve that the shared Web Crypto implementation parses.
@@ -686,7 +686,7 @@
       WEB_CRYPTO_ALGORITHM[result.keyType], null, result.keyType,
       result.details);
     return KeyObject.from(
-      new CryptoKey(visibility, algorithm, true, [], material));
+      __cello.$$makeCryptoKey(visibility, algorithm, true, [], material));
   }
 
   class AsymmetricKeyObject extends KeyObject {
@@ -734,7 +734,7 @@
         throw new DOMException(
           `Invalid ${this.type} key usages`, "SyntaxError");
       }
-      return new CryptoKey(
+      return __cello.$$makeCryptoKey(
         this.type,
         __cello.$$keyAlgorithm(
           requestedName, algorithm, material.keyType, material.details),
@@ -775,7 +775,7 @@
     // inputs stay owned by the caller -- key material must be immutable.
     const bytes = copyU8(
       typeof key === "string" ? Buffer.from(key, encoding) : key);
-    const handle = new CryptoKey(
+    const handle = __cello.$$makeCryptoKey(
       "secret", { name: "secret" }, true, [], { bytes });
     return KeyObject.from(handle);
   }

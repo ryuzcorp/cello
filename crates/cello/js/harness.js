@@ -13213,7 +13213,7 @@ if (!globalThis.structuredClone) {
       type: data.mimeType,
       lastModified: data.lastModified,
     }),
-    CryptoKey: (data) => new CryptoKey(
+    CryptoKey: (data) => __cello.$$makeCryptoKey(
       data.keyType, data.algorithm, data.extractable, data.usages, data.material),
     DOMException: (data) => {
       const exception = new DOMException(data.message, data.name);
@@ -13284,7 +13284,7 @@ if (!globalThis.structuredClone) {
         return {
           type: "CryptoKey", keyType: this.type,
           algorithm: this.algorithm, extractable: this.extractable,
-          usages: this.usages, material: this.__celloMaterial,
+          usages: this.usages, material: __cello.$$cryptoKeyMaterial(this),
         };
       });
     for (const constructor of [

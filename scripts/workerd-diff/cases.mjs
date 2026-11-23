@@ -123,4 +123,5 @@ export const cases = [
   { name: "crypto-validation", fixture: "crypto", path: "/validation" },
   { name: "crypto-aes-gcm", fixture: "crypto", path: "/gcm" },
   { name: "crypto-values", fixture: "crypto", path: "/values" },
+  { name: "crypto-key-isolation", fixture: "crypto", path: "/isolation" },
 ];

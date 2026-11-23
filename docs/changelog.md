@@ -200,7 +200,14 @@ algorithm does not define is refused at import instead of stored on the key.
   not match. `sign()` on a verify-only key, `encrypt()` with an Ed25519 key
   and `unwrapKey()` with a wrap-only KEK now fail as they do on Cloudflare.
   `deriveKey` requires `deriveKey` on the base key without also requiring
-  `deriveBits`.
+  `deriveBits`. `NODE-ED25519` and `Ed25519` name one algorithm for the
+  key-match check, so a key generated under one spelling signs under the
+  other. A key's type, algorithm, extractability, usages and material now
+  live in internal slots: `key.__celloMaterial` is gone, guest
+  `new CryptoKey()` throws `TypeError: Illegal constructor`, a forged
+  `Object.create(CryptoKey.prototype)` is not a `CryptoKey`, and the
+  properties are frozen copies, so mutating `key.algorithm.hash` cannot
+  change what `sign()` hashes with.
 - **Web Crypto argument validation matches workerd** (#198). An absent or
   `null` algorithm, a non-`CryptoKey` key, a non-`BufferSource` data,
   signature or IV, an absent `iv`/`counter`, a non-integer
@@ -209,23 +216,31 @@ algorithm does not define is refused at import instead of stored on the key.
   `TypeMismatchError` or `QuotaExceededError` with the same message text.
   The internal `Cannot read properties of undefined` paths in `sign`,
   `verify`, `encrypt`, `decrypt`, `wrapKey`, `unwrapKey`, `deriveBits` and
-  `exportKey` are gone.
+  `exportKey` are gone. That includes the `importKey` key-data conversion
+  (`BufferSource or JsonWebKey`), the unknown import algorithm name, and a
+  number supplied where an algorithm is expected. RSA-PSS signing and
+  verification now take the caller's `saltLength`; a signature whose salt
+  differs no longer verifies, and a missing salt raises workerd's
+  `DataError`/`TypeError`.
 - **AES-GCM accepts any non-empty IV length and the full tag-length set**
   (#199). The host implemented the AEAD with a fixed-type nonce, so only
   12- and 16-byte IVs worked; J0 is now derived per NIST SP 800-38D for any
   length, and 32- and 64-bit authentication tags are accepted alongside
   96-128 bits. A payload written on Cloudflare with a short IV now decrypts
-  here.
+  here. The 96-bit-IV path runs through the audited `aes-gcm` AEAD, with the
+  tag truncated to the caller's length and compared in constant time.
 - **The non-extractable export error and several `getRandomValues` and AES
   messages use workerd's wording** (#214). This is text only, apart from
   `exportKey` now checking extractability before an unknown format.
 
-The differential gate gained five Web Crypto cases (`crypto-usages`,
-`crypto-operations`, `crypto-validation`, `crypto-aes-gcm`, `crypto-values`):
+The differential gate gained six Web Crypto cases (`crypto-usages`,
+`crypto-operations`, `crypto-validation`, `crypto-aes-gcm`, `crypto-values`,
+`crypto-key-isolation`):
 the usage tables measured against workerd 1.20261121.1, the operation
-checks, the validation probes, the IV and tag ranges, and the digest, HMAC,
-AES-GCM, ECDSA, Ed25519, `getRandomValues`, `timingSafeEqual` and
-`DigestStream` values the earlier sweep already measured as agreeing.
+checks, the validation probes, the IV and tag ranges, the key-isolation
+attacks, and the digest, HMAC, AES-GCM, ECDSA, Ed25519, `getRandomValues`,
+`timingSafeEqual` and `DigestStream` values the earlier sweep already
+measured as agreeing.
 
 ## v0.2.8
 
