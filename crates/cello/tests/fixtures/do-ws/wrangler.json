@@ -4,6 +4,7 @@
   "compatibility_date": "2026-11-01",
   "no_bundle": true,
   "kv_namespaces": [{ "binding": "LOG", "id": "do-ws-log" }],
+  "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "do-ws-bucket" }],
   "queues": {
     "producers": [{ "binding": "Q", "queue": "do-ws-queue" }],
     "consumers": [{ "queue": "do-ws-queue", "max_batch_size": 10, "max_batch_timeout": 1 }]

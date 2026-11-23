@@ -260,6 +260,47 @@ fn durable_object_and_websocket_match_workerd() {
         text(&storage, &["fn", "message"]),
         "() => 1 could not be cloned.",
     );
+    // A private-state host is refused by the host serializer, not stored as
+    // `{}` (#170). The type is named, the class is DataCloneError, and the
+    // write left nothing behind.
+    for kind in ["stream", "headers", "blob", "response"] {
+        let path = format!("storage.{kind}");
+        expect(
+            &mut failures,
+            &format!("{path}.name"),
+            text(&storage, &[kind, "name"]),
+            "DataCloneError",
+        );
+        let message = text(&storage, &[kind, "message"]);
+        assert!(
+            message.ends_with("could not be cloned."),
+            "{path}.message: {message}"
+        );
+        expect(
+            &mut failures,
+            &format!("{path}.back"),
+            text(&storage, &[kind, "back"]),
+            "null",
+        );
+    }
+    expect(
+        &mut failures,
+        "storage.bucket.name",
+        text(&storage, &["bucket", "name"]),
+        "DataCloneError",
+    );
+    expect(
+        &mut failures,
+        "storage.batch.name",
+        text(&storage, &["batch", "name"]),
+        "DataCloneError",
+    );
+    expect(
+        &mut failures,
+        "storage.batchBack",
+        text(&storage, &["batchBack"]),
+        "null",
+    );
     expect(
         &mut failures,
         "storage.sym.name",

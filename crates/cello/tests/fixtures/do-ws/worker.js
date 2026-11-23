@@ -37,8 +37,9 @@ const describe = (data) => ({
 });
 
 export class Plain {
-  constructor(state) {
+  constructor(state, env) {
     this.state = state;
+    this.env = env;
   }
   async fetch(request) {
     const route = new URL(request.url).pathname;
@@ -55,12 +56,29 @@ export class Plain {
     }
     if (route === "/storage") {
       const s = this.state.storage;
+      // A private-state host must be refused, not stored as `{}`: the value's
+      // state is in a slot now, so V8's serializer would write an empty
+      // object (a regression from the own-field era). `back` proves the write
+      // did not land either.
+      const host = async (name, make) => {
+        const out = await attempt(() => s.put("host-" + name, make()), shape);
+        out.back = (await s.get("host-" + name)) ?? null;
+        return out;
+      };
       return Response.json({
         undef: await attempt(() => s.put("undef", undefined), shape),
         fn: await attempt(() => s.put("fn", () => 1), shape),
         sym: await attempt(() => s.put("sym", Symbol("s")), shape),
         proxy: await attempt(() => s.put("proxy", new Proxy({}, {})), shape),
         date: await attempt(() => s.put("date", new Date(0)), shape),
+        stream: await host("stream",
+          () => new ReadableStream({ start(c) { c.close(); } })),
+        headers: await host("headers", () => new Headers({ a: "1" })),
+        blob: await host("blob", () => new Blob(["x"])),
+        response: await host("response", () => new Response("x")),
+        bucket: await host("bucket", () => this.env.BUCKET),
+        batch: await attempt(() => s.put({ "host-b1": new Headers({ a: "1" }) }), shape),
+        batchBack: (await s.get("host-b1")) ?? null,
       });
     }
     if (route === "/ws-api") {

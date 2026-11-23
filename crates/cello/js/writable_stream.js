@@ -1002,12 +1002,14 @@ globalThis.TransformStreamDefaultController =
 // `__cello`.
 __cello.$$writableStreamState = __wsState;
 // Brands for the clone codec: a constructed stream, not a forged prototype.
+const _writableStatesHas = WeakMap.prototype.has;
+const _transformStatesHas = WeakMap.prototype.has;
 __cello.$$isWritableStream = (value) =>
   value !== null && typeof value === "object" &&
-  _writableStates.has(value);
+  Reflect.apply(_writableStatesHas, _writableStates, [value]);
 __cello.$$isTransformStream = (value) =>
   value !== null && typeof value === "object" &&
-  _transformStates.has(value);
+  Reflect.apply(_transformStatesHas, _transformStates, [value]);
 __cello.$$errorStream = (stream, e) =>
   __errorStream(__wsState(stream), e);
 __cello.$$setTransformPair = (target, readable, writable) => {

@@ -1133,7 +1133,16 @@ pub(super) fn op_storage_sync_list_next(
     }
 }
 
-struct StorageValueDelegate;
+/// Refuses the private-state host instances the JS runtime owns (a stream,
+/// `Headers`, `Blob`, `Response`, a crypto key, an R2 bucket). Their state is
+/// in private slots, so V8's serializer would write `{}` -- and on the way in
+/// it would run a stored stub's traps if the decision lived in JS. The
+/// predicate is a module-private harness function looked up here at serialize
+/// time (`__cello.__storageHostName`), brand-only, so this is the one place
+/// the refusal happens and no guest path can replace it.
+struct StorageValueDelegate<'a> {
+    host_name: v8::Local<'a, v8::Function>,
+}
 
 /// Throw what Workerd's storage clone throws: a `DOMException` named
 /// `DataCloneError` ("() => 1 could not be cloned."), not the `TypeError`
@@ -1155,13 +1164,37 @@ fn throw_storage_data_clone_error(scope: &mut v8::PinScope, message: v8::Local<v
     scope.throw_exception(exception);
 }
 
-impl v8::ValueSerializerImpl for StorageValueDelegate {
+impl v8::ValueSerializerImpl for StorageValueDelegate<'_> {
     fn throw_data_clone_error(&self, scope: &mut v8::PinScope, message: v8::Local<v8::String>) {
         throw_storage_data_clone_error(scope, message);
     }
+
+    fn has_custom_host_object(&self, _isolate: &v8::Isolate) -> bool {
+        true
+    }
+
+    /// The harness names the interface (or answers null), so the refusal
+    /// carries the type the way the JS codecs do. Anything else is an
+    /// ordinary object the serializer handles itself.
+    fn is_host_object<'s>(
+        &self,
+        scope: &mut v8::PinScope<'s, '_>,
+        object: v8::Local<'s, v8::Object>,
+    ) -> Option<bool> {
+        let receiver = v8::undefined(scope).into();
+        let name = self.host_name.call(scope, receiver, &[object.into()])?;
+        if name.is_null() || name.is_undefined() {
+            return Some(false);
+        }
+        let name = name.to_rust_string_lossy(scope);
+        let message = format!("{name} could not be cloned.");
+        let message = v8::String::new(scope, &message)?;
+        throw_storage_data_clone_error(scope, message);
+        None
+    }
 }
 
-impl v8::ValueDeserializerImpl for StorageValueDelegate {}
+impl v8::ValueDeserializerImpl for StorageValueDelegate<'_> {}
 
 #[derive(Clone)]
 struct TransientCloneDelegate<'a> {
@@ -1284,7 +1317,14 @@ pub(super) fn serialize_storage_value(
     value: v8::Local<v8::Value>,
 ) -> Option<Vec<u8>> {
     let context = scope.get_current_context();
-    let serializer = v8::ValueSerializer::new(scope, Box::new(StorageValueDelegate));
+    // Looked up in the harness's internals at serialize time, the way
+    // `handler_rejection` reads `__primDOMException`: no prototype member, no
+    // guest-reachable name. A realm without it (early bootstrap) falls back to
+    // plain V8 serialization.
+    let Some(host_name) = super::internal_function(scope, "__storageHostName").ok() else {
+        return None;
+    };
+    let serializer = v8::ValueSerializer::new(scope, Box::new(StorageValueDelegate { host_name }));
     serializer.write_header();
     if !serializer.write_value(context, value).unwrap_or(false) {
         return None;
@@ -1311,8 +1351,14 @@ pub(super) fn deserialize_storage_value<'s>(
         }
         storage::StoredValue::V8(bytes) => {
             let context = scope.get_current_context();
-            let deserializer =
-                v8::ValueDeserializer::new(scope, Box::new(StorageValueDelegate), &bytes);
+            // The deserializer never asks for a host object: the writer
+            // refuses every one of them, so a stored value holds plain data.
+            let host_name = super::internal_function(scope, "__storageHostName").ok()?;
+            let deserializer = v8::ValueDeserializer::new(
+                scope,
+                Box::new(StorageValueDelegate { host_name }),
+                &bytes,
+            );
             deserializer.set_supports_legacy_wire_format(true);
             if !deserializer.read_header(context).unwrap_or(false) {
                 return None;
