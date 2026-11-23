@@ -132,10 +132,11 @@
   });
 
   // Captured: the host storage predicate calls this while a guest may have
-  // patched `WeakMap.prototype.has`.
+  // patched `WeakMap.prototype.has` or `Reflect.apply`.
   const _statesHas = WeakMap.prototype.has;
+  const _statesApply = Reflect.apply;
   __cello.$$isMessagePortInstance = (value) =>
-    Reflect.apply(_statesHas, _states, [value]);
+    _statesApply(_statesHas, _states, [value]);
 
   // EventTarget tells this hook when a listener arrives, so `start()` runs on
   // addEventListener("message") without MessagePort overriding the method

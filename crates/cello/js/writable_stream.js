@@ -76,7 +76,8 @@ class WritableStreamState {
     this.abortHook = undefined;
     // Workerd's compression streams are internal streams: a failed push or
     // flush closes the writable side instead of erroring it (#223).
-    // compression_streams.js opts in through `__cello.$$closesOnError`.
+    // compression_streams.js opts in through the private writable state
+    // (`__cello.$$writableStreamState(...).closesOnError`).
     this.closesOnError = false;
   }
 }
@@ -1002,25 +1003,39 @@ globalThis.TransformStreamDefaultController =
 // `__cello`.
 __cello.$$writableStreamState = __wsState;
 // Brands for the clone codec: a constructed stream, not a forged prototype.
+// The intrinsics are captured: the host storage predicate calls both brands
+// while a guest may have patched the prototype or `Reflect.apply`.
 const _writableStatesHas = WeakMap.prototype.has;
 const _transformStatesHas = WeakMap.prototype.has;
+const _transformStatesGet = WeakMap.prototype.get;
+const _streamsBrandApply = Reflect.apply;
 __cello.$$isWritableStream = (value) =>
   value !== null && typeof value === "object" &&
-  Reflect.apply(_writableStatesHas, _writableStates, [value]);
+  _streamsBrandApply(_writableStatesHas, _writableStates, [value]);
 __cello.$$isTransformStream = (value) =>
   value !== null && typeof value === "object" &&
-  Reflect.apply(_transformStatesHas, _transformStates, [value]);
+  _streamsBrandApply(_transformStatesHas, _transformStates, [value]);
 __cello.$$errorStream = (stream, e) =>
   __errorStream(__wsState(stream), e);
-__cello.$$setTransformPair = (target, readable, writable) => {
+__cello.$$setTransformPair = (target, readable, writable, typeName) => {
   let pair = _transformStates.get(target);
   if (pair === undefined) {
-    pair = { readable: null, writable: null };
+    pair = {
+      readable: null,
+      writable: null,
+      typeName: typeName ?? "TransformStream",
+    };
     _transformStates.set(target, pair);
   }
   pair.readable = readable;
   pair.writable = writable;
+  if (typeName !== undefined) pair.typeName = typeName;
 };
+// The interface a clone refusal names: workerd reports the concrete
+// subclass, and the name is state, not a property a guest could answer.
+__cello.$$transformTypeName = (value) =>
+  _streamsBrandApply(_transformStatesGet, _transformStates, [value])
+    ?.typeName ?? "TransformStream";
 
 // WebIDL reflection (#171, #206).
 for (const [cls, name] of [
