@@ -286,6 +286,9 @@ const __bodyChunk = (chunk) => {
 // The Cache API's own body drain reads guest chunks through the same slot
 // rules; the export is internal (`__cello`), never a guest member.
 __cello.$$bodyChunk = __bodyChunk;
+// A guest chunk's window from its internal slots (#130): the socket and KV
+// preludes run in their own scope and reach it through `__cello`.
+__cello.__hostChunk = __hostChunk;
 // The host response pump's chunk reader. A string chunk is UTF-8, as workerd
 // writes it; every other chunk must be bytes, read through the internal slots.
 // `__bodyBytes` is not used here: its String() fallback would turn a number or
@@ -8133,6 +8136,12 @@ if (__test_stub_stats_enabled())
 if (__test_wait_enabled())
   globalThis.__celloStreamStateForTestOnly = (stream) =>
     __cello.$$readableState(stream);
+// Test-only: the host id a socket allocated. The allocator's unguessability
+// is a security property a conformance fixture must still observe now that
+// the id lives in the private slot (#206). Defined only with
+// CELLO_TEST_WAIT=1; production isolates never define it.
+if (__test_wait_enabled())
+  globalThis.__celloSocketIdForTestOnly = (socket) => __wsState(socket).id;
 // Test-only retained waits: `makeWait` holds one native unrefed wait
 // across native-event retirements (standing in for a container exec
 // wait, which needs an engine the test environment has not got), and
@@ -13149,8 +13158,11 @@ if (!globalThis.MessageEvent) {
       });
     }
   };
-  Object.defineProperty(globalThis.MessageEvent.prototype,
-    Symbol.toStringTag, { value: "MessageEvent", configurable: true });
+  // WebIDL reflection: enumerable own data members already, plus the
+  // interface tag and the zero-length constructor (#206).
+  __webidlTag(globalThis.MessageEvent, "MessageEvent");
+  __webidlPrototype(globalThis.MessageEvent);
+  __webidlLength(globalThis.MessageEvent);
 }
 if (!globalThis.CloseEvent) {
   globalThis.CloseEvent = class CloseEvent extends Event {

@@ -110,7 +110,9 @@ removals are listed again in the breaking-changes section below.
   `DOMException`. `Headers.getAll()`, `Request.cf`/`integrity`/`keepalive`/
   `cache`/`fetcher`, `Response.cf`, `WebSocket.readyState`/
   `bufferedAmount`/`url`/`protocol`/`extensions`, and
-  `ReadableStreamBYOBRequest.atLeast` now exist as workerd defines them.
+  `ReadableStreamBYOBRequest.atLeast` now exist as workerd defines them;
+  `Headers.getAll()` keeps its Cello signature but reports workerd's
+  Set-Cookie-only rule for every other name.
   `R2Bucket` is a real interface whose construction is token-gated, so a
   forged `new R2Bucket(...)` throws instead of minting an object the host
   paths would accept, and `D1Database.query()` refuses with workerd's
@@ -119,9 +121,15 @@ removals are listed again in the breaking-changes section below.
   the other `Error` statics, are no longer reachable. The `shape-*` gate
   cases pin the reflected shape of every class above against workerd
   1.20261121.1; the remaining, reflection-only differences (interface
-  `prototype` writability, V8's method `length`s, D1 sessions, the
-  not-implemented cache methods, and the two object-URL stubs) are listed in
-  the compatibility page.
+  `prototype` writability, V8's method `length`s and D1 sessions) are listed
+  in the compatibility page.
+- **The differential gate now pins the reflected shape of every interface**
+  (#170, #171, #206, #207). Nine `shape-*` cases compare own properties,
+  prototype members and their enumerability, the interface tags, constructor
+  names and lengths, `JSON.stringify` output and `Object.prototype.toString`
+  between workerd 1.20261121.1 and Cello, for the Fetch types, events, the
+  stream family, Web Crypto, the KV/R2/D1 bindings and `WebSocket`. Every case
+  agrees.
 - **A host value can no longer cross RPC or storage as inert data** (#170).
   The RPC projection marks a private-state host -- a signal, `Request`,
   `Response`, `Headers`, `Blob`, `CryptoKey` or a stream -- as a host value,

@@ -215,6 +215,9 @@ Known reflection-only differences:
 - `D1PreparedStatement` carries workerd's own `statement` and `params` data
   members. They are copies for reflection; the statement's behaviour reads
   internal slots.
+- `Headers.getAll()` is workerd's Set-Cookie accessor: any other name throws
+  its `TypeError: getAll() can only be used with the header name
+  "Set-Cookie".`
 - `Cache.add()`, `Cache.addAll()`, `Cache.matchAll()`, `Cache.keys()`,
   `CacheStorage.delete()`, `CacheStorage.match()`, `CacheStorage.has()` and
   `CacheStorage.keys()` exist with workerd's shapes and throw workerd's own

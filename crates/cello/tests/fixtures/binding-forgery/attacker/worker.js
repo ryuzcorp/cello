@@ -722,12 +722,15 @@ export class AttackerDO extends DurableObject {
       // no transport, so id-ownership probes need no client connection.
       const pair = new WebSocketPair();
       this.ctx.acceptWebSocket(pair[1], ['held-tag']);
-      return J({ id: pair[1]._id });
+      // The id is in the private socket state now (#206); the conformance
+      // node defines the test-only reader with CELLO_TEST_WAIT=1.
+      return J({ id: globalThis.__celloSocketIdForTestOnly?.(pair[1]) });
     }
     if (sub === 'ws-list') {
       return J({
         sockets: this.ctx.getWebSockets().map((ws) => ({
-          id: ws._id, tags: ws._tags,
+          id: globalThis.__celloSocketIdForTestOnly?.(ws),
+          tags: this.ctx.getTags(ws),
         })),
       });
     }
@@ -1344,8 +1347,11 @@ export default {
           return { stored, rpc, forged };
         }
         case 'ws-id-shape': {
+          // The id lives in the private socket state (#206); the conformance
+          // node boots with CELLO_TEST_WAIT=1, which defines the test-only
+          // reader for it.
           const pair = new WebSocketPair();
-          return { id: pair[0]._id };
+          return { id: globalThis.__celloSocketIdForTestOnly?.(pair[0]) };
         }
         case 'ws-bind-forge': {
           const scope = `AttackerDO:${await doIdHex(
