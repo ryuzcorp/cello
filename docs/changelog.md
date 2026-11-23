@@ -1,21 +1,23 @@
 ---
 title: Changelog
-description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.7.
+description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.8.
 ---
-## Unreleased
+## v0.2.8
 
-Two stream fixes and four workerd divergences are fixed. `fetch()` no longer
-puts a live response body on a total deadline (a control plane proxying its
-own SSE through a Worker was cut at the budget), and one workerd
-`TransformStream` divergence found by the differential harness is fixed
-(`writer.close()` after the readable side of a `TransformStream` was cancelled
-now rejects with the cancel reason instead of a generic `TypeError`). Three
-more body divergences from the same harness are fixed too: an iterable body is
-a lazy stream of its own chunks instead of being stringified or drained, a body
-can be consumed only once (including by `fetch()`), and `cache.put()` stores a
-body of string chunks as its UTF-8 bytes. Beyond the new
-`CELLO_HTTP_STREAM_IDLE_S` knob there are no configuration, data, or
+A Worker's outbound `fetch()` no longer cuts a live response body at
+`CELLO_FETCH_TIMEOUT_S`. That budget now covers the connection, the upload and
+the response head. A new idle deadline, `CELLO_HTTP_STREAM_IDLE_S`, ends a body
+that goes silent. Before this, a control plane that proxied its own SSE through
+a Worker was cut off at 120 s. A Queue batch that a full consumer isolate
+refuses no longer spends a delivery attempt. Four more divergences from
+workerd, found by the differential harness, are fixed: `TransformStream`
+close after cancel, lazy iterable bodies, single-use bodies (including
+through `fetch()`), and `cache.put()` with string chunks. The only
+configuration change is the new `CELLO_HTTP_STREAM_IDLE_S` knob. Both stream
+timeouts are refused at startup above 86400 s. There are no data or
 bucket-format changes.
+
+The `TransformStream` and body divergences:
 
 - **`writer.close()` after a readable cancel rejects with the cancel
   reason** (#129). Cancelling a `TransformStream`'s readable errors its
@@ -93,8 +95,8 @@ delivery attempt. Under `CELLO_V8_EXTERNAL_LIMIT_MB` pressure the broker
 counted each refusal as a delivery the consumer never ran, so a message
 walked towards `max_retries` and the dead-letter queue untouched by
 application code. The batch is now released with the settlement's own fence
-and retried after a bounded backoff that ends in a charged attempt. No configuration, data, or bucket-format
-changes: the refusal streak lives in the queue cell's existing metadata table.
+and retried after a bounded backoff that ends in a charged attempt. The
+refusal streak lives in the queue cell's existing metadata table:
 
 - **A budget-refused Queue batch is released without spending an attempt**
   (#110). A dispatch whose batch does not fit the consumer isolate's
