@@ -996,6 +996,97 @@ export class Probe {
           handlerNoArgs: await refusal(() => exports.helper()),
           handlerBadProps: await refusal(() => exports.helper({ props: 5 })),
         };
+        // `new` on a handle specializes exactly as calling it does, through
+        // the construct path: valid arguments answer the specialized class,
+        // bad ones the call path's refusal. A specialized class is not a
+        // constructor, as workerd's is not.
+        out.construct = {
+          ns: await attempt(() => {
+            const value = new exports.Probe({ props: { a: 1 } });
+            return [typeof value, Object.prototype.toString.call(value),
+              value.constructor?.name ?? null,
+              Object.getOwnPropertyNames(value).sort()];
+          }),
+          nsNoArgs: await refusal(() => new exports.Probe()),
+          nsNumber: await refusal(() => new exports.Probe(5)),
+          nsBadProps: await refusal(() => new exports.Probe({ props: 5 })),
+          class: await attempt(() => {
+            const value = new exports.NoNamespace({ props: { a: 1 } });
+            return [typeof value, Object.prototype.toString.call(value),
+              value.constructor?.name ?? null,
+              Object.getOwnPropertyNames(value).sort()];
+          }),
+          classNoArgs: await refusal(() => new exports.NoNamespace()),
+          specialized: await refusal(() => {
+            const specialized = exports.Probe({ props: { a: 1 } });
+            return new specialized();
+          }),
+          handler: await refusal(() => new exports.helper()),
+          handlerArgs: await attempt(() => {
+            const value = new exports.helper({ props: { a: 1 } });
+            return [typeof value, Object.prototype.toString.call(value),
+              value.constructor?.name ?? null];
+          }),
+        };
+        // `jurisdiction()` answers a fresh namespace object on every call --
+        // never the handle, never the binding -- over the same instance
+        // store, on the loopback and the real-namespace paths alike: an id
+        // minted either side reads from the other. A named jurisdiction stays
+        // refused on both paths (each runtime's own sentence, so only the
+        // error name is compared).
+        const refusalName = (fn) => {
+          try { fn(); return "<no throw>"; } catch (e) { return e?.name ?? null; }
+        };
+        out.jurisdiction = await attempt(() => {
+          const scoped = exports.Probe.jurisdiction();
+          const scopedAgain = exports.Probe.jurisdiction();
+          const envScoped = this.env.OBJ.jurisdiction();
+          const envScopedAgain = this.env.OBJ.jurisdiction();
+          const plainId = exports.Probe.idFromName("juris-x");
+          const plainIdString = plainId.toString();
+          return {
+            freshLoop: scoped !== scopedAgain,
+            freshEnv: envScoped !== envScopedAgain,
+            loopIsEnv: scoped === envScoped,
+            loopIsHandle: scoped === exports.Probe,
+            envIsBinding: envScoped === this.env.OBJ,
+            shape: [
+              typeof scoped, Object.prototype.toString.call(scoped),
+              scoped.constructor?.name ?? null,
+              Object.getOwnPropertyNames(scoped).sort(),
+            ],
+            envShape: [
+              typeof envScoped, Object.prototype.toString.call(envScoped),
+              envScoped.constructor?.name ?? null,
+              Object.getOwnPropertyNames(envScoped).sort(),
+            ],
+            chain: chain(scoped),
+            envChain: chain(envScoped),
+            sharedFn: scoped.get === exports.Probe.get &&
+              scoped.get === this.env.OBJ.get &&
+              envScoped.get === this.env.OBJ.get,
+            sameCtor: scoped.constructor === envScoped.constructor,
+            sameIdString:
+              scoped.idFromName("juris-x").toString() === plainIdString,
+            toScoped: scoped.get(plainId).id.toString() === plainIdString,
+            toPlain: exports.Probe.get(scoped.idFromName("juris-y")).id
+              .toString() === scoped.idFromName("juris-y").toString(),
+            envToScoped:
+              this.env.OBJ.get(plainId).id.toString() === plainIdString,
+            scopedUid: typeof scoped.newUniqueId(),
+            euHandle: refusalName(() => exports.Probe.jurisdiction("eu")),
+            euEnv: refusalName(() => this.env.OBJ.jurisdiction("eu")),
+          };
+        });
+        // An id minted by another class is refused by `idFromString` with
+        // workerd's sentence (trailing period included), on the handle and
+        // the binding paths alike.
+        out.crossId = {
+          handle: await refusal(() => exports.Probe.idFromString(
+            exports.Thrower.idFromName("z").toString())),
+          env: await refusal(() => this.env.OBJ.idFromString(
+            exports.Thrower.idFromName("z").toString())),
+        };
         // A namespace method reached off its handle is not a capability of
         // its own, and refuses with workerd's full message.
         out.detached = {};

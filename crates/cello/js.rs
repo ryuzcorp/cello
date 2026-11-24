@@ -12468,7 +12468,7 @@ fn op_do_id(
             {
                 throw_durable_object_id_error(
                     scope,
-                    "Durable Object ID is not valid for this namespace",
+                    "Durable Object ID is not valid for this namespace.",
                 );
                 return;
             }
