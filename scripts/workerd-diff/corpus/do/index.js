@@ -881,6 +881,61 @@ export class Probe {
         });
         return report(out);
       },
+      async "/exports-surface"() {
+        // #259: a Durable Object's `ctx.exports` is the module's export map,
+        // as a stateless entrypoint's is: every export is an own, enumerable,
+        // writable handle whose `typeof` is "function". A Durable Object
+        // class handle is a loopback namespace as well (so it carries the
+        // namespace methods and specializes when called), a class with no
+        // namespace is a loopback class handle, and a plain handler is a
+        // loopback service stub.
+        const state = this.state;
+        const exports = state.exports;
+        const names = Object.keys(exports).sort();
+        const entry = (name) => {
+          const value = exports[name];
+          return {
+            type: typeof value,
+            keys: Object.keys(value),
+            own: Object.getOwnPropertyNames(value).sort(),
+            tag: Object.prototype.toString.call(value),
+            get: typeof value?.get,
+            idFromName: typeof value?.idFromName,
+            fetch: typeof value?.fetch,
+          };
+        };
+        const out = {
+          names,
+          // The key set, not the module's definition order.
+          own: Object.keys(exports).sort(),
+          ownFlags: Object.keys(exports).sort().map((name) => {
+            const descriptor = Object.getOwnPropertyDescriptor(exports, name);
+            return [name, descriptor.enumerable, descriptor.writable,
+              descriptor.configurable];
+          }),
+          entries: {},
+          stable: exports === state.exports,
+        };
+        for (const name of names) out.entries[name] = entry(name);
+        // The default handler answers through its handle, exactly as a
+        // service binding would.
+        out.defaultFetch = await attempt(async () => {
+          const response = await exports.default.fetch("https://do.test/rpc");
+          return { status: response.status, body: await response.text() };
+        });
+        // A class handle reaches its own namespace and specializes for a
+        // facet.
+        out.classStub = await attempt(async () => {
+          const response = await exports.Probe.getByName("handle")
+            .fetch("https://do.test/rpc");
+          return response.status;
+        });
+        out.specialize = await attempt(() => {
+          const specialized = exports.Probe({ props: { a: 1 } });
+          return [typeof specialized, Object.getOwnPropertyNames(specialized).sort()];
+        });
+        return report(out);
+      },
       async "/transaction"() {
         const s = this.state.storage;
         await s.deleteAll();
