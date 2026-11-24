@@ -23,7 +23,16 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
   (`do/block-fail-top`, `do/block-fail-nested`, `do/block-fail-limit`) that
   fail before this change and every case agrees, and the block-limit
   conformance test now asserts the 500 and the reset behind its
-  `CELLO_TEST_BLOCK_LIMIT_MS` seam.
+  `CELLO_TEST_BLOCK_LIMIT_MS` seam. A block failure over an open
+  transaction rolls the savepoint back host-side, so the uncommitted writes
+  stay invisible and the next transaction starts clean. RPC stub callers
+  observe the abort the way fetch callers do: the first call rejects with
+  the value the block threw, class intact and with no `remote` marker, the
+  same stub stays broken while a fresh stub works, including a caller in
+  another cell. Repeats on a broken stub replay the same class and message
+  with no marker, for Error and non-Error throws alike. The gate gained
+  `do/block-fail-rpc` and `do/block-fail-open-tx` plus a TypeError repeat
+  pair, all failing before this change and agreeing after.
 - **`writer.close()` across a same-turn readable cancel resolves on a
   compression stream, as Workerd does (#262).** With no `await` between a
   write, `close()` and `reader.cancel()`, both `close()` and `writer.closed`
