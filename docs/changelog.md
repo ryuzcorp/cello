@@ -152,6 +152,29 @@ workerd 1.20261121.1).
   instead of falling back to text, and `storage.list(null)` lists where it
   used to fail deserializing the options. `head` and `delete` take no options
   on R2, so a stray argument is still ignored there, as in workerd.
+- **A released writer no longer wedges the stream** (#232). `releaseLock()`
+  run while the writable's `start` gate is still open cleared the queue but
+  left backpressure set, so the next writer's `ready` never resolved. It is
+  recomputed after the queue is dropped, so `ready` resolves exactly as on
+  workerd; the released writer's queued write still rejects with the
+  released `TypeError`. `desiredSize` on a writer that is not released now
+  reports the queue formula while the stream is erroring -- `-1` with a
+  queued write past the high-water mark -- instead of `null`; only the
+  fully errored stream answers `null`.
+- **Compression stream edges match workerd** (#230). A string chunk is
+  UTF-8 encoded (and `undefined` is an empty chunk) instead of failing the
+  byte-stream type check, whose message now names the stream class. A gzip
+  member is framed in Rust: the header's optional CRC-16 (FHCRC) is
+  verified, the trailer's CRC-32 and ISIZE are checked on the push that
+  completes each field, a member whose trailer never arrived reports
+  "Called close() on a decompression stream with incomplete data" on
+  `close()`, and bytes past the member report "Trailing bytes after end of
+  compressed data". An `abort()` racing a compression push no longer
+  replaces the push failure with the abort reason: the parked write still
+  runs, the failure is the error `closed` reports, and `abort()` resolves.
+  `releaseLock()` on a compression writable that has already closed is a
+  no-op, as on workerd's internal streams: the stream stays locked and
+  `desiredSize` stays 0. The differential gate gained nine cases.
 
 ## v0.2.9
 

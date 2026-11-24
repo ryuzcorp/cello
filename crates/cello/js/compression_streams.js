@@ -17,15 +17,23 @@
 return (() => {
 
 // Per spec the chunk must be a BufferSource; anything else is a
-// TypeError, which errors both sides of the transform.
+// TypeError, which errors both sides of the transform. Workerd's byte
+// transforms also take a string (encoded as UTF-8, measured on
+// 1.20261121.1) and treat undefined as an empty chunk, and its TypeError
+// names the stream class rather than the value (#230).
+const utf8 = new TextEncoder();
+
 function bytes(chunk) {
+  if (typeof chunk === 'string') return utf8.encode(chunk);
+  if (chunk === undefined) return new Uint8Array(0);
   if (ArrayBuffer.isView(chunk))
     return new Uint8Array(chunk.buffer, chunk.byteOffset,
                           chunk.byteLength);
   if (chunk instanceof ArrayBuffer) return new Uint8Array(chunk);
   throw new TypeError(
-    'The provided value is not of type (ArrayBuffer or ' +
-    'ArrayBufferView).');
+    'This TransformStream is being used as a byte stream, but received ' +
+    'an object of non-ArrayBuffer/ArrayBufferView type on its writable ' +
+    'side.');
 }
 
 // Releases the native stream of a collected transformer. Ids are never

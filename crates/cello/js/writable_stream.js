@@ -265,6 +265,12 @@ class WritableStreamDefaultWriter {
     const state = this.#s;
     if (state.released) return;
     const s = __wsState(state.stream);
+    // Workerd's compression streams are internal streams: once their
+    // writable side has closed -- cleanly, or through a failed push or
+    // flush -- releaseLock() is a no-op. The writer keeps the stream
+    // locked, desiredSize stays 0, and its earlier promises keep their
+    // settlement (#230).
+    if (s.closesOnError && s.state === 'closed') return;
     // Spec section 4.6.9: releasing rejects the writer's ready and
     // (still-pending) closed promises with a fresh TypeError, even while
     // an abort is in flight. For ready that means a *new* rejected promise
@@ -286,6 +292,12 @@ class WritableStreamDefaultWriter {
     for (const entry of s.queue) entry.reject(err);
     s.queue = [];
     s.queueSize = 0;
+    // The queue is empty now, so the stream is no longer over its
+    // high-water mark. Recompute rather than leave the stale flag: a new
+    // writer's ready resolves on construction only when backpressure is
+    // clear, and nothing else would re-run the check while the start gate
+    // is still open (#232).
+    s.backpressure = s.queueSize >= s.hwm;
     s.locked = false;
     s.writer = null;
     state.released = true;
@@ -300,8 +312,11 @@ class WritableStreamDefaultWriter {
       throw new TypeError(
         "This WritableStream writer has been released.");
     const s = __wsState(state.stream);
-    if (s.state === 'errored' ||
-        s.state === 'erroring') return null;
+    // Only an *errored* stream reports null; while it is still erroring
+    // workerd keeps reporting the queue formula, which can go negative
+    // (a queued write past the high-water mark, measured -1 with
+    // highWaterMark 1 and two writes outstanding) (#232).
+    if (s.state === 'errored') return null;
     if (s.state === 'closed') return 0;
     return s.hwm - s.queueSize;
   }
@@ -424,7 +439,20 @@ function __abortRequest(st, reason) {
   // No-op sink: a dropped abort() that ends up rejecting
   // must not fire the unhandled-rejection hook.
   p.catch(() => {});
-  if (!wasErroring) __startErroring(st, reason);
+  if (!wasErroring) {
+    // A compression stream's abort waits for the write in flight (#230):
+    // workerd lets the transform run, and a failed push is the error the
+    // stream keeps -- closed rejects with "Decompression failed." and
+    // abort() resolves -- instead of the abort reason poisoning the parked
+    // write. Release the write from the readable handshake so it runs; the
+    // settle path (__startWrite or __closeAfterError) ends the request.
+    if (st.closesOnError && st.state === 'writable' &&
+        (st.inFlightWrite !== null || st.queue.length > 0)) {
+      if (st.unblockWrite) st.unblockWrite();
+      return p;
+    }
+    __startErroring(st, reason);
+  }
   return p;
 }
 
@@ -536,7 +564,16 @@ function __startWrite(st, entry) {
       entry.resolve(undefined);
       st.queueSize -= entry.size;
       if (st.queueSize < 0) st.queueSize = 0;
-      if (st.state === 'writable' && !__closing(st))
+      // A compression stream's abort deferred to this write (#230): the
+      // chunk was written, so the abort now takes the normal path. Starting
+      // the error here rejects the writes still queued, then finishErroring
+      // runs the sink abort and resolves the request. Only while the stream
+      // is still writable: an abort that arrived while it was already
+      // erroring stores no reason of its own (`wasErroring`), and starting
+      // the error again would overwrite the stored one with `undefined`.
+      if (st.closesOnError && st.state === 'writable' && st.pendingAbort)
+        __startErroring(st, st.pendingAbort.reason);
+      else if (st.state === 'writable' && !__closing(st))
         __updateBackpressure(st);
       __advanceQueue(st);
     },
@@ -620,6 +657,13 @@ function __closeAfterError(st, e) {
   if (st.closeRequest) {
     st.closeRequest.reject(closedError);
     st.closeRequest = null;
+  }
+  // An abort racing this push lost: workerd keeps the push failure (closed
+  // rejects with it) and resolves abort() (#230).
+  const abortReq = st.pendingAbort;
+  if (abortReq) {
+    st.pendingAbort = null;
+    abortReq.resolve();
   }
   const writerState = st.writer === null ? undefined : __wtrState(st.writer);
   if (writerState !== undefined) {

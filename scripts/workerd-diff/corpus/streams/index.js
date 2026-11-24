@@ -7,6 +7,9 @@ const decoder = new TextDecoder();
 const text = (body) => new Response(body, { headers: { "content-type": "text/plain; charset=utf-8" } });
 const report = (value) => text(JSON.stringify(value));
 const errorInfo = (error) => ({ name: error?.name ?? String(error), message: error?.message ?? String(error) });
+const attempt = (fn) => {
+  try { return fn(); } catch (error) { return errorInfo(error); }
+};
 const checksum = (value) => {
   let sum = 0;
   for (const char of value) sum = (sum * 31 + char.codePointAt(0)) % 2147483647;
@@ -35,6 +38,36 @@ const byteStream = (chunks) =>
       controller.close();
     },
   });
+
+/** CRC-32 (gzip's polynomial), so a member can be built by hand. */
+const crc32 = (bytes) => {
+  let crc = 0xffffffff;
+  for (const byte of bytes) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+};
+
+const rawDeflate = async (bytes) =>
+  new Uint8Array(await new Response(new Response(bytes).body.pipeThrough(new CompressionStream("deflate-raw"))).arrayBuffer());
+
+/**
+ * A single gzip member built field by field, so the header CRC, the trailer's
+ * CRC-32 and ISIZE can each be made right or wrong on purpose. `headerCrc`
+ * is "none" (no FHCRC field), "valid", or "wrong".
+ */
+async function gzipMember(payload, { headerCrc = "none", crc = crc32(payload), isize = payload.length } = {}) {
+  const body = await rawDeflate(payload);
+  const head = [0x1f, 0x8b, 8, headerCrc === "none" ? 0 : 2, 0, 0, 0, 0, 0, 0xff];
+  if (headerCrc !== "none") {
+    const value = crc32(new Uint8Array(head));
+    const low = headerCrc === "wrong" ? value ^ 0xffff : value;
+    head.push(low & 0xff, (low >>> 8) & 0xff);
+  }
+  const trailer = new Uint8Array(new Uint32Array([crc, isize]).buffer);
+  return new Uint8Array([...head, ...body, ...trailer]);
+}
 
 /** Compresses, then decompresses, and reports what came back out. */
 async function roundTrip(format, payload) {
@@ -498,6 +531,275 @@ const routes = {
     };
 
     return report(out);
+  },
+
+  async "/release-before-start"() {
+    // Issue #232: releaseLock() while the writable's start gate is still
+    // open. Workerd drops the released writer's queued write with the
+    // released TypeError but leaves the stream usable: clearing the queue
+    // must clear backpressure too, or the next writer's ready() never
+    // resolves.
+    const log = [];
+    let release;
+    const ws = new WritableStream({
+      start() {
+        log.push("start");
+        return new Promise((resolve) => (release = resolve));
+      },
+      write(chunk) { log.push(`write:${chunk}`); },
+    });
+    const writer = ws.getWriter();
+    const queued = writer.write("a").then(() => "ok", errorInfo);
+    writer.releaseLock();
+    log.push("released");
+    const next = ws.getWriter();
+    let ready = "pending";
+    next.ready.then(() => (ready = "resolved"), (error) => (ready = errorInfo(error).message));
+    for (let index = 0; index < 5; index += 1) await null;
+    const beforeStart = { ready, desiredSize: next.desiredSize, locked: ws.locked };
+    release();
+    const write = await queued;
+    for (let index = 0; index < 5; index += 1) await null;
+    return report({ beforeStart, write, ready, desiredSize: next.desiredSize, log });
+  },
+
+  async "/erroring-desired-size"() {
+    // Issue #232: a writer that is not released still reports the queue
+    // formula while the stream is erroring, even when that goes negative;
+    // only the fully errored stream answers null.
+    let controller;
+    let releaseWrite;
+    const ws = new WritableStream({
+      start(c) { controller = c; },
+      write(chunk) {
+        if (chunk === "a") return new Promise((resolve) => (releaseWrite = resolve));
+      },
+    }, { highWaterMark: 1 });
+    const writer = ws.getWriter();
+    const a = writer.write("a").then(() => "ok", errorInfo);
+    const b = writer.write("b").then(() => "ok", errorInfo);
+    await null;
+    await null;
+    controller.error("boom");
+    const erroring = attempt(() => writer.desiredSize);
+    const ready = await writer.ready.then(() => "ok", errorInfo);
+    releaseWrite();
+    const out = { erroring, ready, a: await a, b: await b };
+    out.closed = await writer.closed.then(() => "ok", errorInfo);
+    out.errored = attempt(() => writer.desiredSize);
+    return report(out);
+  },
+
+  async "/compression-string-chunks"() {
+    // Issue #230: a string chunk is UTF-8 encoded (and undefined is an
+    // empty chunk) instead of failing the byte-stream type check, and the
+    // type check names the stream class the way workerd does.
+    const compress = new CompressionStream("gzip");
+    const writer = compress.writable.getWriter();
+    const packed = new Response(compress.readable).arrayBuffer();
+    const empty = await writer.write(undefined).then(() => "ok", errorInfo);
+    const text = await writer.write("héllo").then(() => "ok", errorInfo);
+    const close = await writer.close().then(() => "ok", errorInfo);
+    const bytes = new Uint8Array(await packed);
+    const back = await new Response(new Response(bytes).body.pipeThrough(new DecompressionStream("gzip"))).text();
+
+    const decompress = new DecompressionStream("gzip");
+    const dWriter = decompress.writable.getWriter();
+    const dRead = new Response(decompress.readable).arrayBuffer().then(() => "ok", errorInfo);
+    const dWrite = await dWriter.write("not gzip").then(() => "ok", errorInfo);
+    const dClose = await dWriter.close().then(() => "ok", errorInfo);
+
+    const typed = await (async () => {
+      const stream = new CompressionStream("gzip");
+      const w = stream.writable.getWriter();
+      // A pending read keeps the transform running. The chunk check fails
+      // the write, and the readable is then cancelled: which way that
+      // parking read settles depends on ordering, so it is not asserted.
+      const reader = stream.readable.getReader();
+      reader.read().catch(() => {});
+      const result = await w.write(123).then(() => "ok", errorInfo);
+      const cancel = await reader.cancel("done").then(() => "ok", errorInfo);
+      return { result, cancel };
+    })();
+
+    return report({ empty, text, close, dWrite, dClose, dRead: await dRead, back, typed, length: bytes.length });
+  },
+
+  async "/compression-truncated-close"() {
+    // Issue #230: a gzip member whose trailer never arrived reports the
+    // incomplete-data error on close(), while a trailer that arrived but
+    // does not check out fails the push that carried it, and bytes past
+    // the member are their own error.
+    const compress = async (bytes) =>
+      new Uint8Array(await new Response(new Response(bytes).body.pipeThrough(new CompressionStream("gzip"))).arrayBuffer());
+    const through = async (bytes) => {
+      const stream = new DecompressionStream("gzip");
+      const writer = stream.writable.getWriter();
+      const read = new Response(stream.readable).arrayBuffer().then(() => "ok", errorInfo);
+      return {
+        write: await writer.write(bytes).then(() => "ok", errorInfo),
+        close: await writer.close().then(() => "ok", errorInfo),
+        read: await read,
+      };
+    };
+    const whole = await compress(new TextEncoder().encode("hello world hello world"));
+    const flipped = whole.slice();
+    flipped[flipped.length - 1] ^= 0xff;
+    const trailing = new Uint8Array([...whole, 1, 2, 3, 4]);
+    return report({
+      missingTrailer: await through(whole.slice(0, whole.length - 8)),
+      cutTrailer: await through(whole.slice(0, whole.length - 4)),
+      normal: await through(whole),
+      badChecksum: await through(flipped),
+      trailing: await through(trailing),
+    });
+  },
+
+  async "/compression-abort-racing-push"() {
+    // Issue #230: an abort() racing a compression push loses to it. The
+    // parked write still runs, its push failure is the error the stream
+    // keeps, and abort() resolves.
+    const compress = async () =>
+      new Uint8Array(await new Response(new Response(new TextEncoder().encode("payload payload")).body.pipeThrough(new CompressionStream("gzip"))).arrayBuffer());
+    const whole = await compress();
+    const bad = whole.slice(0, 14);
+    bad[10] = 0xff;
+    bad[11] = 0xff;
+    bad[12] = 0xff;
+    bad[13] = 0xff;
+    const stream = new DecompressionStream("gzip");
+    const writer = stream.writable.getWriter();
+    const ready = writer.ready.then(() => "ok", errorInfo);
+    const closed = writer.closed.then(() => "ok", errorInfo);
+    const write = writer.write(bad).then(() => "ok", errorInfo);
+    const abort = writer.abort("my-reason").then(() => "ok", errorInfo);
+    const out = { abort: await abort, write: await write };
+    await null;
+    out.ready = await ready;
+    out.closed = await closed;
+    out.locked = stream.writable.locked;
+    stream.readable.cancel("done");
+    return report(out);
+  },
+
+  async "/compression-release-after-failure"() {
+    // Issue #230: the writable of a compression stream is an internal
+    // stream, so releaseLock() on it is a no-op once it has closed -- the
+    // stream stays locked and desiredSize stays 0 -- instead of admitting
+    // a new writer. A gzip member with a valid header and a corrupt deflate
+    // body fails the push, which closes the writable side.
+    const compress = async () =>
+      new Uint8Array(await new Response(new Response(new TextEncoder().encode("payload payload")).body.pipeThrough(new CompressionStream("gzip"))).arrayBuffer());
+    const whole = await compress();
+    const bad = whole.slice(0, 14);
+    bad[10] = 0xff;
+    bad[11] = 0xff;
+    bad[12] = 0xff;
+    bad[13] = 0xff;
+    const failed = new DecompressionStream("gzip");
+    const failedWriter = failed.writable.getWriter();
+    const failedClosed = failedWriter.closed.then(() => "ok", errorInfo);
+    const failedRead = new Response(failed.readable).arrayBuffer().then(() => "ok", errorInfo);
+    const failedWrite = await failedWriter.write(bad).then(() => "ok", errorInfo);
+    const read = await failedRead;
+    failedWriter.releaseLock();
+    const failedOut = {
+      write: failedWrite,
+      read,
+      locked: failed.writable.locked,
+      desiredSize: attempt(() => failedWriter.desiredSize),
+      getWriter: (() => {
+        try { return typeof failed.writable.getWriter(); } catch (error) { return error.name; }
+      })(),
+      closed: await failedClosed,
+    };
+
+    const clean = new CompressionStream("gzip");
+    const cleanWriter = clean.writable.getWriter();
+    const cleanRead = new Response(clean.readable).arrayBuffer().then(() => "ok", errorInfo);
+    await cleanWriter.write(new Uint8Array([1, 2, 3])).then(() => "ok", errorInfo);
+    await cleanWriter.close().then(() => "ok", errorInfo);
+    const cleanBytes = await cleanRead;
+    cleanWriter.releaseLock();
+    const cleanOut = {
+      read: cleanBytes,
+      locked: clean.writable.locked,
+      desiredSize: attempt(() => cleanWriter.desiredSize),
+      write: await cleanWriter.write(new Uint8Array([4])).then(() => "ok", errorInfo),
+    };
+
+    return report({ failed: failedOut, clean: cleanOut });
+  },
+
+  async "/compression-gzip-header-crc"() {
+    // Issue #230 review: FHCRC is validated, not skipped. A correct header
+    // CRC is accepted; a wrong one fails the push that carries it.
+    const payload = encoder.encode("fhcrc payload fhcrc payload");
+    const through = async (bytes) => {
+      const stream = new DecompressionStream("gzip");
+      const writer = stream.writable.getWriter();
+      const read = new Response(stream.readable).arrayBuffer().then((buffer) => `ok ${buffer.byteLength}`, errorInfo);
+      return {
+        write: await writer.write(bytes).then(() => "ok", errorInfo),
+        close: await writer.close().then(() => "ok", errorInfo),
+        read: await read,
+      };
+    };
+    return report({
+      valid: await through(await gzipMember(payload, { headerCrc: "valid" })),
+      wrong: await through(await gzipMember(payload, { headerCrc: "wrong" })),
+      absent: await through(await gzipMember(payload)),
+    });
+  },
+
+  async "/compression-trailer-split"() {
+    // Issue #230 review: the trailer's CRC-32 is checked as soon as its four
+    // bytes arrive, so a bad checksum fails its own push even when ISIZE is
+    // still to come.
+    const payload = encoder.encode("split trailer payload");
+    const member = await gzipMember(payload);
+    const badCrc = member.slice();
+    badCrc[badCrc.length - 8] ^= 0xff;
+    const badSize = member.slice();
+    badSize[badSize.length - 1] ^= 0xff;
+    const split = (bytes) => [bytes.slice(0, bytes.length - 8), bytes.slice(bytes.length - 8, bytes.length - 4), bytes.slice(bytes.length - 4)];
+    const feed = async (pieces) => {
+      const stream = new DecompressionStream("gzip");
+      const writer = stream.writable.getWriter();
+      const read = new Response(stream.readable).arrayBuffer().then((buffer) => `ok ${buffer.byteLength}`, errorInfo);
+      const writes = [];
+      for (const piece of pieces) writes.push(await writer.write(piece).then(() => "ok", errorInfo));
+      return {
+        writes,
+        close: await writer.close().then(() => "ok", errorInfo),
+        read: await read,
+      };
+    };
+    return report({
+      badCrc: await feed(split(badCrc)),
+      badSize: await feed(split(badSize)),
+      good: await feed([member]),
+    });
+  },
+
+  async "/compression-cancel-then-abort"() {
+    // Issue #230 review: a readable cancel followed by an abort while a write
+    // is in flight must not lose the stored error -- the bug rejected both
+    // closed and abort with `undefined`. The rejection reason itself differs
+    // on base (workerd answers the abort reason), so only its presence is
+    // pinned here; the exact reason is asserted by the Rust test.
+    const stream = new CompressionStream("gzip");
+    const writer = stream.writable.getWriter();
+    const reader = stream.readable.getReader();
+    reader.read().catch(() => {});
+    await null;
+    const write = writer.write(encoder.encode("payload")).then(() => "ok", errorInfo);
+    const cancel = reader.cancel("cancel-reason").then(() => "ok", errorInfo);
+    // The abort is the call that used to overwrite the stored error; its own
+    // settlement differs from workerd's on base, so it is not asserted here.
+    writer.abort("abort-reason").catch(() => {});
+    const closed = writer.closed.then(() => "resolved", (error) => (error === undefined ? "undefined" : "rejected"));
+    return report({ write: await write, cancel: await cancel, closed: await closed });
   },
 
   async "/writable-backpressure"() {

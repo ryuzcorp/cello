@@ -81,7 +81,7 @@ pub(super) fn op_zlib(
 /// chunk by chunk instead of arriving once at close.
 enum ZlibStream {
     GzipEncode(flate2::write::GzEncoder<Vec<u8>>),
-    GzipDecode(flate2::write::GzDecoder<Vec<u8>>),
+    GzipDecode(Box<GzipDecode>),
     ZlibEncode(flate2::write::ZlibEncoder<Vec<u8>>),
     ZlibDecode(flate2::write::ZlibDecoder<Vec<u8>>),
     RawEncode(flate2::write::DeflateEncoder<Vec<u8>>),
@@ -95,13 +95,305 @@ enum ZlibStream {
     BrotliDecode(Box<brotli::DecompressorWriter<Vec<u8>>>),
 }
 
+/// Workerd's gzip close() message for a member whose trailer never arrived,
+/// shared by every decompressor that can report it.
+const INCOMPLETE: &str = "Called close() on a decompression stream with incomplete data";
+
+/// A gzip stream framed here rather than by flate2's `write::GzDecoder`.
+///
+/// That decoder validates the trailer only in `finish()`, so a missing
+/// trailer and a wrong checksum are the same `InvalidInput` error, a bad
+/// checksum surfaces on close() instead of on the push that carried it,
+/// and bytes after the member reach the caller as a generic failure.
+/// Workerd validates as the bytes arrive, and its three outcomes are
+/// distinct (#230, measured on 1.20261121.1): a failed push is
+/// "Decompression failed.", a header or trailer that never completes is
+/// the incomplete-data error at close, and input past the trailer is
+/// "Trailing bytes after end of compressed data".
+struct GzipDecode {
+    phase: GzipPhase,
+    /// Raw inflate: the gzip header and trailer are this type's job.
+    inflate: flate2::Decompress,
+    /// CRC-32 of the uncompressed bytes, and their count for ISIZE.
+    crc: flate2::Crc,
+    /// CRC-32 of every header byte, for FHCRC's low 16 bits.
+    header_crc: flate2::Crc,
+    /// The header's FLG byte, with each optional field cleared as it is
+    /// consumed, so the next one is always the lowest remaining bit.
+    flags: u8,
+}
+
+enum GzipPhase {
+    /// Collecting the fixed ten-byte header.
+    Header {
+        buf: [u8; 10],
+        len: usize,
+    },
+    /// Collecting FEXTRA's two-byte XLEN.
+    ExtraLen {
+        buf: [u8; 2],
+        len: usize,
+    },
+    /// Skipping FEXTRA's XLEN payload bytes.
+    Extra {
+        left: usize,
+    },
+    /// Skipping a NUL-terminated FNAME or FCOMMENT.
+    Name,
+    Comment,
+    /// Collecting FHCRC, checked against the header's CRC-16 once both
+    /// bytes have arrived.
+    HeaderCrc {
+        buf: [u8; 2],
+        len: usize,
+    },
+    /// Inflating the deflate body.
+    Body,
+    /// Collecting the trailer's CRC-32, checked as soon as its four bytes
+    /// arrive (workerd fails that push, not the one carrying ISIZE).
+    TrailerCrc {
+        buf: [u8; 4],
+        len: usize,
+    },
+    /// Collecting the trailer's ISIZE.
+    TrailerSize {
+        buf: [u8; 4],
+        len: usize,
+    },
+    /// The member ended and its trailer checked out.
+    Done,
+}
+
+const GZIP_FAILURE: &str = "Decompression failed.";
+const GZIP_TRAILING: &str = "Trailing bytes after end of compressed data";
+
+/// The bytes after a NUL-terminated header field, or `None` when this
+/// chunk ends inside it and the next push has to carry the terminator.
+fn after_nul(input: &[u8]) -> Option<&[u8]> {
+    input
+        .iter()
+        .position(|&byte| byte == 0)
+        .map(|end| &input[end + 1..])
+}
+
+impl GzipDecode {
+    fn new() -> Self {
+        GzipDecode {
+            phase: GzipPhase::Header {
+                buf: [0; 10],
+                len: 0,
+            },
+            inflate: flate2::Decompress::new(false),
+            crc: flate2::Crc::new(),
+            header_crc: flate2::Crc::new(),
+            flags: 0,
+        }
+    }
+
+    /// Consumes what it can of the next optional header field, falling
+    /// through to the one after it.
+    fn next_header_field(&mut self) {
+        self.phase = if self.flags & 0x04 != 0 {
+            self.flags &= !0x04;
+            GzipPhase::ExtraLen {
+                buf: [0; 2],
+                len: 0,
+            }
+        } else if self.flags & 0x08 != 0 {
+            self.flags &= !0x08;
+            GzipPhase::Name
+        } else if self.flags & 0x10 != 0 {
+            self.flags &= !0x10;
+            GzipPhase::Comment
+        } else if self.flags & 0x02 != 0 {
+            self.flags &= !0x02;
+            GzipPhase::HeaderCrc {
+                buf: [0; 2],
+                len: 0,
+            }
+        } else {
+            GzipPhase::Body
+        };
+    }
+
+    /// One push: advances the frame and inflates the body bytes the frame
+    /// leaves, returning whatever output it produced.
+    fn push(&mut self, mut input: &[u8]) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        loop {
+            // Taken by value so an arm can set `self.phase` without
+            // borrowing it; every path below installs the next phase.
+            match std::mem::replace(&mut self.phase, GzipPhase::Done) {
+                GzipPhase::Header { mut buf, mut len } => {
+                    let take = (10 - len).min(input.len());
+                    buf[len..len + take].copy_from_slice(&input[..take]);
+                    self.header_crc.update(&input[..take]);
+                    len += take;
+                    input = &input[take..];
+                    // Workerd rejects a bad magic, method or flag as soon
+                    // as those bytes arrive, not once the header is whole
+                    // (measured: an eight-byte "not gzip" chunk fails the
+                    // push rather than the close).
+                    if (len >= 2 && (buf[0] != 0x1f || buf[1] != 0x8b))
+                        || (len >= 3 && buf[2] != 8)
+                        || (len >= 4 && buf[3] & 0xe0 != 0)
+                    {
+                        return Err(anyhow!(GZIP_FAILURE));
+                    }
+                    if len < 10 {
+                        self.phase = GzipPhase::Header { buf, len };
+                        return Ok(out);
+                    }
+                    self.flags = buf[3];
+                    self.next_header_field();
+                }
+                GzipPhase::ExtraLen { mut buf, mut len } => {
+                    let take = (2 - len).min(input.len());
+                    buf[len..len + take].copy_from_slice(&input[..take]);
+                    self.header_crc.update(&input[..take]);
+                    len += take;
+                    input = &input[take..];
+                    if len < 2 {
+                        self.phase = GzipPhase::ExtraLen { buf, len };
+                        return Ok(out);
+                    }
+                    self.phase = GzipPhase::Extra {
+                        left: u16::from_le_bytes(buf) as usize,
+                    };
+                }
+                GzipPhase::Extra { left } => {
+                    let take = left.min(input.len());
+                    self.header_crc.update(&input[..take]);
+                    input = &input[take..];
+                    let left = left - take;
+                    if left > 0 {
+                        self.phase = GzipPhase::Extra { left };
+                        return Ok(out);
+                    }
+                    self.next_header_field();
+                }
+                GzipPhase::Name => {
+                    let Some(rest) = after_nul(input) else {
+                        self.header_crc.update(input);
+                        self.phase = GzipPhase::Name;
+                        return Ok(out);
+                    };
+                    self.header_crc.update(&input[..input.len() - rest.len()]);
+                    input = rest;
+                    self.next_header_field();
+                }
+                GzipPhase::Comment => {
+                    let Some(rest) = after_nul(input) else {
+                        self.header_crc.update(input);
+                        self.phase = GzipPhase::Comment;
+                        return Ok(out);
+                    };
+                    self.header_crc.update(&input[..input.len() - rest.len()]);
+                    input = rest;
+                    self.next_header_field();
+                }
+                GzipPhase::HeaderCrc { mut buf, mut len } => {
+                    let take = (2 - len).min(input.len());
+                    buf[len..len + take].copy_from_slice(&input[..take]);
+                    len += take;
+                    input = &input[take..];
+                    if len < 2 {
+                        self.phase = GzipPhase::HeaderCrc { buf, len };
+                        return Ok(out);
+                    }
+                    // RFC 1952 FHCRC: the low 16 bits of the CRC-32 of every
+                    // header byte before these two.
+                    if u16::from_le_bytes(buf) != self.header_crc.sum() as u16 {
+                        return Err(anyhow!(GZIP_FAILURE));
+                    }
+                    self.next_header_field();
+                }
+                GzipPhase::Body => {
+                    let mut status = flate2::Status::Ok;
+                    while status != flate2::Status::StreamEnd {
+                        let produced = out.len();
+                        let before = self.inflate.total_in();
+                        out.reserve(32 * 1024);
+                        status = self
+                            .inflate
+                            .decompress_vec(input, &mut out, flate2::FlushDecompress::None)
+                            .map_err(|_| anyhow!(GZIP_FAILURE))?;
+                        let used = (self.inflate.total_in() - before) as usize;
+                        input = &input[used..];
+                        self.crc.update(&out[produced..]);
+                        // Neither buffer moved: the next push or close
+                        // supplies the rest of the member.
+                        if status != flate2::Status::StreamEnd && used == 0 && out.len() == produced
+                        {
+                            self.phase = GzipPhase::Body;
+                            return Ok(out);
+                        }
+                    }
+                    self.phase = GzipPhase::TrailerCrc {
+                        buf: [0; 4],
+                        len: 0,
+                    };
+                }
+                GzipPhase::TrailerCrc { mut buf, mut len } => {
+                    let take = (4 - len).min(input.len());
+                    buf[len..len + take].copy_from_slice(&input[..take]);
+                    len += take;
+                    input = &input[take..];
+                    if len < 4 {
+                        self.phase = GzipPhase::TrailerCrc { buf, len };
+                        return Ok(out);
+                    }
+                    if u32::from_le_bytes(buf) != self.crc.sum() {
+                        return Err(anyhow!(GZIP_FAILURE));
+                    }
+                    self.phase = GzipPhase::TrailerSize {
+                        buf: [0; 4],
+                        len: 0,
+                    };
+                }
+                GzipPhase::TrailerSize { mut buf, mut len } => {
+                    let take = (4 - len).min(input.len());
+                    buf[len..len + take].copy_from_slice(&input[..take]);
+                    len += take;
+                    input = &input[take..];
+                    if len < 4 {
+                        self.phase = GzipPhase::TrailerSize { buf, len };
+                        return Ok(out);
+                    }
+                    if u32::from_le_bytes(buf) != self.crc.amount() {
+                        return Err(anyhow!(GZIP_FAILURE));
+                    }
+                    self.phase = GzipPhase::Done;
+                }
+                GzipPhase::Done => {
+                    if !input.is_empty() {
+                        return Err(anyhow!(GZIP_TRAILING));
+                    }
+                    self.phase = GzipPhase::Done;
+                    return Ok(out);
+                }
+            }
+        }
+    }
+
+    /// Close: only a member whose trailer checked out is complete.
+    fn finish(self) -> Result<Vec<u8>> {
+        match self.phase {
+            GzipPhase::Done => Ok(Vec::new()),
+            _ => Err(anyhow!(INCOMPLETE)),
+        }
+    }
+}
+
 /// The writer types share `write`/`get_ref`/`get_mut` but not `finish`,
 /// so dispatch once here; the brotli arms are the ones without `finish`.
 macro_rules! zlib_each {
     ($stream:expr, $w:ident => $body:expr) => {
         match $stream {
             ZlibStream::GzipEncode($w) => $body,
-            ZlibStream::GzipDecode($w) => $body,
+            ZlibStream::GzipDecode(_) => {
+                unreachable!("the gzip decoder is framed in Rust")
+            }
             ZlibStream::ZlibEncode($w) => $body,
             ZlibStream::ZlibDecode($w) => $body,
             ZlibStream::RawEncode($w) => $body,
@@ -118,7 +410,9 @@ macro_rules! zlib_each_flate {
     ($stream:expr, $w:ident => $body:expr) => {
         match $stream {
             ZlibStream::GzipEncode($w) => $body,
-            ZlibStream::GzipDecode($w) => $body,
+            ZlibStream::GzipDecode(_) => {
+                unreachable!("the gzip decoder is framed in Rust")
+            }
             ZlibStream::ZlibEncode($w) => $body,
             ZlibStream::ZlibDecode($w) => $body,
             ZlibStream::RawEncode($w) => $body,
@@ -137,7 +431,7 @@ impl ZlibStream {
         let sink = Vec::new;
         Some(match (format, decompress) {
             ("gzip", false) => Self::GzipEncode(z::GzEncoder::new(sink(), level)),
-            ("gzip", true) => Self::GzipDecode(z::GzDecoder::new(sink())),
+            ("gzip", true) => Self::GzipDecode(Box::new(GzipDecode::new())),
             ("deflate", false) => Self::ZlibEncode(z::ZlibEncoder::new(sink(), level)),
             ("deflate", true) => Self::ZlibDecode(z::ZlibDecoder::new(sink())),
             ("deflate-raw", false) => Self::RawEncode(z::DeflateEncoder::new(sink(), level)),
@@ -174,9 +468,13 @@ impl ZlibStream {
     /// back as one chunk), with the rest arriving from `finish`. A
     /// decoder that stops consuming input has hit the end of the
     /// compressed stream, so leftover bytes are trailing garbage —
-    /// Workerd's strict_compression_checks.
+    /// Workerd's strict_compression_checks. Gzip frames and validates its
+    /// own bytes (see [`GzipDecode`]).
     fn push(&mut self, mut input: &[u8]) -> Result<Vec<u8>> {
         use std::io::Write;
+        if let Self::GzipDecode(decoder) = self {
+            return decoder.push(input);
+        }
         const ENCODER_CHUNK: usize = 32 * 1024;
         let failure = self.failure();
         let held = if self.decompress() { 0 } else { ENCODER_CHUNK };
@@ -191,17 +489,18 @@ impl ZlibStream {
         })
     }
 
-    /// Terminate the stream and return the final output. For gzip this
-    /// also validates the trailer, so a truncated stream errors here.
+    /// Terminate the stream and return the final output. A decoder reports
+    /// the incomplete-data error when its member never ended; gzip's
+    /// trailer is validated as its bytes arrive (see [`GzipDecode`]).
     fn finish(self) -> Result<Vec<u8>> {
         // Workerd tells a truncated stream apart from corrupt input on
         // close(): "incomplete data" for the former, "Decompression failed."
         // for the latter. flate2 reports the former as UnexpectedEof, and its
         // brotli decoder reports both as a failed close (measured: workerd
         // answers the incomplete message for either brotli case).
-        const INCOMPLETE: &str = "Called close() on a decompression stream with incomplete data";
         let failure = self.failure();
         match self {
+            Self::GzipDecode(decoder) => decoder.finish(),
             Self::BrotliEncode(writer) => Ok((*writer).into_inner()),
             Self::BrotliDecode(writer) => (*writer).into_inner().map_err(|_| anyhow!(INCOMPLETE)),
             other => zlib_each_flate!(other, w => w.finish().map_err(|error| {
@@ -408,6 +707,32 @@ export default {
         }
         return Response.json({ ok: true });
       }
+      case "/gzip-frames": {
+        // The three outcomes workerd distinguishes on a decompression
+        // stream: an unfinished member, a checksum that does not check out,
+        // and bytes past the member (#230).
+        const payload = new TextEncoder().encode("hello world hello world");
+        const packed = await through(new CompressionStream("gzip"), payload);
+        const flipped = packed.slice();
+        flipped[flipped.length - 1] ^= 0xff;
+        const trailing = new Uint8Array(packed.byteLength + 3);
+        trailing.set(packed);
+        trailing.set([1, 2, 3], packed.byteLength);
+        const attempt = async (bytes) => {
+          const stream = new DecompressionStream("gzip");
+          const writer = stream.writable.getWriter();
+          const read = drain(stream.readable).then(() => "resolved", (e) => e.message);
+          const write = await writer.write(bytes).then(() => "resolved", (e) => e.message);
+          const close = await writer.close().then(() => "resolved", (e) => e.message);
+          return { write, close, read: await read };
+        };
+        return Response.json({
+          normal: await attempt(packed),
+          missingTrailer: await attempt(packed.slice(0, packed.byteLength - 8)),
+          badChecksum: await attempt(flipped),
+          trailing: await attempt(trailing),
+        });
+      }
       case "/release": {
         // Held, so only the stream's own ending can release its entry.
         const cancelled = new CompressionStream("gzip");
@@ -535,6 +860,42 @@ export default {
             }
         }
         panic!("foreground tasks kept coming after 1024 runs");
+    }
+
+    /// A gzip member is framed natively: an unfinished member is the
+    /// incomplete-data error on close, a bad checksum fails the push that
+    /// carries the trailer, and bytes past the member are their own error.
+    #[test]
+    fn gzip_frames_report_workerd_outcomes() {
+        on_engine_thread(|| {
+            let mut worker = load();
+            let report = fetch(&mut worker, "/gzip-frames");
+            assert_eq!(report["normal"]["write"], "resolved", "{report}");
+            assert_eq!(report["normal"]["close"], "resolved", "{report}");
+            assert_eq!(report["missingTrailer"]["write"], "resolved", "{report}");
+            assert_eq!(
+                report["missingTrailer"]["close"],
+                "Called close() on a decompression stream with incomplete data",
+                "{report}"
+            );
+            assert_eq!(
+                report["missingTrailer"]["read"],
+                report["missingTrailer"]["close"]
+            );
+            assert_eq!(
+                report["badChecksum"]["write"], "Decompression failed.",
+                "{report}"
+            );
+            assert_eq!(
+                report["badChecksum"]["close"], "This WritableStream has been closed.",
+                "{report}"
+            );
+            assert_eq!(
+                report["trailing"]["write"], "Trailing bytes after end of compressed data",
+                "{report}"
+            );
+            assert_eq!(live(&worker), 0);
+        });
     }
 
     /// Every format round-trips chunk by chunk, and a stream that flushes
