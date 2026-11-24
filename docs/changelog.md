@@ -21,7 +21,7 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
    `do/nested-siblings-await`, `do/nested-siblings-await-second`,
    `do/nested-siblings-child`, `do/nested-siblings-inner-timer`,
    `do/nested-siblings-inner-fetch`, `do/nested-siblings-storage`,
-   `do/nested-siblings-fail`) that fail before this change and every case
+   `do/nested-siblings-fail`) that fail on `origin/main` and every case
    agrees.
 
   - **Transform pipe-cancel and internal-stream writes match Workerd in the
@@ -82,7 +82,7 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
   never the section itself, and never a sibling or nephew -- and the frame
   record rides the body's continuations so a schedule after an `await` still
    (`do/nested-hold-timers`, `do/nested-hold-fetch` and
-   `do/nested-hold-prearmed-after-fail`) that fail before this change and
+   `do/nested-hold-prearmed-after-fail`) that fail on `origin/main` and
    every case agrees.
 - **A throw, the 64-level limit or the 30 s limit in
   `blockConcurrencyWhile` breaks the event the way workerd breaks it

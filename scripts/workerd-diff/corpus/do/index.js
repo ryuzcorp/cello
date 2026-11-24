@@ -1055,6 +1055,74 @@ export class Probe {
         });
         return report({ unreachable: true });
       },
+      // #282: several timers held past their deadlines release innermost
+      // scope first, deadline order within a scope, scopeless (handler)
+      // timers last. Each shape below pins one ordering against deadline
+      // order: a handler timer loses to an outer-body timer with a later
+      // deadline, an inner-body timer beats an outer-body timer with an
+      // earlier deadline, and an interval ticks once at the drain, then
+      // re-arms normally.
+      async "/nested-hold-scope"() {
+        const log = [];
+        const h = new Promise((resolve) => setTimeout(() => { log.push("H-done"); resolve(); }, 50));
+        await this.state.blockConcurrencyWhile(async () => {
+          log.push("outer-body");
+          const o = new Promise((resolve) => setTimeout(() => { log.push("O-done"); resolve(); }, 100));
+          this.state.blockConcurrencyWhile(async () => {
+            log.push("inner-body");
+            await new Promise((resolve) => setTimeout(resolve, 300));
+            log.push("inner-done");
+          });
+          await o;
+          log.push("after-o");
+          return "outer-value";
+        });
+        await h;
+        log.push("after-h");
+        return report({ log });
+      },
+      async "/nested-hold-depth2"() {
+        const log = [];
+        await this.state.blockConcurrencyWhile(async () => {
+          log.push("outer-body");
+          const u = new Promise((resolve) => setTimeout(() => { log.push("U-done"); resolve(); }, 50));
+          await this.state.blockConcurrencyWhile(async () => {
+            log.push("I-body");
+            const t = new Promise((resolve) => setTimeout(() => { log.push("I-done"); resolve(); }, 100));
+            await this.state.blockConcurrencyWhile(async () => {
+              log.push("J-body");
+              await new Promise((resolve) => setTimeout(resolve, 200));
+              log.push("J-done");
+            });
+            await t;
+            log.push("I-after-t");
+            return "I-value";
+          });
+          await u;
+          log.push("O-after-u");
+          return "outer-value";
+        });
+        log.push("outer-awaited");
+        return report({ log });
+      },
+      async "/nested-hold-interval"() {
+        const log = [];
+        await this.state.blockConcurrencyWhile(async () => {
+          log.push("outer-body");
+          const iv = setInterval(() => log.push("tick"), 50);
+          this.state.blockConcurrencyWhile(async () => {
+            log.push("inner-body");
+            await new Promise((resolve) => setTimeout(resolve, 300));
+            log.push("inner-done");
+          });
+          await new Promise((resolve) => setTimeout(resolve, 360));
+          clearInterval(iv);
+          log.push("cleared");
+          return "outer-value";
+        });
+        log.push("outer-awaited");
+        return report({ log });
+      },
       // #278: sibling nested sections in one body run one at a time, in
       // schedule order: the second starts only after the first has fully
       // settled, body and descendants alike. Each log below carries order
@@ -1970,6 +2038,23 @@ const routes = {
      });
      return report(out);
    },
+  // #282: several timers held past their deadlines release innermost
+  // scope first, deadline order within a scope, scopeless timers last.
+  async "/nested-hold-order"() {
+    const out = {};
+    for (const [key, path] of [
+      ["scope", "/nested-hold-scope"],
+      ["depth2", "/nested-hold-depth2"],
+      ["interval", "/nested-hold-interval"],
+    ]) {
+      const stub = OBJ.getByName(`nested-hold-${key}`);
+      out[key] = await attempt(async () => {
+        const response = await stub.fetch(`https://do.test${path}`);
+        return { status: response.status, body: await response.text() };
+      });
+    }
+    return report(out);
+  },
   async "/ids"() {
     const a = OBJ.idFromName("alpha");
     const b = OBJ.idFromName("alpha");
