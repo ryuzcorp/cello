@@ -252,6 +252,12 @@ export const cases = [
     fixture: "do",
     path,
   })),
+  // #282: a held timer whose callback throws must not wedge the section.
+  ...["/nested-hold-throwstuck"].map((path) => ({
+    name: `do${path}`,
+    fixture: "do",
+    path,
+  })),
   // #268 P1a/P1b: pre-armed timers must wait for sections that open after
   // they were armed, and a nested failure must leave no trace in the
   // open-section records. The orchestration fails a nested block on one

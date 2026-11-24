@@ -1123,6 +1123,32 @@ export class Probe {
         log.push("outer-awaited");
         return report({ log });
       },
+      // #282: a held timer whose callback throws must not wedge the
+      // section: the throw stays an unhandled rejection, but the release
+      // bookkeeping runs regardless, so the event completes with the full
+      // log instead of hanging.
+      async "/nested-hold-throwstuck"() {
+        const log = [];
+        const gate = this.state.blockConcurrencyWhile(async () => {
+          log.push("outer-body");
+          setTimeout(() => { log.push("T-throws"); throw new Error("timer-boom"); }, 50);
+          this.state.blockConcurrencyWhile(async () => {
+            log.push("inner-body");
+            await new Promise((resolve) => setTimeout(resolve, 300));
+            log.push("inner-done");
+          });
+          await new Promise((resolve) => setTimeout(resolve, 600));
+          log.push("outer-after");
+          return "outer-value";
+        });
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        log.push("handler-150");
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        log.push("handler-400");
+        await gate;
+        log.push("awaited");
+        return report({ log });
+      },
       // #278: sibling nested sections in one body run one at a time, in
       // schedule order: the second starts only after the first has fully
       // settled, body and descendants alike. Each log below carries order

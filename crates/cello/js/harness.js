@@ -2304,11 +2304,11 @@ const __holdKey = Symbol("cello.hold");
    // so pre-armed timers and subrequests must not bail out here. Handler
    // work runs in no body and names no section, so the wait covers every
    // open section of its state.
-   const scope = __currentActorScope();
-   if (scope === "") return undefined;
-   const state = __cell.instances[scope]?.__celloState;
-   if (state === undefined || state === null) return undefined;
-   return { state, section: undefined };
+  const scope = __currentActorScope();
+  if (scope === "") return undefined;
+  const state = __cell.instances[scope]?.__celloState;
+  if (state === undefined || state === null) return undefined;
+  return { state, section: undefined };
  };
 // Whether `record` is nested inside `ancestor`, through any number of
 // levels: a section holds only the waits scheduled in the sections above
@@ -2414,10 +2414,16 @@ class Timeout {
             ? hold.section : null;
           if (owner !== null) owner.pendingFires++;
           __holdNestedSections(hold).then(() => {
-            fire();
-            if (owner !== null) {
-              owner.pendingFires--;
-              __maybeResolveRelease(owner);
+            // A throwing guest callback must not wedge the section: the
+            // throw stays an unhandled rejection, but the release
+            // bookkeeping runs regardless (#282).
+            try {
+              fire();
+            } finally {
+              if (owner !== null) {
+                owner.pendingFires--;
+                __maybeResolveRelease(owner);
+              }
             }
           });
         }
@@ -4546,25 +4552,27 @@ class DurableObjectState {
       // later reserves a deeper number without being enclosed.
       const frame = __als_get();
       const entered = frame === undefined ? undefined : frame.get(__holdKey);
-      let parent;
+      let parent = null;
       if (entered !== undefined && entered.state === this && entered.section !== undefined) {
         // The scheduling body's own section, or the nearest ancestor still
         // open: a continuation that outlives its section joins the drain
         // still running above it.
         parent = entered.section;
         while (parent.settledFlag) {
-          if (parent.parent === null) { parent = undefined; break; }
+          if (parent.parent === null) { parent = null; break; }
           parent = parent.parent;
         }
       }
-      if (parent === undefined) {
+      if (parent === null) {
         // Scheduled outside any body -- a timer or handler reaction firing
         // while a section drains -- joins the youngest open section of this
-        // state. `_blockDepth` is nonzero here, so one exists.
+        // state. `_blockDepth` is nonzero here, so one exists, unless the
+        // state was reset and its map cleared, in which case the section
+        // stays parentless (#282).
         const openSections = this._openNested;
         if (openSections !== undefined) {
           for (const candidate of openSections.values()) {
-            if (parent === undefined || candidate.seq > parent.seq) parent = candidate;
+            if (parent === null || candidate.seq > parent.seq) parent = candidate;
           }
         }
       }
@@ -4583,6 +4591,7 @@ class DurableObjectState {
       };
       let resolveSettled;
       record.settled = new Promise((resolve) => { resolveSettled = resolve; });
+      record.resolveSettled = resolveSettled;
       let resolveRelease;
       record.release = new Promise((resolve) => { resolveRelease = resolve; });
       record.resolveRelease = resolveRelease;
@@ -4759,7 +4768,12 @@ class DurableObjectState {
         return value;
       } catch (error) {
         // A block that never reached its body -- the acquisition refused, or
-        // the block ahead failed -- rejects the caller's promise too.
+        // the block ahead failed -- rejects the caller's promise too. Forget
+        // the synchronously opened root as well: nothing it could wait for
+        // ever ran, and the guarded delete makes a double-forget free (#282).
+        rootSection.settledFlag = true;
+        __maybeResolveRelease(rootSection);
+        if (openRootSections.delete(rootSection)) __openSectionCount--;
         rejectGuest(error);
         throw error;
       } finally {
@@ -4867,22 +4881,31 @@ class DurableObjectState {
       },
     );
   }
-  // Reconcile the open-section count synchronously before the termination
+  // Reconcile the open sections synchronously before the termination
   // below: the settle microtasks that would forget these records never run
   // on a terminated cell, so without this the isolate-global counter stays
-  // elevated and every later capture in the isolate pays the slow path.
-  // Clearing the map drops the stale records with it; the guarded
-  // `open.delete` forgets keep any surviving reaction safe.
-  #reconcileOpenSections() {
+  // elevated, every later capture in the isolate pays the slow path, and --
+  // worst -- any hold already waiting on these records pends forever, since
+  // neither `settled` nor `release` would ever resolve (#282). Force both
+  // resolved with the failure so waiters are released and fail fast against
+  // the dead object instead of hanging; the guarded `open.delete` forgets
+  // keep any surviving reaction safe, and clearing the map drops the stale
+  // records with it.
+  #reconcileOpenSections(failure) {
     const open = this._openNested;
     if (open === undefined) return;
+    for (const record of open.values()) {
+      record.settledFlag = true;
+      if (record.resolveSettled !== undefined) record.resolveSettled(failure);
+      record.resolveRelease();
+    }
     __openSectionCount -= open.size;
     open.clear();
   }
   #resetAfterConcurrencyFailure(error) {
     if (this._aborted) return;
     this._aborted = true;
-    this.#reconcileOpenSections();
+    this.#reconcileOpenSections(error);
     // Drop this scope's queued puts, not the executing cell's: under a
     // stub-mediated caller the executing cell is the caller, whose puts
     // must survive. The host verifies this scope is a resetting cell of
@@ -4911,7 +4934,7 @@ class DurableObjectState {
   abort(reason) {
     if (this._aborted) return;
     this._aborted = true;
-    this.#reconcileOpenSections();
+    this.#reconcileOpenSections(reason);
     // Drop this scope's queued puts, not the executing cell's: under a
     // stub-mediated caller the executing cell is the caller, whose puts
     // must survive. The host verifies this scope is a resetting cell of
