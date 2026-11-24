@@ -570,6 +570,18 @@ export class Probe {
           createdToArray: created.toArray?.() ?? null,
         };
         out.cursorShape = Object.fromEntries(Object.entries(Object.getOwnPropertyDescriptors(Object.getPrototypeOf(withColumns))).map(([k, d]) => [k, typeof d.value]));
+        // A cursor's `next()` answers both members even when it is done, and
+        // both `one()` refusals end with workerd's period (#251 review).
+        const tail = sql.exec("SELECT 1 AS v");
+        tail.next();
+        const tailDone = tail.next();
+        const emptyDone = sql.exec("SELECT 1 AS v WHERE 0").next();
+        out.tailDoneKeys = Object.keys(tailDone);
+        out.tailDoneValue = "value" in tailDone ? String(tailDone.value) : "<absent>";
+        out.emptyDoneKeys = Object.keys(emptyDone);
+        out.emptyDoneValue = "value" in emptyDone ? String(emptyDone.value) : "<absent>";
+        out.oneEmpty = await attempt(() => sql.exec("SELECT 1 WHERE 0").one());
+        out.oneMany = await attempt(() => sql.exec("SELECT 1 UNION ALL SELECT 2").one());
         return report(out);
       },
       async "/sql-types"() {
@@ -910,10 +922,94 @@ const routes = {
       const response = await stub.fetch.call({}, "https://do.test/rpc");
       return { status: response.status };
     });
-    // `connect` converts a `SocketAddress` or a `host:port` string before the
-    // transport is reached; Cello has none, so only the two refusals compare.
-    out.connectNoArg = await attempt(() => stub.connect());
-    out.connectNoPort = await attempt(() => stub.connect("https://do.test/"));
+    // `connect` converts its argument as workerd's `AnySocketAddress` union
+    // does before the transport is reached: an object is the SocketAddress
+    // dictionary, every primitive is a `host:port` string the URL parser
+    // splits, and a converted address must be a valid host. Only the
+    // conversion is compared: workerd dials and answers a Socket where Cello
+    // refuses at its missing transport, so any non-TypeError reads as
+    // "converted" on both, while every conversion refusal is a TypeError
+    // whose name and message are compared. Every row was probed against
+    // workerd 1.20261121.1 (#251 review).
+    const connect = (value) => attempt(async () => {
+      try {
+        await stub.connect(value);
+      } catch (error) {
+        if (error instanceof TypeError) throw error;
+      }
+      return "<converted>";
+    });
+    out.connectNoArg = await attempt(() => {
+      stub.connect();
+      return "<converted>";
+    });
+    for (const [name, value] of Object.entries({
+      empty: "", blank: " ", hostOnly: "127.0.0.1", emptyPort: "127.0.0.1:",
+      emptyHost: ":80", nameHost: "host:80", valid: "127.0.0.1:80",
+      port0: "127.0.0.1:0", portMax: "127.0.0.1:65535",
+      portOver: "127.0.0.1:65536", portHuge: "127.0.0.1:99999",
+      portFloat: "127.0.0.1:1.5", portWord: "127.0.0.1:http",
+      scheme: "https://do.test/", portNegative: "127.0.0.1:-1",
+      ipv6: "[::1]:80", ipv6Bare: "::1:80", ipv6NoPort: "[::1]",
+      ipv6BareOnly: "::1", hostSpace: " 127.0.0.1:80",
+      portSpace: "127.0.0.1: 80", trailingSpace: "127.0.0.1:80 ",
+      twoColons: "a:b:80", leadingZeroPort: "a:080", underscorePort: "a:8_0",
+      suffixPort: "a:80a", hexPort: "a:0x50", ipv4: "1.2.3.4:80",
+      dottedHost: "a.b:80", spaceInHost: "a b:80", urlPort: "http://a:80",
+      doubleColonTail: "a::", leadingSpaceString: " a:80",
+      plusPort: "a:+80", dashHost: "-a:80", slashHost: "a/b:80",
+      backslashHost: "a\\b:80", unicodeHost: "\u00e9:80",
+      newlinePort: "a:80\n", tabPort: "a:\t80",
+      number: 123, boolean: true, nan: NaN, bigint: 5n,
+    })) out["connect:string:" + name] = await connect(value);
+    for (const [name, value] of Object.entries({
+      nullValue: null, explicitUndefined: undefined, object: {},
+      portOnly: { port: 80 }, hostOnlyObject: { hostname: "127.0.0.1" },
+      validObject: { hostname: "127.0.0.1", port: 80 },
+      stringPort: { hostname: "127.0.0.1", port: "80" },
+      floatPort: { hostname: "127.0.0.1", port: 1.5 },
+      booleanPort: { hostname: "a", port: true },
+      overPort: { hostname: "127.0.0.1", port: 65536 },
+      int32Port: { hostname: "a", port: 2 ** 31 },
+      negativePort: { hostname: "a", port: -1 },
+      textPort: { hostname: "a", port: "80x" },
+      nanPort: { hostname: "a", port: NaN },
+      infinitePort: { hostname: "a", port: Infinity },
+      bigintPort: { hostname: "a", port: 80n },
+      emptyHostObject: { hostname: "", port: 80 },
+      nullHostObject: { hostname: null, port: 80 },
+      numericHost: { hostname: 127, port: 80 },
+      shortHostObject: { hostname: "a", port: 80 },
+      spaceHostObject: { hostname: " ", port: 80 },
+      spaceInHostObject: { hostname: "a b", port: 80 },
+      longHostObject: { hostname: "a".repeat(300), port: 80 },
+      unicodeHostObject: { hostname: "\u00e9", port: 80 },
+      arrayOne: ["a:1"], arrayTwo: ["a", 1], dateArg: new Date(0),
+      functionArg: () => 1,
+    })) out["connect:object:" + name] = await connect(value);
+    out.connectSymbol = await connect(Symbol("s"));
+    // The options dictionary converts too: a primitive is the WebIDL refusal,
+    // an object is a dictionary whose unknown members are ignored, and only
+    // `secureTransport` has values the transport validates.
+    const connectOptions = (options) => attempt(async () => {
+      try {
+        await stub.connect("127.0.0.1:80", options);
+      } catch (error) {
+        if (error instanceof TypeError) throw error;
+      }
+      return "<converted>";
+    });
+    out.connectOptionsString = await connectOptions("bad");
+    out.connectOptionsNumber = await connectOptions(5);
+    out.connectOptionsTrue = await connectOptions(true);
+    out.connectOptionsNull = await connectOptions(null);
+    out.connectOptionsUndefined = await connectOptions(undefined);
+    out.connectOptionsArray = await connectOptions([]);
+    out.connectOptionsUnknown = await connectOptions({ bogus: 1 });
+    out.connectOptionsSecure = await connectOptions({ secureTransport: "bogus" });
+    out.connectOptionsSecureOff = await connectOptions({ secureTransport: "off" });
+    out.connectOptionsHalfOpen = await connectOptions({ allowHalfOpen: "yes" });
+    out.connectOptionsHighWater = await connectOptions({ highWaterMark: "9" });
     return report(out);
   },
   async "/stub-errors"() {

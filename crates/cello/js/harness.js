@@ -2418,7 +2418,9 @@ class SqlCursor {
       this.#deferredError = null;
       throw error;
     }
-    if (this.#prefetched === null) return { done: true };
+    // workerd answers both members even when done, so a spread, destructure
+    // or `Object.keys` of the result matches it (#251 review).
+    if (this.#prefetched === null) return { done: true, value: undefined };
     const value = this.#prefetched;
     this.#advanceNative();
     return { done: false, value };
@@ -2446,9 +2448,11 @@ class SqlCursor {
   one() {
     const first = this.next();
     if (first.done)
-      throw new Error("Expected exactly one result from SQL query, but got no results");
+      throw new Error(
+        "Expected exactly one result from SQL query, but got no results.");
     if (!this.next().done)
-      throw new Error("Expected exactly one result from SQL query, but got multiple results");
+      throw new Error(
+        "Expected exactly one result from SQL query, but got multiple results.");
     return first.value;
   }
   *raw() {
@@ -8043,23 +8047,105 @@ const __stubRoute = (receiver) => {
   return route;
 };
 // workerd's `Fetcher.connect(address)` opens a TCP socket the cell reads and
-// writes. The argument converts as a `SocketAddress` or a `host:port` string,
-// with its own two refusals; Cello has no such transport, so a converted
-// address refuses instead of routing a cell RPC that a class with a method
+// writes, and its argument converts as workerd's `AnySocketAddress` union
+// (`api/sockets.c++` `connectImpl`) before any transport is involved: an
+// object is the `SocketAddress` dictionary (a required `uint16` port, an
+// optional hostname), every primitive is a `host:port` string the standard
+// URL parser splits, so IPv6 works, and the address must then be a valid host.
+// Cello has no such transport, so only a fully converted address reaches the
+// refusal below instead of routing a cell RPC that a class with a method
 // named `connect` would answer by accident (#251).
-const __stubConnect = (address) => {
-  if (address === undefined)
+const __addressError = (message) => new TypeError(message);
+const __addressNotParsed = () =>
+  __addressError("Specified address could not be parsed.");
+const __addressMissingHostname = () =>
+  __addressError("Specified address is missing hostname.");
+const __addressMissingPort = () =>
+  __addressError("Specified address is missing port.");
+const __addressInvalid = () =>
+  __addressError(
+    "Specified address is empty string, contains unsupported characters or " +
+      "is too long.");
+// workerd's isValidHost: 1 to 255 octets of ASCII letters, digits and the
+// punctuation a hostname or an IPv6 literal may carry. Only ASCII can pass,
+// so a code unit above 127 is refused without computing a byte length.
+const __validHost = (host) => {
+  if (host.length === 0) return false;
+  for (let i = 0; i < host.length; i++) {
+    const c = host.charCodeAt(i);
+    if ((c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) ||
+        c === 45 || c === 46 || c === 95 || c === 91 || c === 93 || c === 58)
+      continue;
+    return false;
+  }
+  return host.length <= 255;
+};
+// The captured constructor: a guest that replaces `globalThis.URL` must not
+// choose how an address is read.
+const __primURL = URL;
+const __socketAddress = (address) => {
+  // The union dispatches on the value's type, as JSG's does: `null`,
+  // `undefined` and every object (an array, a function, a Date) are the
+  // dictionary, and a primitive is the string. `undefined` is here only for
+  // an explicit argument; a missing one is the caller's WebIDL refusal.
+  if (address === undefined || address === null)
+    throw __addressError(
+      "Cannot initialize SocketAddress with required members from an " +
+        "undefined or null value.");
+  if (typeof address === "object" || typeof address === "function") {
+    const hostname = address.hostname === undefined
+      ? "" : __jsString(address.hostname);
+    const raw = address.port;
+    if (typeof raw === "bigint")
+      throw new TypeError("Cannot convert a BigInt value to a number");
+    const number = Number(raw);
+    if (!Number.isFinite(number))
+      throw __addressError(
+        "The value cannot be converted because it is not an integer.");
+    const port = Math.trunc(number);
+    if (port < 0)
+      throw __addressError(
+        "The value cannot be converted because it is negative and this API " +
+          "expects a positive number.");
+    if (port > 65535)
+      throw __addressError(
+        "Value out of range. Must be less than or equal to 65535.");
+    const converted = hostname + ":" + port;
+    if (!__validHost(converted)) throw __addressInvalid();
+    return converted;
+  }
+  const text = __jsString(address);
+  let url;
+  try {
+    url = new __primURL("fake://" + text);
+  } catch {
+    throw __addressNotParsed();
+  }
+  if (url.hostname === "") throw __addressMissingHostname();
+  if (url.port === "") throw __addressMissingPort();
+  if (!__validHost(text)) throw __addressInvalid();
+  return text;
+};
+// workerd's `SocketOptions` conversion: a primitive is the WebIDL refusal and
+// `null` or an object is the dictionary, whose unknown members are ignored.
+// The members only reach the transport, except `secureTransport`, whose three
+// names the transport validates before it dials (#251).
+const __socketOptions = (options) => {
+  if (options === undefined) return;
+  if (options === null)
     throw new TypeError(
-      "Failed to execute 'connect' on 'Fetcher': parameter 1 is not of " +
-        "type 'SocketAddress or string'.");
-  const text = String(address);
-  const colon = text.lastIndexOf(":");
-  const port = colon < 0 ? NaN : Number(text.slice(colon + 1));
-  if (!Number.isInteger(port) || port < 0 || port > 65535)
-    throw new TypeError("Specified address is missing port.");
-  throw new Error(
-    "connect() is not implemented in cello: a Durable Object stub has no " +
-      "TCP transport");
+      "Cannot initialize SocketOptions with required members from an " +
+        "undefined or null value.");
+  if (typeof options !== "object" && typeof options !== "function")
+    throw new TypeError(
+      "Failed to execute 'connect' on 'Fetcher': parameter 2 is not of " +
+        "type 'SocketOptions'.");
+  const secure = options.secureTransport;
+  if (secure === undefined) return;
+  const name = __jsString(secure);
+  if (name !== "off" && name !== "starttls" && name !== "on")
+    throw new TypeError(
+      "Unsupported value in secureTransport socket option: " + name);
 };
 class Fetcher {
   static {
@@ -8074,7 +8160,17 @@ class Fetcher {
     // The receiver check comes first, as a native method's does: a detached
     // `connect` is not a capability either.
     __stubRoute(this);
-    return __stubConnect(arguments[0]);
+    // WebIDL refuses a missing argument before the union converts, and an
+    // explicit `undefined` is the dictionary's required-members refusal.
+    if (arguments.length === 0)
+      throw new TypeError(
+        "Failed to execute 'connect' on 'Fetcher': parameter 1 is not of " +
+          "type 'SocketAddress or string'.");
+    __socketAddress(arguments[0]);
+    __socketOptions(arguments[1]);
+    throw new Error(
+      "connect() is not implemented in cello: a Durable Object stub has no " +
+        "TCP transport");
   }
 }
 __webidlTag(Fetcher, "Fetcher");
