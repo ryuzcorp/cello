@@ -849,6 +849,122 @@ const routes = {
     return report({ valid: await shape(valid), invalid: await shape(new Uint8Array([1, 2, 3, 4])) });
   },
 
+  async "/compression-invalid-chunk"() {
+    // Issue #276: writing a chunk that is not a BufferSource (nor a string
+    // nor undefined) rejects only that write with a TypeError, leaving both
+    // sides usable -- the conversion throws before any native call. Cello
+    // used to park the write until a read pulled it through the transform,
+    // which errored the readable and closed the writable with the chunk
+    // error. Shaped both ways round the first read without any timing: the
+    // drain loop is already reading when the invalid write lands
+    // (readFirst), or the invalid write is issued first and the drain
+    // starts right after (invalidFirst). Every promise settles on both
+    // runtimes, and the transcripts differ on the unfixed one.
+    const hex = (bytes) => [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+    const shape = async (readFirst) => {
+      const stream = new CompressionStream("gzip");
+      const writer = stream.writable.getWriter();
+      const reader = stream.readable.getReader();
+      const chunks = [];
+      let drained = null;
+      const startDrain = () => {
+        drained = (async () => {
+          for (;;) {
+            try {
+              const { value, done } = await reader.read();
+              if (done) return { done: true };
+              chunks.push({ len: value.byteLength, head: hex(value.slice(0, 8)) });
+            } catch (error) { return errorInfo(error); }
+          }
+        })();
+      };
+      let invalid;
+      if (readFirst) {
+        startDrain();
+        invalid = writer.write(42).then(() => "ok", errorInfo);
+      } else {
+        invalid = writer.write(42).then(() => "ok", errorInfo);
+        startDrain();
+      }
+      const invalidOut = await invalid;
+      const valid = writer.write(encoder.encode("payload")).then(() => "ok", errorInfo);
+      const close = writer.close().then(() => "ok", errorInfo);
+      const closed = writer.closed.then(() => "ok", errorInfo);
+      const out = {
+        invalid: invalidOut,
+        valid: await valid,
+        close: await close,
+        closed: await closed,
+        drain: await drained,
+        chunks,
+        total: chunks.reduce((sum, chunk) => sum + chunk.len, 0),
+      };
+      reader.releaseLock();
+      writer.releaseLock();
+      return out;
+    };
+    return report({
+      invalidFirst: await shape(false),
+      readFirst: await shape(true),
+    });
+  },
+
+  async "/decompression-invalid-chunk"() {
+    // Issue #276, the decompression side: an invalid chunk rejects only
+    // that write; a valid member written after it still decompresses and
+    // the close resolves. The member is built by compressing a payload
+    // through a pipe, the same way the round-trip cases do. The drain
+    // joins every chunk, so output splits cannot flake the transcript.
+    const member = new Uint8Array(await new Response(
+      new Response(encoder.encode("payload payload payload")).body
+        .pipeThrough(new CompressionStream("gzip"))).arrayBuffer());
+    const shape = async (readFirst) => {
+      const stream = new DecompressionStream("gzip");
+      const writer = stream.writable.getWriter();
+      const reader = stream.readable.getReader();
+      const parts = [];
+      let drained = null;
+      const startDrain = () => {
+        drained = (async () => {
+          for (;;) {
+            try {
+              const { value, done } = await reader.read();
+              if (done) return { done: true };
+              parts.push(decoder.decode(value));
+            } catch (error) { return errorInfo(error); }
+          }
+        })();
+      };
+      let invalid;
+      if (readFirst) {
+        startDrain();
+        invalid = writer.write(42).then(() => "ok", errorInfo);
+      } else {
+        invalid = writer.write(42).then(() => "ok", errorInfo);
+        startDrain();
+      }
+      const invalidOut = await invalid;
+      const valid = writer.write(member).then(() => "ok", errorInfo);
+      const close = writer.close().then(() => "ok", errorInfo);
+      const closed = writer.closed.then(() => "ok", errorInfo);
+      const out = {
+        invalid: invalidOut,
+        valid: await valid,
+        close: await close,
+        closed: await closed,
+        drain: await drained,
+        text: parts.join(""),
+      };
+      reader.releaseLock();
+      writer.releaseLock();
+      return out;
+    };
+    return report({
+      invalidFirst: await shape(false),
+      readFirst: await shape(true),
+    });
+  },
+
   async "/compression-close-cancel"(request) {
     // Issue #262: writer.close() around a same-turn readable cancel. Workerd
     // resolves both `close()` and `closed`; the flush that close starts must

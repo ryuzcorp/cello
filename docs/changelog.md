@@ -4,6 +4,16 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
 ---
 ## Unreleased
 
+- **An invalid chunk rejects only its own write on compression streams, as
+  Workerd does (#276).** Writing a chunk that is neither a `BufferSource`, a
+  string nor `undefined` used to park the write until a read pulled it through
+  the transform, which errored the readable and closed the writable with the
+  chunk error. The chunk is now validated when the write is accepted, so only
+  that write rejects with the `TypeError` while the stream stays usable: a
+  valid write after it still runs and the close resolves. The differential
+  gate gained `compression-invalid-chunk` and `decompression-invalid-chunk`,
+  each in both read/write orderings, all failing before this change.
+
 - **A throw, the 64-level limit or the 30 s limit in
   `blockConcurrencyWhile` breaks the event the way workerd breaks it
   (#267).** A body that throws or rejects -- top-level or nested -- used to

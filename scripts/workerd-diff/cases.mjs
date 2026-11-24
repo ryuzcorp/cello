@@ -38,6 +38,9 @@ export const cases = [
   { name: "compression-close-cancel-no-write", fixture: "streams", path: "/compression-close-cancel?only=no-write" },
   { name: "compression-close-cancel-cancel-first", fixture: "streams", path: "/compression-close-cancel?only=cancel-first" },
   { name: "compression-queued-write-cancel", fixture: "streams", path: "/compression-queued-write-cancel" },
+  // #276: an invalid chunk rejects only its own write on compression streams.
+  { name: "compression-invalid-chunk", fixture: "streams", path: "/compression-invalid-chunk" },
+  { name: "decompression-invalid-chunk", fixture: "streams", path: "/decompression-invalid-chunk" },
   // #269: pipeTo onto a taken or closed destination, pipeThrough onto taken sides.
   { name: "pipe-to-destination-states", fixture: "streams", path: "/pipe-to-destination-states" },
   { name: "pipe-through-locked", fixture: "streams", path: "/pipe-through-locked" },
