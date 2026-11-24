@@ -726,9 +726,11 @@ class ReadableStream {
   }
 
   cancel(reason) {
+    // Workerd names the locked stream the same way pipeTo and pipeThrough
+    // do (#269).
     if (this.#s.locked)
       return Promise.reject(new TypeError(
-        "Cannot cancel a locked ReadableStream"));
+        "This ReadableStream is currently locked to a reader."));
     return this.#cancel(reason);
   }
 
@@ -960,6 +962,11 @@ class ReadableStream {
     if (__cello.$$writableStreamState(destination).locked)
       return Promise.reject(new TypeError(
         "This WritableStream is currently locked to a writer"));
+    // A destination a previous pipe already closed is refused up front
+    // with workerd's message, instead of failing the first write (#269).
+    if (__cello.$$writableStreamState(destination).state === 'closed')
+      return Promise.reject(new TypeError(
+        "This destination writable stream is closed."));
     if (signal && signal.aborted) {
       const err = signal.reason || new DOMException(
         "The operation was aborted", "AbortError");

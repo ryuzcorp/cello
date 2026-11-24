@@ -33,6 +33,36 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
   with no marker, for Error and non-Error throws alike. The gate gained
   `do/block-fail-rpc` and `do/block-fail-open-tx` plus a TypeError repeat
   pair, all failing before this change and agreeing after.
+- **`close()` racing `writer.abort()` settles as Workerd does, and an empty
+  `DecompressionStream` close rejects, on compression streams (#270).** With
+  no readable cancel involved, an `abort()` that lands while a `close()` is
+  queued or its flush is already in flight now wins: the close and
+  `writer.closed` reject with the abort reason, the abort fulfills, and the
+  readable errors with it too, where Cello used to resolve the close (and,
+  once the flush was running, the pending read with the flushed bytes). The
+  writable ends in the closed shape, so a `close()` or `write()` that follows
+  an `abort()` reports the closed stream instead of the abort reason, and a
+  second `close()` after a raced one does too. Closing a
+  `DecompressionStream` whose member never completed -- empty or truncated
+  -- rejects `close()` and `closed` with `Called close() on a decompression
+  stream with incomplete data` however the close lines up with a readable
+  `cancel()`, where Cello used to resolve a close that followed the cancel;
+  a complete member still closes cleanly. The readable cancel no longer
+  releases the native compressor at all, so a close that follows always runs
+  its flush, which reports the member's true end. The differential gate
+  gained two cases -- the close/abort orderings over gzip, deflate and
+  deflate-raw, and the empty-decompression close variants -- that fail
+  before this change, and every case agrees.
+- **`pipeTo` onto a closed destination and `cancel()` on a locked
+  `ReadableStream` report Workerd's messages (#269).** A destination a
+  previous pipe already closed is refused up front with `This destination
+  writable stream is closed.` instead of failing the first write, and
+  cancelling a locked stream reports `This ReadableStream is currently
+  locked to a reader.`, as `pipeTo` and `pipeThrough` already do. The
+  differential gate gained two cases -- taken or closed destinations, and
+  `pipeThrough` onto taken sides -- pinning that every shape settles with
+  Workerd's outcome instead of hanging, and every case agrees.
+
 - **`writer.close()` across a same-turn readable cancel resolves on a
   compression stream, as Workerd does (#262).** With no `await` between a
   write, `close()` and `reader.cancel()`, both `close()` and `writer.closed`

@@ -876,8 +876,9 @@ export default {
       }
       case "/release": {
         // Held, so only the stream's own ending can release its entry. A
-        // readable cancel releases immediately when no write is pending
-        // (#257); the abort that follows is then a no-op on the state.
+        // readable cancel records itself without releasing the compressor
+        // (#270); the abort that follows drops it, as does the abort on a
+        // stream that was never cancelled.
         const cancelled = new CompressionStream("gzip");
         held.push(cancelled);
         await cancelled.readable.cancel("done");
@@ -950,19 +951,27 @@ export default {
         } catch (e) {
           return Response.json({ ok: false, name: e.name, message: e.message });
         }
-      case "/cancel-one":
-        await held.pop().readable.cancel("done");
+      case "/close-one":
+        // A readable cancel no longer releases the native stream (#270):
+        // the compressor stays alive so a close that follows still runs
+        // its flush. Closing frees the slot even when the flush fails --
+        // the end consumes the entry before running it.
+        await held.pop().writable.getWriter().close().catch(() => {});
         return Response.json({ ok: true });
       case "/cancel-with-write": {
-        // The write is accepted before the cancel, so the compressor must
-        // outlive the cancel until the write has run (#257).
+        // The write is accepted before the cancel, so it still runs; the
+        // cancel records itself without releasing the compressor, and the
+        // close that follows flushes and frees the slot (#270).
         const stream = new CompressionStream("gzip");
         held.push(stream);
         const writer = stream.writable.getWriter();
         const write = writer.write(new Uint8Array(64).fill(0x61))
           .then(() => "ok", (e) => e.name);
         const cancel = stream.readable.cancel("done").then(() => "ok", (e) => e.name);
-        return Response.json({ write: await write, cancel: await cancel });
+        const writeResult = await write;
+        const cancelResult = await cancel;
+        const close = await writer.close().then(() => "ok", (e) => e.name);
+        return Response.json({ write: writeResult, cancel: cancelResult, close });
       }
       case "/abandon":
         for (let i = 0; i < n; i++) new DecompressionStream("deflate-raw");
@@ -1156,9 +1165,9 @@ export default {
     }
 
     /// The stream past the cap is refused with a `RangeError` and no
-    /// native state; releasing one admits the next. A readable cancel
-    /// releases once the writes it accepted have run, so a stream with no
-    /// write frees its slot immediately (#257).
+    /// native state; releasing one admits the next. A readable cancel no
+    /// longer frees the slot -- the compressor stays alive for a close
+    /// that follows -- so closing is what admits the next stream (#270).
     #[test]
     fn cap_refuses_the_stream_past_it() {
         on_engine_thread(|| {
@@ -1169,22 +1178,24 @@ export default {
             assert_eq!(refused["ok"], false, "{refused}");
             assert_eq!(refused["name"], "RangeError", "{refused}");
             assert_eq!(live(&worker), MAX_LIVE_ZLIB_STREAMS);
-            fetch(&mut worker, "/cancel-one");
+            fetch(&mut worker, "/close-one");
             assert_eq!(live(&worker), MAX_LIVE_ZLIB_STREAMS - 1);
             assert_eq!(fetch(&mut worker, "/one")["ok"], true);
             assert_eq!(live(&worker), MAX_LIVE_ZLIB_STREAMS);
         });
     }
 
-    /// A readable cancel that arrives behind an accepted write keeps the
-    /// native stream until that write has run, then releases it (#257).
+    /// A readable cancel that arrives behind an accepted write lets that
+    /// write run; the compressor stays alive across the cancel so a close
+    /// that follows still flushes, and the close frees the slot (#270).
     #[test]
-    fn cancel_releases_after_the_accepted_write() {
+    fn close_after_cancel_releases_the_slot() {
         on_engine_thread(|| {
             let mut worker = load();
             let report = fetch(&mut worker, "/cancel-with-write");
             assert_eq!(report["write"], "ok", "{report}");
             assert_eq!(report["cancel"], "ok", "{report}");
+            assert_eq!(report["close"], "ok", "{report}");
             assert_eq!(live(&worker), 0);
         });
     }

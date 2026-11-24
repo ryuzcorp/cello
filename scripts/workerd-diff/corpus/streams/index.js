@@ -914,6 +914,258 @@ const routes = {
     }
     return report(out);
   },
+  async "/pipe-to-destination-states"() {
+    // Issue #269: pipeTo onto a destination it cannot take rejects instead
+    // of hanging. A destination locked by a held writer or by another pipe
+    // in flight rejects with the lock message and leaves the source
+    // unlocked; one a previous pipe already closed is refused up front
+    // with the closed-destination message; an errored one rejects with the
+    // stored error. A destination whose writer was released pipes fine.
+    const out = {};
+    {
+      const dest = new WritableStream({ write() {} });
+      dest.getWriter();
+      const source = byteStream(["a", "b"]);
+      out.lockedByWriter = await source.pipeTo(dest).then(() => "ok", errorInfo);
+      out.lockedByWriterSource = source.locked;
+    }
+    {
+      let release;
+      const gate = new Promise((done) => (release = done));
+      const dest = new WritableStream({ write() { return gate; } });
+      const first = byteStream(["a"]).pipeTo(dest).then(() => "ok", errorInfo);
+      out.lockedByPipe = await byteStream(["b"]).pipeTo(dest).then(() => "ok", errorInfo);
+      release();
+      out.lockedByPipeFirst = await first;
+    }
+    {
+      const dest = new WritableStream({});
+      await byteStream(["a"]).pipeTo(dest);
+      out.closedDestination = await byteStream(["b"]).pipeTo(dest).then(() => "ok", errorInfo);
+    }
+    {
+      const dest = new WritableStream({ write() { throw new Error("sink-boom"); } });
+      const writer = dest.getWriter();
+      await writer.write(encoder.encode("x")).catch(() => {});
+      writer.releaseLock();
+      out.erroredDestination = await byteStream(["a"]).pipeTo(dest).then(() => "ok", errorInfo);
+    }
+    {
+      const dest = new WritableStream({ write() {} });
+      dest.getWriter().releaseLock();
+      out.releasedDestination = await byteStream(["a"]).pipeTo(dest).then(() => "ok", errorInfo);
+      out.releasedDestinationLocked = dest.locked;
+    }
+    return report(out);
+  },
+
+  async "/pipe-through-locked"() {
+    // Issue #269: pipeThrough throws synchronously when either side is
+    // taken, however the writable got locked, and pipeTo onto the writable
+    // of a live pipeThrough chain rejects instead of hanging.
+    const out = {};
+    {
+      const source = byteStream(["a"]);
+      source.getReader();
+      out.lockedSource = attempt(() => {
+        source.pipeThrough(new TransformStream());
+        return "ok";
+      });
+    }
+    {
+      const transform = new TransformStream();
+      transform.writable.getWriter();
+      out.lockedWritable = attempt(() => {
+        byteStream(["a"]).pipeThrough(transform);
+        return "ok";
+      });
+    }
+    {
+      const transform = new TransformStream();
+      const feeder = byteStream(["f"]).pipeTo(transform.writable);
+      feeder.catch(() => {});
+      out.lockedByPipe = attempt(() => {
+        byteStream(["a"]).pipeThrough(transform);
+        return "ok";
+      });
+      // Ending the feeder is cleanup, not pinned: once the readable is
+      // cancelled the feeder pipe settles fulfilled on workerd and rejects
+      // with the cancel reason on cello (plain-transform cancel races the
+      // parked write differently). Both settle, so neither hangs.
+      await transform.readable.cancel("done").catch(() => {});
+      await feeder.then(() => {}, () => {});
+    }
+    {
+      const transform = new TransformStream({
+        transform(chunk, controller) { controller.enqueue(chunk); },
+      });
+      const readable = byteStream(["a", "b"]).pipeThrough(transform);
+      out.livePipeThrough = await byteStream(["z"]).pipeTo(transform.writable).then(() => "ok", errorInfo);
+      out.drained = await readText(readable);
+    }
+    return report(out);
+  },
+
+  async "/compression-close-abort"() {
+    // Issue #270: close() racing writer.abort() with no readable cancel.
+    // The abort wins over a queued or in-flight close on workerd's internal
+    // streams: the close and closed reject with the abort reason, the abort
+    // fulfills, and the readable errors with it too. An abort with no close
+    // racing it ends the writable in the closed shape, so a close or write
+    // that follows it reports the closed stream instead of the abort reason.
+    const out = {};
+    for (const format of ["gzip", "deflate", "deflate-raw"]) {
+      {
+        // Write, close, abort, close, abort with no await between: the
+        // start gate is still shut, so everything queues behind it.
+        const stream = new CompressionStream(format);
+        const writer = stream.writable.getWriter();
+        const read = new Response(stream.readable).arrayBuffer().then(
+          (buffer) => buffer.byteLength, errorInfo);
+        const write = writer.write(encoder.encode("payload")).then(() => "written", errorInfo);
+        const close = writer.close().then(() => "closed-ok", errorInfo);
+        const abort = writer.abort("abort-reason").then(() => "aborted", errorInfo);
+        const closed = writer.closed.then(() => "closed", errorInfo);
+        const close2 = writer.close().then(() => "closed-ok", errorInfo);
+        const abort2 = writer.abort("other-reason").then(() => "aborted", errorInfo);
+        out[`${format}:queued`] = {
+          write: await write,
+          close: await close,
+          abort: await abort,
+          closed: await closed,
+          close2: await close2,
+          abort2: await abort2,
+          read: await read,
+          locked: stream.writable.locked,
+        };
+      }
+      {
+        // The write finished, so the close's flush is in flight when the
+        // abort lands: the abort still wins.
+        const stream = new CompressionStream(format);
+        const writer = stream.writable.getWriter();
+        const read = new Response(stream.readable).arrayBuffer().then(
+          (buffer) => buffer.byteLength, errorInfo);
+        await writer.write(encoder.encode("payload payload"));
+        const closed = writer.closed.then(() => "closed", errorInfo);
+        const close = writer.close().then(() => "closed-ok", errorInfo);
+        const abort = writer.abort("abort-reason").then(() => "aborted", errorInfo);
+        out[`${format}:flush`] = {
+          close: await close,
+          abort: await abort,
+          closed: await closed,
+          read: await read,
+        };
+      }
+      {
+        // Abort first, then close and write: the writable is already in
+        // the closed shape, so both report the closed stream.
+        const stream = new CompressionStream(format);
+        const writer = stream.writable.getWriter();
+        const abort = await writer.abort("abort-reason").then(() => "aborted", errorInfo);
+        const close = await writer.close().then(() => "closed-ok", errorInfo);
+        const write = await writer.write(encoder.encode("x")).then(() => "written", errorInfo);
+        out[`${format}:abort-first`] = {
+          abort,
+          close,
+          write,
+          closed: await writer.closed.then(() => "closed", errorInfo),
+          desiredSize: attempt(() => writer.desiredSize),
+        };
+      }
+    }
+    return report(out);
+  },
+
+  async "/decompression-empty-close"() {
+    // Issue #270: closing a DecompressionStream whose member never
+    // completed rejects close() and closed with the incomplete-data error,
+    // however the close lines up with the readable cancel. A complete
+    // member still closes cleanly.
+    const member = await gzipMember(encoder.encode("payload payload payload"));
+    const truncated = member.slice(0, 10);
+    const out = {};
+    {
+      const stream = new DecompressionStream("gzip");
+      const writer = stream.writable.getWriter();
+      const read = new Response(stream.readable).arrayBuffer().then(
+        (buffer) => buffer.byteLength, errorInfo);
+      out.emptyCloseOnly = {
+        close: await writer.close().then(() => "closed-ok", errorInfo),
+        closed: await writer.closed.then(() => "closed", errorInfo),
+        read: await read,
+      };
+    }
+    {
+      // No data at all: no read is started, since a pending one never
+      // settles on workerd once the readable is cancelled with nothing to
+      // deliver.
+      const stream = new DecompressionStream("gzip");
+      const writer = stream.writable.getWriter();
+      const reader = stream.readable.getReader();
+      const cancel = reader.cancel("cancel-reason").then(() => "cancelled", errorInfo);
+      const close = writer.close().then(() => "closed-ok", errorInfo);
+      out.emptyCancelFirst = {
+        cancel: await cancel,
+        close: await close,
+        closed: await writer.closed.then(() => "closed", errorInfo),
+      };
+    }
+    {
+      // A read has to be pending before the write: without a consumer the
+      // write parks on backpressure and the route would hang on both
+      // runtimes. The pending read rejects with the cancel reason on both.
+      const stream = new DecompressionStream("gzip");
+      const writer = stream.writable.getWriter();
+      const reader = stream.readable.getReader();
+      const pull = reader.read().then(
+        ({ value, done }) => ({ bytes: value?.byteLength ?? 0, done }), errorInfo);
+      await writer.write(truncated);
+      const cancel = reader.cancel("cancel-reason").then(() => "cancelled", errorInfo);
+      const close = writer.close().then(() => "closed-ok", errorInfo);
+      out.truncatedCancelFirst = {
+        cancel: await cancel,
+        close: await close,
+        closed: await writer.closed.then(() => "closed", errorInfo),
+        pull: await pull,
+      };
+    }
+    for (const [label, chunk] of [["empty", null], ["truncated", truncated]]) {
+      const stream = new DecompressionStream("gzip");
+      const writer = stream.writable.getWriter();
+      // A pending read keeps a written chunk flowing; it settles the same
+      // only in the cancel-first shape above, so here it is just a
+      // consumer with its outcome ignored.
+      if (chunk) stream.readable.getReader().read().then(() => {}, () => {});
+      if (chunk) await writer.write(chunk);
+      const close = writer.close().then(() => "closed-ok", errorInfo);
+      const cancel = stream.readable.cancel("cancel-reason").then(() => "cancelled", errorInfo);
+      out[`${label}CloseFirst`] = {
+        close: await close,
+        cancel: await cancel,
+        closed: await writer.closed.then(() => "closed", errorInfo),
+      };
+    }
+    {
+      // A complete member closes cleanly even across the cancel. The
+      // pending read is only a consumer here: it settles differently on
+      // the two runtimes (delivery timing), so it is awaited but not pinned.
+      const stream = new DecompressionStream("gzip");
+      const writer = stream.writable.getWriter();
+      const reader = stream.readable.getReader();
+      const pull = reader.read().then(() => "read", errorInfo);
+      const write = await writer.write(member).then(() => "written", errorInfo);
+      const cancel = await reader.cancel("cancel-reason").then(() => "cancelled", errorInfo);
+      await pull;
+      out.completeCancelFirst = {
+        write,
+        cancel,
+        close: await writer.close().then(() => "closed-ok", errorInfo),
+        closed: await writer.closed.then(() => "closed", errorInfo),
+      };
+    }
+    return report(out);
+  },
 
   async "/compression-encoder-chunks"() {
     // Issue #257: workerd enqueues one chunk per push with whatever the
