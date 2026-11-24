@@ -814,6 +814,71 @@ const routes = {
     return report(out);
   },
 
+  async "/compression-queued-write-cancel"() {
+    // Issue #257: with no await between them, the write is still queued
+    // behind the writable's start gate when the cancel and the abort arrive.
+    // Workerd completes a write it accepted before the cancel, so the
+    // transform still runs: a valid member resolves and `closed` reports the
+    // abort reason, an invalid one fails and `closed` keeps the failure.
+    const member = async (text) =>
+      new Uint8Array(await new Response(new Response(encoder.encode(text)).body
+        .pipeThrough(new CompressionStream("gzip"))).arrayBuffer());
+    const valid = await member("payload payload payload");
+    const shape = async (chunk) => {
+      const stream = new DecompressionStream("gzip");
+      const writer = stream.writable.getWriter();
+      const reader = stream.readable.getReader();
+      const pull = reader.read().then(({ value }) => value.byteLength, errorInfo);
+      const write = writer.write(chunk).then(() => "ok", errorInfo);
+      const cancel = reader.cancel("cancel-reason").then(() => "ok", errorInfo);
+      const abort = writer.abort("abort-reason").then(() => "ok", errorInfo);
+      const closed = writer.closed.then(() => "ok", (error) => (error === undefined ? "undefined" : errorInfo(error)));
+      const out = {
+        write: await write,
+        cancel: await cancel,
+        abort: await abort,
+        closed: await closed,
+        pull: await pull,
+        desiredSize: attempt(() => writer.desiredSize),
+        locked: stream.writable.locked,
+        writeAfter: await writer.write(chunk).then(() => "ok", errorInfo),
+      };
+      out.closedAfter = await writer.closed.then(() => "ok", errorInfo);
+      return out;
+    };
+    return report({ valid: await shape(valid), invalid: await shape(new Uint8Array([1, 2, 3, 4])) });
+  },
+
+  async "/compression-encoder-chunks"() {
+    // Issue #257: workerd enqueues one chunk per push with whatever the
+    // compressor emitted -- the gzip/zlib header on the first push, nothing
+    // more until deflate has a block or the stream ends -- instead of
+    // holding output until 32 KiB or close. The concatenation is the same
+    // byte stream either way (`compression-encoder-bytes` pins that).
+    const hex = (bytes) => [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+    const out = {};
+    for (const format of ["gzip", "deflate", "deflate-raw", "brotli"]) {
+      const stream = new CompressionStream(format);
+      const writer = stream.writable.getWriter();
+      const reader = stream.readable.getReader();
+      const chunks = [];
+      const drained = (async () => {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) return;
+          chunks.push({ len: value.byteLength, head: hex(value.slice(0, 8)) });
+        }
+      })();
+      for (const size of [3, 3, 1000, 40000]) {
+        await writer.write(new Uint8Array(size).fill(0x61));
+      }
+      const close = await writer.close().then(() => "ok", errorInfo);
+      await drained;
+      out[format] = { close, chunks, total: chunks.reduce((sum, chunk) => sum + chunk.len, 0) };
+    }
+    return report(out);
+  },
+
   async "/locked-stream-messages"() {
     // Issue #245: workerd names the interface and the holder when a stream
     // is already locked.

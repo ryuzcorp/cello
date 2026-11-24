@@ -35,10 +35,17 @@
 //!   abort reason, and rejects the pending read with an `Error` carrying the
 //!   cancel reason, ending the writable in the closed shape. Cello answered
 //!   the cancel reason everywhere and left the writable errored.
+//! - The two compression residuals of that fix (#257): a write queued behind
+//!   the writable's start gate when the same turn cancels and aborts must
+//!   complete (its push failure, if any, is what the stream keeps), and an
+//!   encoder must deliver whatever it emitted per push -- the gzip header on
+//!   the first write, deflate's zlib header, nothing from deflate-raw or
+//!   brotli before close -- instead of holding output until 32 KiB or close.
 //!
 //! The `scripts/workerd-diff` gate pins the same transcripts against a real
 //! workerd (`writer-released`, `decompression-close-after-error`,
-//! `compression-cancel-then-abort`).
+//! `compression-cancel-then-abort`, `compression-queued-write-cancel`,
+//! `compression-encoder-chunks`).
 
 use cello::js::{Compat, RequestBody, Worker, WorkerConfig, WorkerConfigOptions};
 use serde_json::Value;
@@ -314,6 +321,105 @@ async function compressionCancelThenAbort() {
   check("a later write reports the closed stream", isTypeError(writeAfter, CLOSED), `${JSON.stringify(writeAfter)}`);
 }
 
+// A write queued behind the writable's start gate when a cancel and an abort
+// arrive in the same turn: workerd completes the write it accepted, so the
+// transform still runs. A valid member resolves and `closed` reports the
+// abort reason; an invalid one fails and `closed` keeps the failure (#257).
+async function compressionQueuedWriteCancel() {
+  const compress = async (text) => new Uint8Array(await new Response(
+    new Response(new TextEncoder().encode(text)).body
+      .pipeThrough(new CompressionStream("gzip"))).arrayBuffer());
+  const valid = await compress("payload payload payload");
+  const shape = async (chunk) => {
+    const stream = new DecompressionStream("gzip");
+    const writer = stream.writable.getWriter();
+    const reader = stream.readable.getReader();
+    const pull = rejection(reader.read());
+    const write = settles(writer.write(chunk));
+    const cancel = settles(reader.cancel("cancel-reason"));
+    const abort = rejection(writer.abort("abort-reason"));
+    const closed = rejection(writer.closed);
+    const out = {
+      write: await write,
+      cancel: await cancel,
+      abort: await abort,
+      closed: await closed,
+      pull: await pull,
+    };
+    out.desiredSize = desiredSizeOf(writer);
+    out.locked = stream.writable.locked;
+    out.writeAfter = await settles(writer.write(chunk));
+    out.closedAfter = await rejection(writer.closed);
+    return out;
+  };
+  const good = await shape(valid);
+  check("a queued valid write resolves", good.write === "ok", JSON.stringify(good.write));
+  check("the cancel resolves", good.cancel === "ok", JSON.stringify(good.cancel));
+  check("the abort resolves", good.abort === "resolved", `abort: ${good.abort}`);
+  check("closed reports the abort reason", good.closed === "string:abort-reason", `closed: ${good.closed}`);
+  check("the pending read rejects with the cancel reason", good.pull === "Error:cancel-reason", `pull: ${good.pull}`);
+  check("desiredSize is 0", good.desiredSize === "ok 0", good.desiredSize);
+  check("the writable stays locked", good.locked === true, "writable unlocked itself");
+  check("a later write reports the closed stream", isTypeError(good.writeAfter, CLOSED), JSON.stringify(good.writeAfter));
+  check("closed keeps the abort reason", good.closedAfter === "string:abort-reason", `closed: ${good.closedAfter}`);
+
+  const bad = await shape(new Uint8Array([1, 2, 3, 4]));
+  check(
+    "a queued invalid write fails the push",
+    isTypeError(bad.write, "Decompression failed."),
+    JSON.stringify(bad.write),
+  );
+  check(
+    "closed keeps the failure",
+    bad.closed === "TypeError:Decompression failed.",
+    `closed: ${bad.closed}`,
+  );
+  check("the abort still resolves", bad.abort === "resolved", `abort: ${bad.abort}`);
+  check("the pending read rejects with the cancel reason", bad.pull === "Error:cancel-reason", `pull: ${bad.pull}`);
+  check(
+    "closed keeps the failure afterwards",
+    bad.closedAfter === "TypeError:Decompression failed.",
+    `closed: ${bad.closedAfter}`,
+  );
+}
+
+// Per-push output: workerd enqueues a chunk per push with whatever the
+// compressor emitted, so gzip delivers its 10-byte header separately and
+// deflate its 2-byte zlib header, while deflate-raw and brotli emit nothing
+// before close. The concatenation is unchanged (#257).
+async function compressionEncoderChunks() {
+  const expected = {
+    gzip: [10, 65],
+    deflate: [2, 61],
+    "deflate-raw": [57],
+    brotli: [13],
+  };
+  for (const format of Object.keys(expected)) {
+    const stream = new CompressionStream(format);
+    const writer = stream.writable.getWriter();
+    const reader = stream.readable.getReader();
+    const chunks = [];
+    const drained = (async () => {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) return;
+        chunks.push(value.byteLength);
+      }
+    })();
+    for (const size of [3, 3, 1000, 40000]) {
+      await writer.write(new Uint8Array(size).fill(0x61));
+    }
+    const close = await settles(writer.close());
+    await drained;
+    check(`${format} close resolves`, close === "ok", JSON.stringify(close));
+    check(
+      `${format} emits one chunk per push`,
+      JSON.stringify(chunks) === JSON.stringify(expected[format]),
+      JSON.stringify(chunks),
+    );
+  }
+}
+
 export default {
   async fetch(request) {
     failures.length = 0;
@@ -321,6 +427,8 @@ export default {
     if (pathname === "/writer-released") await writerReleased();
     else if (pathname === "/decompression-close-after-error") await decompressionCloseAfterError();
     else if (pathname === "/compression-cancel-then-abort") await compressionCancelThenAbort();
+    else if (pathname === "/compression-queued-write-cancel") await compressionQueuedWriteCancel();
+    else if (pathname === "/compression-encoder-chunks") await compressionEncoderChunks();
     else return Response.json({ ok: false, failures: [`no route ${pathname}`] }, { status: 404 });
     return Response.json({ ok: failures.length === 0, failures });
   },
@@ -358,4 +466,18 @@ fn compression_cancel_then_abort_matches_workerd() {
     ensure_engine();
     let mut worker = load_worker(WORKER, "stream-edges");
     check_route(&mut worker, "/compression-cancel-then-abort");
+}
+
+#[test]
+fn compression_queued_write_cancel_matches_workerd() {
+    ensure_engine();
+    let mut worker = load_worker(WORKER, "stream-edges");
+    check_route(&mut worker, "/compression-queued-write-cancel");
+}
+
+#[test]
+fn compression_encoder_chunks_match_workerd() {
+    ensure_engine();
+    let mut worker = load_worker(WORKER, "stream-edges");
+    check_route(&mut worker, "/compression-encoder-chunks");
 }

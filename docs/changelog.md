@@ -4,6 +4,22 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
 ---
 ## Unreleased
 
+- **Compression streams deliver output per push and keep an accepted write
+  across a cancel, as Workerd does (#257).** A `CompressionStream` now
+  enqueues whatever the encoder emitted for each write instead of holding
+  output until 32 KiB or `close()`: gzip delivers its 10-byte header on the
+  first write, `deflate` its 2-byte zlib header, and `deflate-raw`/`brotli`
+  nothing before close, so chunk boundaries match Workerd's. The
+  concatenation is unchanged byte for byte, and a 16 MiB body compresses in
+  the same time as before (median 246–248 ms before and 246–247 ms after
+  over 256 × 64 KiB writes, 42–43 ms either way over 16384 × 1 KiB writes;
+  two runs each, after a warm-up). A readable `cancel()` no
+  longer refuses a write the writable had already accepted: with no `await`
+  between the write, the `cancel()` and an `abort()`, the transform still
+  runs, so a valid member resolves with `writer.closed` reporting the abort
+  reason and an invalid one fails with `Decompression failed.` — Workerd's
+  shape in both cases, where Cello used to fail every such write with the
+  cancel error.
 - **A compression stream settles a cancel racing an abort the way Workerd
   does (#252).** A `DecompressionStream`/`CompressionStream` with a write in
   flight, a pending `read()` and a synchronous `reader.cancel()` followed by

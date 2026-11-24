@@ -128,10 +128,6 @@ impl ZlibFramed {
         self.inner.get_mut().extend_from_slice(&Self::HEADER);
     }
 
-    fn get_ref(&self) -> &Vec<u8> {
-        self.inner.get_ref()
-    }
-
     fn get_mut(&mut self) -> &mut Vec<u8> {
         self.inner.get_mut()
     }
@@ -540,11 +536,13 @@ impl ZlibStream {
     }
 
     /// Write one chunk and return whatever output it produced. Decoded
-    /// output flows per chunk; encoders hold theirs until a full buffer
-    /// accumulates (matching Workerd, whose suite reads a small message
-    /// back as one chunk), with the rest arriving from `finish`. A
+    /// output flows per chunk; encoders return whatever the compressor
+    /// emitted for this push -- the gzip/zlib header on the first one, and
+    /// nothing more until deflate has a full block or the stream ends.
+    /// Workerd enqueues a chunk per push the same way (#257), while the
+    /// concatenation of every push and `finish` is the same byte stream. A
     /// decoder that stops consuming input has hit the end of the
-    /// compressed stream, so leftover bytes are trailing garbage —
+    /// compressed stream, so leftover bytes are trailing garbage --
     /// Workerd's strict_compression_checks. Gzip frames and validates its
     /// own bytes (see [`GzipDecode`]).
     fn push(&mut self, mut input: &[u8]) -> Result<Vec<u8>> {
@@ -552,20 +550,17 @@ impl ZlibStream {
         if let Self::GzipDecode(decoder) = self {
             return decoder.push(input);
         }
-        const ENCODER_CHUNK: usize = 32 * 1024;
         let failure = self.failure();
         // A decoder that stops consuming has reached the end of its stream,
         // so the rest of the push is trailing garbage; workerd names that
         // case separately from a corrupt stream (#245).
         let stop = if self.decompress() { TRAILING } else { failure };
-        let held = if self.decompress() { 0 } else { ENCODER_CHUNK };
         zlib_each!(self, w => {
             while !input.is_empty() {
                 let n = w.write(input).map_err(|_| anyhow!(failure))?;
                 if n == 0 { return Err(anyhow!(stop)); }
                 input = &input[n..];
             }
-            if w.get_ref().len() < held { return Ok(Vec::new()); }
             Ok(std::mem::take(w.get_mut()))
         })
     }
@@ -669,7 +664,7 @@ pub(super) fn op_zlib_stream_new(
             scope,
             &format!(
                 "Too many open compression streams in this isolate (limit \
-                 {MAX_LIVE_ZLIB_STREAMS}); close, cancel or abort the ones \
+                 {MAX_LIVE_ZLIB_STREAMS}); close or abort the ones \
                  no longer in use."
             ),
         )
@@ -880,10 +875,13 @@ export default {
         });
       }
       case "/release": {
-        // Held, so only the stream's own ending can release its entry.
+        // Held, so only the stream's own ending can release its entry. A
+        // readable cancel releases immediately when no write is pending
+        // (#257); the abort that follows is then a no-op on the state.
         const cancelled = new CompressionStream("gzip");
         held.push(cancelled);
         await cancelled.readable.cancel("done");
+        await cancelled.writable.abort("done");
         const aborted = new DecompressionStream("deflate");
         held.push(aborted);
         await aborted.writable.abort("done");
@@ -916,6 +914,17 @@ export default {
       case "/cancel-one":
         await held.pop().readable.cancel("done");
         return Response.json({ ok: true });
+      case "/cancel-with-write": {
+        // The write is accepted before the cancel, so the compressor must
+        // outlive the cancel until the write has run (#257).
+        const stream = new CompressionStream("gzip");
+        held.push(stream);
+        const writer = stream.writable.getWriter();
+        const write = writer.write(new Uint8Array(64).fill(0x61))
+          .then(() => "ok", (e) => e.name);
+        const cancel = stream.readable.cancel("done").then(() => "ok", (e) => e.name);
+        return Response.json({ write: await write, cancel: await cancel });
+      }
       case "/abandon":
         for (let i = 0; i < n; i++) new DecompressionStream("deflate-raw");
         return Response.json({ ok: true });
@@ -1108,7 +1117,9 @@ export default {
     }
 
     /// The stream past the cap is refused with a `RangeError` and no
-    /// native state; releasing one admits the next.
+    /// native state; releasing one admits the next. A readable cancel
+    /// releases once the writes it accepted have run, so a stream with no
+    /// write frees its slot immediately (#257).
     #[test]
     fn cap_refuses_the_stream_past_it() {
         on_engine_thread(|| {
@@ -1123,6 +1134,19 @@ export default {
             assert_eq!(live(&worker), MAX_LIVE_ZLIB_STREAMS - 1);
             assert_eq!(fetch(&mut worker, "/one")["ok"], true);
             assert_eq!(live(&worker), MAX_LIVE_ZLIB_STREAMS);
+        });
+    }
+
+    /// A readable cancel that arrives behind an accepted write keeps the
+    /// native stream until that write has run, then releases it (#257).
+    #[test]
+    fn cancel_releases_after_the_accepted_write() {
+        on_engine_thread(|| {
+            let mut worker = load();
+            let report = fetch(&mut worker, "/cancel-with-write");
+            assert_eq!(report["write"], "ok", "{report}");
+            assert_eq!(report["cancel"], "ok", "{report}");
+            assert_eq!(live(&worker), 0);
         });
     }
 

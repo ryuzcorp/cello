@@ -32,6 +32,8 @@ export const cases = [
   { name: "compression-gzip-header-crc", fixture: "streams", path: "/compression-gzip-header-crc" },
   { name: "compression-trailer-split", fixture: "streams", path: "/compression-trailer-split" },
   { name: "compression-cancel-then-abort", fixture: "streams", path: "/compression-cancel-then-abort" },
+  { name: "compression-queued-write-cancel", fixture: "streams", path: "/compression-queued-write-cancel" },
+  { name: "compression-encoder-chunks", fixture: "streams", path: "/compression-encoder-chunks" },
   { name: "locked-stream-messages", fixture: "streams", path: "/locked-stream-messages" },
   { name: "writable-ready-queued-close", fixture: "streams", path: "/writable-ready-queued-close" },
   { name: "compression-encoder-bytes", fixture: "streams", path: "/compression-encoder-bytes" },

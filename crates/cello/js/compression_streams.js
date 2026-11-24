@@ -60,11 +60,11 @@ function make(format, decompress, name, missing) {
   // this object, so it is collectable exactly when neither side is
   // reachable any more.
   let ts;
-  // A readable cancel leaves a write that was already in flight to finish
-  // (workerd's internal streams complete it) and that write's transform
-  // has nowhere to enqueue: the readable is cancelled. `cancelled` on the
-  // writable's private state is set before the parked write is released,
-  // so the chunk is compressed and dropped, as workerd does (#252).
+  // A readable cancel drops the output -- the readable is gone -- but not
+  // the compressor: workerd's internal streams keep the writable open, so a
+  // write it already accepted still runs and its push failure is what the
+  // stream keeps. The native state is freed by `flush()` (a later close),
+  // by the writable's abort, or by the finalizer (#252, #257).
   const readableCancelled = () =>
     ts !== undefined &&
     __cello.$$writableStreamState(ts.writable).cancelled !== null;
