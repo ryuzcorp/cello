@@ -295,10 +295,20 @@ service; the [KV](../services/kv.md), [R2](../services/r2.md) and
 - **A Durable Object stub is a `DurableObject` over `Fetcher`.** `fetch` and
   `connect` have arity 0, a detached `fetch` throws workerd's `Illegal
   invocation` message, and `name`/`id` are own, enumerable and read-only.
-  `stub.connect()` converts its address as workerd does (`parameter 1 is not
-  of type 'SocketAddress or string'`, `Specified address is missing port.`)
-  and then rejects: Cello has no Fetcher TCP transport for a stub, so a
-  well-formed address never opens a socket.
+  `stub.connect()` converts its argument as workerd's `AnySocketAddress`
+  union does, from workerd's own `api/sockets.c++`: an object (or `null`) is
+  the `SocketAddress` dictionary, whose required `uint16` `port` refuses with
+  `The value cannot be converted because it is not an integer.`,
+  `... because it is negative ...` or
+  `Value out of range. Must be less than or equal to 65535.`, and whose
+  optional `hostname` defaults to the empty string; every primitive is a
+  `host:port` string split by the standard URL parser, so IPv6 literals work,
+  and refuses with `Specified address is missing hostname.`/`missing port.`/
+  `could not be parsed.`. The joined address must then be a valid host
+  (`Specified address is empty string, contains unsupported characters or is
+  too long.`). Its `SocketOptions` argument converts too, including the three
+  `secureTransport` names. A fully converted address then rejects: Cello has
+  no Fetcher TCP transport for a stub, so no socket is opened.
 - **R2 cursors are opaque tokens.** A string outside the token format that
   names no object gets the empty page R2 answers instead of a listing
   restarted from the top. A plain key is still read as the cursor 0.2.9

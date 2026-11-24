@@ -26,7 +26,10 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
   stub's `name`/`id` are own, enumerable and read-only, and a stub is a
   `DurableObject` over `Fetcher` whose `fetch`/`connect` have arity 0: a
   detached `fetch` throws workerd's `Illegal invocation` message instead of
-  reaching the cell. The three session-bookmark methods exist:
+  reaching the cell, and `connect()` converts its argument as workerd's
+  `AnySocketAddress` union and its options as `SocketOptions` do, down to
+  each refusal message, before it refuses for want of a transport. The three
+  session-bookmark methods exist:
   `getCurrentBookmark()` answers a per-object bookmark whose sequence only a
   call to itself advances and `deleteAll()` resets, and
   `getBookmarkForTime()`/`onNextSessionRestoreBookmark()` refuse with
@@ -34,7 +37,9 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
   their argument converts. `SqlStorage` shows `exec()`, `databaseSize` and
   the nested `Cursor`/`Statement` constructors, which refuse `new`; an
   `exec()` cursor is an instance of `sql.Cursor`, carries no own property,
-  and no longer answers a `columns` member. Cello's own `sql.prepare()`,
+  and no longer answers a `columns` member; its `next()` returns both
+  `done` and `value` even when it is done, and both `one()` refusals end with
+  workerd's period. Cello's own `sql.prepare()`,
   `sql.ingest()` and SQL fault hooks exist only with `CELLO_TEST_WAIT=1`,
   like every other test seam, so a shipping node has none.
   `ctx.setHibernatableWebSocketEventTimeout()` exists with workerd's
