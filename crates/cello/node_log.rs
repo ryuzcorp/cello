@@ -10125,6 +10125,53 @@ mod bucket_executor_tests {
         });
     }
 
+    /// A wake that only flips the bundle loop's posture must be spent on the
+    /// round it enables. Fail-before (#200): the loop parks while there is no
+    /// durability target yet, the registration lands, then the gate opens
+    /// with no wake of its own (the fleet sampler flips it silently) and the
+    /// write's single wake is consumed just to re-evaluate the posture — the
+    /// loop parks again with the cell dirty, `sync_loop` keeps suppressing
+    /// per-cell uploads because bundling is armed, and the ticket waits out
+    /// its whole budget. Under host load the suite reaches this interleaving,
+    /// which is why `lone_cell_per_cell_failure_heals_through_retry` timed out
+    /// at 10 s with zero per-cell PUTs.
+    #[test]
+    fn a_posture_wake_is_spent_on_the_round_it_enables() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("test dir");
+            let store = Arc::new(ListCountingStore::new());
+            let bucket = Arc::new(Bucket::with_store_for_test(
+                store.clone() as Arc<dyn cello_ltx::object_store::ObjectStore>
+            ));
+            let manager = test_manager_with_store(dir.path(), bucket.clone(), store.clone());
+            let manager = Arc::new(manager);
+            let parks = manager.ltx.bundle_idle_parks();
+            let _registration = manager
+                .ltx
+                .register_durability(manager.clone())
+                .expect("registration installs");
+            // The registration's wake is spent with the gate still closed, so
+            // the loop sits in the idle park: no polling, the counter is the
+            // gate.
+            manager.ltx.wait_for_bundle_idle_parks(parks + 1).await;
+            // Everything below flips the posture without waking the loop; only
+            // the write's ticket will.
+            open_gate(&manager);
+            publish_bucket_open(&manager, &bucket).await;
+            activate_cell(&manager, "c0", 1, true).await;
+            sql_write(&cell_db(&dir.path().join("watch"), "c0", 1));
+            let (_, source) = crate::asyncrt::timeout(
+                std::time::Duration::from_secs(10),
+                manager.ltx.await_durable("c0", 1, 1),
+            )
+            .await
+            .expect("no timeout")
+            .expect("the posture wake rounds the waiting cell");
+            assert_eq!(source, cello_logic::ProofSource::Bucket);
+        });
+    }
+
     /// A lone-cell round whose sync claim is held — a pre-arm worker between
     /// its CAS and its yield to the bundle loop, which then exits without
     /// uploading and nudges only the bundling-suppressed scan — still

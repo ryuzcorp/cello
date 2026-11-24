@@ -58,6 +58,47 @@ use crate::replication::SyncWait;
 use crate::replication::{EvictionAbandon, EvictionRestoreArtifact};
 use cello_logic::durability::{proof_deadline, ProofProgress, ProofWait};
 
+/// Test seam for the bundle loop's idle wait: the "no durability target, no
+/// bucket demand" park. A test uses it to place the loop in that posture
+/// before flipping the posture without timing. Production carries the empty
+/// struct and the call compiles to nothing.
+#[derive(Default)]
+pub(crate) struct BundleIdlePark {
+    #[cfg(test)]
+    parks: AtomicU64,
+    #[cfg(test)]
+    changed: Notify,
+}
+
+impl BundleIdlePark {
+    fn entered(&self) {
+        #[cfg(test)]
+        {
+            self.parks.fetch_add(1, Ordering::SeqCst);
+            self.changed.notify_one();
+        }
+    }
+
+    #[cfg(test)]
+    fn count(&self) -> u64 {
+        self.parks.load(Ordering::SeqCst)
+    }
+
+    /// Wait until the loop has entered `count` idle parks. Deterministic: the
+    /// counter moves before the loop sleeps and the notice is checked against
+    /// it, so a caller never waits on a park that already happened.
+    #[cfg(test)]
+    async fn wait_for(&self, count: u64) {
+        loop {
+            let changed = self.changed.notified();
+            if self.count() >= count {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+
 /// Max cells uploading concurrently across the node. Caps blocking-pool threads
 /// and in-flight object-store requests under high write fan-out.
 const SYNC_CONCURRENCY: usize = 64;
@@ -1443,6 +1484,9 @@ pub struct LtxRepl {
     replica_close_tasks: TaskGroup,
     /// The node's root task group, for the per-cell background hydration.
     tasks: TaskGroup,
+    /// Test seam: the bundle loop's idle parks.
+    #[cfg(test)]
+    bundle_idle: Arc<BundleIdlePark>,
     /// Woken when a cell's `committed` advances, so the background loop syncs
     /// without polling; a slow tick backstops any missed notification.
     dirty: Arc<Notify>,
@@ -1763,6 +1807,7 @@ impl LtxRepl {
         let dirty = Arc::new(Notify::new());
         let dirty_ship = Arc::new(Notify::new());
         let dirty_bundle = Arc::new(Notify::new());
+        let bundle_idle = Arc::new(BundleIdlePark::default());
         let registration: Arc<Mutex<RegistrationState>> = Arc::default();
         let stop = StopToken::new();
         let tasks = TaskGroup::new(stop.clone());
@@ -1804,6 +1849,7 @@ impl LtxRepl {
                 stop.clone(),
                 flush_ms,
                 dirty_bundle.clone(),
+                bundle_idle.clone(),
             ),
         );
         let compaction_queue =
@@ -1826,6 +1872,8 @@ impl LtxRepl {
             replica_close_stop,
             replica_close_tasks: replica_close_tasks.clone(),
             tasks: tasks.clone(),
+            #[cfg(test)]
+            bundle_idle,
             dirty,
             restore_slots: Arc::new(Semaphore::new(RESTORE_DOWNLOAD_CONCURRENCY)),
             compaction_queue,
@@ -3268,6 +3316,19 @@ impl LtxRepl {
             return forced;
         }
         bucket_bundles_env_on()
+    }
+
+    /// Idle parks the bundle loop has entered, so a test can place it in the
+    /// "no durability target, no bucket demand" posture deterministically.
+    #[cfg(test)]
+    pub(crate) fn bundle_idle_parks(&self) -> u64 {
+        self.bundle_idle.count()
+    }
+
+    /// Wait for the bundle loop's `count`-th idle park.
+    #[cfg(test)]
+    pub(crate) async fn wait_for_bundle_idle_parks(&self, count: u64) {
+        self.bundle_idle.wait_for(count).await;
     }
 
     /// Test override for the operator switch, so deterministic tests do not touch
@@ -5645,6 +5706,7 @@ async fn bundle_loop(
     stop: StopToken,
     flush_ms: u64,
     dirty: Arc<Notify>,
+    idle: Arc<BundleIdlePark>,
 ) {
     // Fleet path keeps its interval pacing; bucket path is event-driven: flush
     // when dirty and no PUT is in flight, accumulating while one is in flight
@@ -5665,6 +5727,17 @@ async fn bundle_loop(
         tick.set_missed_tick_behavior(asyncrt::MissedTickBehavior::Delay);
         tick
     });
+    // Whether a wake has arrived that this loop has not yet spent. An
+    // iteration that only re-evaluates the posture (the branch below parks and
+    // `continue`s) would otherwise consume the wake and park again: the gate
+    // opening, the registration landing, or a ticket taken while the loop slept
+    // each deliver exactly ONE wake, and the round that wake enables must ride
+    // it. Parking with a dirty cell waiting is the whole-node stall (#200):
+    // `sync_loop` suppresses per-cell uploads while bundling is armed, so the
+    // ticket waits out its durability budget for a write that may never come.
+    // A wake is spent on at most one round, so a round that cannot progress
+    // (claim held, credit refused, store down) re-parks instead of spinning.
+    let mut wake_unspent = true;
     loop {
         // Choose the wait by posture: bucket waits on dirty (event-driven), fleet on
         // its interval tick. Re-evaluate every iteration so a gate close/open flips
@@ -5672,13 +5745,22 @@ async fn bundle_loop(
         let bucket_wake = registered_durability(&registration)
             .is_some_and(|targets| targets.manager.bucket_candidate());
         if bucket_wake {
-            asyncrt::select_biased! {
-                "a stop signal that ties the bucket bundle wait prevents another flush";
-                _ = stop.stopped() => break,
-                _ = dirty.notified() => {},
-            }
-            if stop.is_stopped() {
-                break;
+            // Level-triggered before parking: a cell already dirty is this
+            // loop's work now, so spend the wake on it instead of parking and
+            // consuming it. Only a loop that has already spent its wake — or
+            // that has nothing waiting — waits here.
+            if wake_unspent && dirty_cells(&cells) > 0 {
+                wake_unspent = false;
+            } else {
+                asyncrt::select_biased! {
+                    "a stop signal that ties the bucket bundle wait prevents another flush";
+                    _ = stop.stopped() => break,
+                    _ = dirty.notified() => {},
+                }
+                if stop.is_stopped() {
+                    break;
+                }
+                wake_unspent = true;
             }
             // The linger is a batching window, not a pacing delay: hold it
             // open only while more than one cell is dirty. A lone cell
@@ -5701,10 +5783,12 @@ async fn bundle_loop(
             if stop.is_stopped() {
                 break;
             }
+            wake_unspent = false;
         } else {
             // No fleet interval and no bucket demand: park until dirty or stop, then
             // re-evaluate. This keeps `flush_ms == 0` test topologies (which never
             // pace) able to bundle event-driven while fleet stays off.
+            idle.entered();
             asyncrt::select_biased! {
                 "a stop signal that ties the idle bundle wait prevents another flush";
                 _ = stop.stopped() => break,
@@ -5713,6 +5797,10 @@ async fn bundle_loop(
             if stop.is_stopped() {
                 break;
             }
+            // The posture may have changed while parked (a registration lands,
+            // the gate opens): carry the wake into the next iteration so the
+            // round it enables is not lost to the re-evaluation.
+            wake_unspent = true;
             continue;
         }
         let installed = registered_durability(&registration).map(|targets| targets.manager.clone());
