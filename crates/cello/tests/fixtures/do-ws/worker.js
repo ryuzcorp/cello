@@ -24,6 +24,9 @@ const shape = (error) => ({
   remote: error !== null && typeof error === "object" ? error.remote : null,
   stack: typeof error?.stack === "string" ? error.stack : null,
   stackLines: typeof error?.stack === "string" ? error.stack.split("\n").length : null,
+  // The oversize probe throws a string `payload`; its length proves the clone
+  // crossed whole rather than being truncated or dropped (#238).
+  payloadLength: typeof error?.payload === "string" ? error.payload.length : null,
 });
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 5));
