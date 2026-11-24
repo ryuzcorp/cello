@@ -75,6 +75,21 @@ or API-shape break.
   `DOMException` class captured at bootstrap, so a Worker that replaces
   `globalThis.DOMException` neither gets a call inside either path nor changes
   the class its caller sees.
+- **A bucket-posture node no longer parks its durability loop with a write
+  waiting (#200).** The bundle loop waited before it looked at the dirty set,
+  so an iteration that only re-evaluated its posture — the durability
+  registration landing, the fleet's `BUCKET_BUNDLES_FORMAT` gate opening, a
+  lease epoch arming — consumed the one wake that change delivered and then
+  parked with a cell already dirty. `sync_loop` suppresses per-cell uploads
+  while bundling is armed, so that ticket had no retry path at all: zero
+  PUTs, then `ltx durability timed out for <cell> epoch <n>` after the whole
+  `CELLO_LTX_DURABILITY_TIMEOUT_SECS` budget on a healthy store. A write in
+  that window failed and its cell reset; every later write woke the loop
+  again, which is why it looked sporadic. The loop now spends a wake on the
+  round it enables — it parks only after an iteration that could not round,
+  while a round that cannot progress still re-parks instead of spinning. A
+  loaded `--lib` run reached the old park at about one in three attempts; 24
+  loaded runs after the fix reached it zero times.
 
 Three binding divergences the 0.2.9 sweep filed are fixed, and the
 differential gate gained three cases (204 in all, every one agreeing with
