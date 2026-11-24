@@ -84,12 +84,20 @@ class WritableStreamState {
     // error here instead, so a write the writable accepted afterwards
     // refuses with it (and errors the stream), while a write accepted
     // before it still completes (#252, #257). The native compressor stays
-    // alive across the cancel: a close that follows still runs its flush,
-    // which reports the member's true end -- success for a complete
+    // alive only until the accepted writes drain: a cancel with nothing
+    // accepted or in flight ends it right away, otherwise the last
+    // accepted write's settle does, and the outcome is stashed so a close
+    // that follows replays the member's true end -- success for a complete
     // member, the incomplete-data error otherwise -- instead of failing
     // with `zlib stream already closed` (#270). The flush consumes it, an
     // abort drops it, and abandonment is covered by the finalizer.
     this.cancelled = null;
+    // Hook a compression stream installs here: run once its readable is
+    // cancelled and no accepted write is still outstanding, so a
+    // cancel-only stream frees its native slot with no close, no abort,
+    // and no dependency on the collector (#270). Kept in the private
+    // state for the same reason as `unblockWrite` above.
+    this.cancelDrainHook = undefined;
   }
 }
 
@@ -572,6 +580,21 @@ function __dealWithRejection(st, e) {
   if (st.state === 'erroring') __finishErroring(st);
 }
 
+// A compression stream whose readable was cancelled ends its native stream
+// as soon as no accepted write is still outstanding: nothing queued, none
+// in flight, and no close running its flush (the flush owns the end then).
+// A queued close does not block the end -- no transform can run between it
+// and the flush, so the flush replays the stashed outcome unchanged (#270).
+function __maybeEndCancelled(st) {
+  if (!st.closesOnError || st.cancelled === null ||
+      st.cancelDrainHook === undefined)
+    return;
+  if (st.inFlightWrite !== null || st.queue.length > 0 ||
+      st.inFlightClose !== null)
+    return;
+  st.cancelDrainHook();
+}
+
 function __advanceQueue(st) {
   if (!st.started) return;
   if (st.inFlightWrite || st.inFlightClose) return;
@@ -623,6 +646,9 @@ function __startWrite(st, entry) {
       else if (st.state === 'writable' && !__closing(st))
         __updateBackpressure(st);
       __advanceQueue(st);
+      // The last accepted write settled behind a readable cancel: end the
+      // native stream now if no close owns that end instead (#270).
+      __maybeEndCancelled(st);
     },
     (e) => {
       st.inFlightWrite = null;
@@ -631,6 +657,10 @@ function __startWrite(st, entry) {
       entry.reject(e);
       if (st.closesOnError) __closeAfterError(st, e);
       else __dealWithRejection(st, e);
+      // A failed push already dropped the native stream, so this is a
+      // guarded no-op; a cancel-error refusal on an otherwise idle stream
+      // ends one a clean drain left behind (#270).
+      __maybeEndCancelled(st);
     },
   );
 }
@@ -712,11 +742,48 @@ function __finishClose(st) {
 }
 
 function __finishCloseWithError(st, e) {
+  const abortReq = st.pendingAbort;
+  if (st.state === 'erroring' && abortReq !== null &&
+      st.closesOnError && !abortReq.wasErroring) {
+    // The abort() that errored the stream raced a close() whose flush is
+    // now failing: on workerd's internal (compression) streams the abort
+    // still wins (#270). The close rejects with the abort reason, the
+    // sink abort still runs, and the writable ends in the closed shape:
+    // the abort fulfills and writer.closed rejects with the abort reason.
+    // The pending read keeps the flush failure -- the sink's close
+    // algorithm errored the readable with it before this ran -- while
+    // later write()/close() calls report the closed stream. Plain streams
+    // keep the close-wins outcome below, as workerd does.
+    st.inFlightClose.reject(st.storedError);
+    st.inFlightClose = null;
+    st.pendingAbort = null;
+    let result;
+    try {
+      result = st.abortFn
+        ? st.abortFn.call(st.sink, abortReq.reason)
+        : undefined;
+    } catch (e2) { result = Promise.reject(e2); }
+    Promise.resolve(result).then(
+      () => {
+        abortReq.resolve();
+        st.state = 'closed';
+        if (st.writer) {
+          const writerState = __wtrState(st.writer);
+          __resolveReady(writerState);
+          __rejectClosedWriter(writerState, st.storedError);
+        }
+      },
+      (e2) => {
+        abortReq.reject(e2);
+        __rejectCloseAndClosed(st);
+      },
+    );
+    return;
+  }
   st.inFlightClose.reject(e);
   st.inFlightClose = null;
   // A pending abort is rejected with the close error;
   // the sink abort is not run.
-  const abortReq = st.pendingAbort;
   if (abortReq) {
     st.pendingAbort = null;
     abortReq.reject(e);
@@ -982,16 +1049,17 @@ class TransformStream {
           // it refuses with that error, and an `abort()` is an ordinary
           // abort (#252, #257). Recording the cancel before the `flushing`
           // check is what makes a close that already started its flush skip
-          // the enqueue; that flush ends the compressor itself (#262). The
-          // cancel never releases the native stream: a close that follows
-          // still runs its flush, which reports the member's true end --
-          // success for a complete member, the incomplete-data error for
-          // an empty or truncated decompressor -- instead of failing with
+          // the enqueue (#262). The native stream ends once nothing
+          // accepted is still outstanding -- right here when the cancel
+          // finds the writable idle, otherwise when the last accepted
+          // write settles -- and the outcome is stashed so a close that
+          // follows replays the member's true end instead of failing with
           // `zlib stream already closed` or resolving a close workerd
           // rejects (#270). The flush consumes the id, an abort drops it,
           // and abandonment is covered by the finalizer.
           wst.cancelled = __cello.$$cancelError(reason);
           if (wst.unblockWrite) wst.unblockWrite();
+          __maybeEndCancelled(wst);
           return;
         }
         if (flushing) return;

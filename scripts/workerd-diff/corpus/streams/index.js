@@ -2225,6 +2225,121 @@ const routes = {
     const second = await reader.read().then(() => "resolved", (error) => errorInfo(error));
     return report({ first: first.value, second });
   },
+
+  async "/compression-cancel-releases-slot"() {
+    // Issue #270: a readable cancel with no close or abort still frees the
+    // native compressor slot once nothing accepted is outstanding. Every
+    // wrapper stays held, so the collector cannot help: 300 rounds must
+    // construct cleanly and the final probe must too.
+    const held = [];
+    let constructed = 0;
+    let rangeErrors = 0;
+    for (let i = 0; i < 300; i += 1) {
+      try {
+        const stream = new CompressionStream("gzip");
+        held.push(stream);
+        constructed += 1;
+        await stream.readable.cancel("done");
+      } catch (e) {
+        if (e?.name === "RangeError") rangeErrors += 1;
+        else return report({ uncaught: errorInfo(e) });
+      }
+    }
+    let final;
+    try {
+      held.push(new CompressionStream("gzip"));
+      final = "ok";
+    } catch (e) { final = errorInfo(e); }
+    return report({ constructed, rangeErrors, final, held: held.length });
+  },
+
+  async "/compression-response-cancel-releases-slot"() {
+    // Issue #270: the same release through a Response body cancel.
+    const held = [];
+    let constructed = 0;
+    let rangeErrors = 0;
+    for (let i = 0; i < 300; i += 1) {
+      try {
+        const stream = new CompressionStream("gzip");
+        held.push(stream);
+        constructed += 1;
+        await new Response(stream.readable).body.cancel("done");
+      } catch (e) {
+        if (e?.name === "RangeError") rangeErrors += 1;
+        else return report({ uncaught: errorInfo(e) });
+      }
+    }
+    let final;
+    try {
+      held.push(new CompressionStream("gzip"));
+      final = "ok";
+    } catch (e) { final = errorInfo(e); }
+    return report({ constructed, rangeErrors, final, held: held.length });
+  },
+
+  async "/compression-pipe-fail-releases-slot"() {
+    // Issue #270: a pipeTo that fails its destination cancels the
+    // compression source; the accepted write still runs, then the drain
+    // frees the slot. Wrappers stay held, so only a prompt release keeps
+    // 300 rounds under the cap.
+    const held = [];
+    let constructed = 0;
+    let rangeErrors = 0;
+    for (let i = 0; i < 300; i += 1) {
+      try {
+        const stream = new CompressionStream("gzip");
+        constructed += 1;
+        held.push(stream);
+        const writer = stream.writable.getWriter();
+        held.push(writer);
+        const write = writer.write(encoder.encode("hello hello hello"));
+        write.then(() => {}, () => {});
+        await stream.readable.pipeTo(new WritableStream({
+          write() { throw new Error("dest-boom"); },
+        })).then(() => "ok", errorInfo);
+        await write.then(() => "written", errorInfo);
+      } catch (e) {
+        if (e?.name === "RangeError") rangeErrors += 1;
+        else return report({ uncaught: errorInfo(e) });
+      }
+    }
+    let final;
+    try {
+      held.push(new CompressionStream("gzip"));
+      final = "ok";
+    } catch (e) { final = errorInfo(e); }
+    return report({ constructed, rangeErrors, final, held: held.length });
+  },
+
+  async "/compression-abort-failing-flush"() {
+    // Issue #270: a truncated member with a pending read, so the close
+    // starts a flush that fails; an abort that lands before it settles
+    // still wins. Close and closed reject with the abort reason, the
+    // abort fulfills, and the pending read keeps the incomplete-data
+    // error from the flush.
+    const member = await gzipMember(encoder.encode("payload payload payload"));
+    const truncated = member.slice(0, 10);
+    const out = {};
+    for (const when of ["same-turn", "next-tick"]) {
+      const stream = new DecompressionStream("gzip");
+      const writer = stream.writable.getWriter();
+      const reader = stream.readable.getReader();
+      const pull = reader.read().then(
+        ({ value, done }) => ({ bytes: value?.byteLength ?? 0, done }), errorInfo);
+      await writer.write(truncated);
+      const close = writer.close().then(() => "closed-ok", errorInfo);
+      let abort;
+      if (when === "same-turn") abort = writer.abort("abort-reason").then(() => "aborted", errorInfo);
+      else { await null; abort = writer.abort("abort-reason").then(() => "aborted", errorInfo); }
+      out[when] = {
+        close: await close,
+        abort: await abort,
+        closed: await writer.closed.then(() => "closed", errorInfo),
+        pull: await pull,
+      };
+    }
+    return report(out);
+  },
 };
 
 export default {

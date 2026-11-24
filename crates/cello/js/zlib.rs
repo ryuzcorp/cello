@@ -876,9 +876,10 @@ export default {
       }
       case "/release": {
         // Held, so only the stream's own ending can release its entry. A
-        // readable cancel records itself without releasing the compressor
-        // (#270); the abort that follows drops it, as does the abort on a
-        // stream that was never cancelled.
+        // readable cancel ends the compressor once nothing accepted is
+        // still outstanding (#270); the abort that follows drops an
+        // already-ended stream as a no-op, as does the abort on a stream
+        // that was never cancelled.
         const cancelled = new CompressionStream("gzip");
         held.push(cancelled);
         await cancelled.readable.cancel("done");
@@ -951,17 +952,19 @@ export default {
         } catch (e) {
           return Response.json({ ok: false, name: e.name, message: e.message });
         }
-      case "/close-one":
-        // A readable cancel no longer releases the native stream (#270):
-        // the compressor stays alive so a close that follows still runs
-        // its flush. Closing frees the slot even when the flush fails --
-        // the end consumes the entry before running it.
-        await held.pop().writable.getWriter().close().catch(() => {});
+      case "/cancel-one":
+        // A readable cancel ends the native stream once nothing accepted
+        // is outstanding (#270): the filled stream never took a write, so
+        // cancelling frees its slot with no close. Closing would free it
+        // too -- the end consumes the entry before running it, even when
+        // the flush fails.
+        await held.pop().readable.cancel("done");
         return Response.json({ ok: true });
       case "/cancel-with-write": {
         // The write is accepted before the cancel, so it still runs; the
-        // cancel records itself without releasing the compressor, and the
-        // close that follows flushes and frees the slot (#270).
+        // cancel records itself and the drain that follows ends the
+        // compressor, stashing the flush outcome, and the close that
+        // follows replays it and frees nothing further (#270).
         const stream = new CompressionStream("gzip");
         held.push(stream);
         const writer = stream.writable.getWriter();
@@ -1149,8 +1152,10 @@ export default {
         });
     }
 
-    /// Cancel, abort, a poisoning push and an invalid chunk each release
-    /// the native stream while JS still holds the stream object.
+    /// A readable cancel ends its compressor once nothing accepted is
+    /// still outstanding, an abort drops its stream, and a poisoning push
+    /// or an invalid chunk each release the native stream too -- all while
+    /// JS still holds the stream object.
     #[test]
     fn cancel_abort_and_push_error_release_while_held() {
         on_engine_thread(|| {
@@ -1165,9 +1170,10 @@ export default {
     }
 
     /// The stream past the cap is refused with a `RangeError` and no
-    /// native state; releasing one admits the next. A readable cancel no
-    /// longer frees the slot -- the compressor stays alive for a close
-    /// that follows -- so closing is what admits the next stream (#270).
+    /// native state; releasing one admits the next. A readable cancel
+    /// ends the compressor once nothing accepted is outstanding, so
+    /// cancelling -- with no close -- is what admits the next stream
+    /// here (#270).
     #[test]
     fn cap_refuses_the_stream_past_it() {
         on_engine_thread(|| {
@@ -1178,7 +1184,7 @@ export default {
             assert_eq!(refused["ok"], false, "{refused}");
             assert_eq!(refused["name"], "RangeError", "{refused}");
             assert_eq!(live(&worker), MAX_LIVE_ZLIB_STREAMS);
-            fetch(&mut worker, "/close-one");
+            fetch(&mut worker, "/cancel-one");
             assert_eq!(live(&worker), MAX_LIVE_ZLIB_STREAMS - 1);
             assert_eq!(fetch(&mut worker, "/one")["ok"], true);
             assert_eq!(live(&worker), MAX_LIVE_ZLIB_STREAMS);
@@ -1186,8 +1192,9 @@ export default {
     }
 
     /// A readable cancel that arrives behind an accepted write lets that
-    /// write run; the compressor stays alive across the cancel so a close
-    /// that follows still flushes, and the close frees the slot (#270).
+    /// write run; the drain that follows ends the compressor and stashes
+    /// the flush outcome, so a close that follows replays it and the slot
+    /// count stays at zero (#270).
     #[test]
     fn close_after_cancel_releases_the_slot() {
         on_engine_thread(|| {
