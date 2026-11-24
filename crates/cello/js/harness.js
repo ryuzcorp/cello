@@ -2798,9 +2798,13 @@ class DurableObjectStorage {
   // undefined (`putMultiple` skips it rather than deleting the key). A Map, a
   // Set or a Date has no such key, so it writes nothing at all.
   _putEntries(entries, options) {
+    // Any object is the options dictionary, an array included: workerd's
+    // struct conversion reads one positionally, and an array of any shape
+    // leaves every PutOptions field at its default, so the write is the same
+    // as with `{}` (#249 review).
     const kind = typeof options;
     if (options !== undefined && options !== null && kind !== "object" &&
-        kind !== "function" || Array.isArray(options)) {
+        kind !== "function") {
       throw new TypeError(
         "put() may only be called with a single key-value pair and optional " +
           "options as put(key, value, options) or with multiple key-value " +

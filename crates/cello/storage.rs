@@ -3032,7 +3032,7 @@ fn d1_exec_error(message: impl Into<String>) -> D1Failure {
 /// line failed, so this reproduces that shape rather than inventing a better
 /// one a Worker's matcher would not expect.
 fn d1_exec_line(input: &str, failure: D1Failure) -> D1Failure {
-    let line = input.trim().split('\n').next().unwrap_or_default();
+    let line = js_trim(input).split('\n').next().unwrap_or_default();
     D1Failure {
         family: failure.family,
         message: format!("Error in line 1: {line}: {}", failure.message),
@@ -4848,17 +4848,23 @@ pub fn d1_run(scope: &str, request: &D1Request) -> Result<D1Response, D1Failure>
         })
         .unwrap_or_else(|| Err(d1_error(format!("no db for {scope}")))),
         D1Request::Exec { sql, rows } => {
-            let source = CString::new(sql.as_str())
+            // workerd's `exec()` trims its input the way `String.prototype.trim`
+            // does -- NBSP and the byte-order mark included -- before it splits
+            // it, runs it and names the failing line, so the trim is applied
+            // once here and everything below reads the trimmed text (#249
+            // review).
+            let text = js_trim(sql);
+            let source = CString::new(text)
                 .map_err(|error| d1_exec_error(format!("invalid SQL text: {error}")))?;
             // What workerd's `exec()` reports as its count: one per input line
             // that carries a statement, not one per statement SQLite ran --
             // `exec("CREATE TABLE a (x); CREATE TABLE b (y)")` is one line and
             // so counts once (#239). An input with no such line is refused
             // before anything runs.
-            let count = d1_exec_lines(sql);
+            let count = d1_exec_lines(text);
             if count == 0 {
                 return Err(d1_exec_line(
-                    sql,
+                    text,
                     d1_exec_error("No SQL statements detected."),
                 ));
             }
@@ -4888,7 +4894,7 @@ pub fn d1_run(scope: &str, request: &D1Request) -> Result<D1Response, D1Failure>
                             scope,
                             connection,
                             &source,
-                            sql,
+                            text,
                             *rows,
                             d1_exec_error,
                             D1RunPolicy {
@@ -4921,7 +4927,7 @@ pub fn d1_run(scope: &str, request: &D1Request) -> Result<D1Response, D1Failure>
                                 d1_exec_error,
                             );
                         }
-                        Err(d1_exec_line(sql, failure))
+                        Err(d1_exec_line(text, failure))
                     }
                 }
             })

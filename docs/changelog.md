@@ -236,14 +236,18 @@ workerd 1.20261121.1).
   `put() called with undefined value.`, `put([["r", 1]], options)` stores
   `"r,1"`). A primitive key coerces (`put(5, "five")` stores `"5"`), a symbol
   key throws V8's conversion error, and `put()` with no argument names the
-  `string or object` parameter. `storage.list()` (and the synchronous
+  `string or object` parameter. An array in the batch options slot is a
+  dictionary like any other object (`put({a: 1}, [])` writes `a`, as workerd
+  reads the array positionally into `PutOptions`). `storage.list()` (and the synchronous
   `kv.list()`) convert their `ListOptions` the way workerd's JSG does: the
   string fields read any value, `reverse` is a boolean coercion, `limit` is an
   `int` with the int32 range check and `List limit must be positive.`, `start`
   with `startAfter` is refused, and an `undefined` field is absent, instead of
-  reporting serde's own text. `exec()` reports one count per input line that
-  carries a statement rather than one per statement, an empty or
-  comment-only input is refused before anything runs, and a fresh D1 database
+  reporting serde's own text. `exec()` trims its input the way
+  `String.prototype.trim` does -- NBSP and the byte-order mark included -- so
+  neither reaches SQLite or the line an error names; it reports one count per
+  input line that carries a statement rather than one per statement, an empty
+  or comment-only input is refused before anything runs, and a fresh D1 database
   reports `last_row_id` 0 for its first DDL and keeps reading after a write
   where it reported 0; `size_after` counts only the application's pages, so a
   fresh database is 4096 bytes as in workerd instead of 49152. Binding

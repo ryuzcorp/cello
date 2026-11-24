@@ -137,6 +137,7 @@ export const cases = [
   // #239: exec() counts input lines, and a fresh database's last_row_id and
   // size_after are the application's own, not a cell's storage tables'.
   { name: "d1-exec-lines", fixture: "d1", path: "/exec-lines" },
+  { name: "d1-exec-unicode", fixture: "d1", path: "/exec-unicode" },
   { name: "d1-meta-fresh", fixture: "d1", path: "/meta-fresh" },
   { name: "cache-put-refusals", fixture: "cache", path: "/put-refusals" },
   { name: "cache-match-options", fixture: "cache", path: "/match-options" },
