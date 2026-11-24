@@ -101,7 +101,9 @@ Workerd stores a `true`/`false` bind as the TEXT `'true'`/`'false'`. Cello wrote
   UPDATE flags SET flag = CASE flag WHEN 1 THEN 'true' WHEN 0 THEN 'false' ELSE flag END;
   ```
 
-  Every `1`/`0` becomes `'true'`/`'false'`; a `NULL`, a text value or another number keeps its value. A `CHECK` constraint that allows only `0`/`1` makes the `UPDATE` fail instead of leaving a half-typed column: drop or replace the constraint first, or rebuild the table. Bump the date after the rewrite, so the binds that follow write TEXT too.
+  Every `1`/`0` becomes `'true'`/`'false'`; a `NULL`, a text value or another number keeps its value. A `CHECK` constraint that allows only `0`/`1` makes the `UPDATE` fail instead of leaving a half-typed column. Cello's SQLite cannot drop such a constraint in place, so rebuild the table without it, copy the rows, and re-create the `CHECK` for the new values. Bump the date after the rewrite, so the binds that follow write TEXT too.
+
+  The previous version keeps serving until the new one owns the cell, and every boolean it writes in that window is still INTEGER. Run the same `UPDATE` once more after the bumped version owns the cell; it is idempotent, because TEXT rows fall through `ELSE flag`. Alternatively, keep the cell idle from the rewrite until the takeover.
 
 `tests/do_sql_boolean_compat.rs` runs that sequence against a real cell: INTEGER rows written at an old date, the rewrite, then the bumped date, ending with every row TEXT and a boolean predicate finding all of them.
 
