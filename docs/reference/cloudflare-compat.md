@@ -458,6 +458,14 @@ The `tail` and `email` handlers are unavailable.
   defaults to a highWaterMark of 0, and `writer.write()` / `writer.ready`
   stay pending until a consumer reads. A cancelled readable, `abort()`,
   `controller.error()`, and `controller.terminate()` release a parked write.
+  Cancelling the readable while a `pipeTo` is feeding the writable fulfills
+  the feeder pipe once the destination's writes have drained -- the source
+  is still cancelled with the reason -- and a `controller.error()` on an
+  otherwise idle pipe fulfills the same way, as on Workerd. A write the
+  cancel lands on rejects with `TypeError: The readable side of this
+  TransformStream is no longer readable.`, while `writer.closed` and later
+  operations keep reporting the cancel reason; a write whose transform was
+  already running still completes, as does one queued behind it.
   `IdentityTransformStream` and
   `FixedLengthStream` resolve a write only once its bytes have been read.
 - A pull source runs on Workerd's schedule, which differs from the WHATWG

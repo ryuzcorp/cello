@@ -100,6 +100,22 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
   differential gate gained `workflow-status/shape-terminal`, `shape-live`,
   `send-terminal`, `lifecycle-a`, `lifecycle-b` and `binding` (252 total)
   and every case agrees.
+- **A plain `TransformStream` readable cancel racing a `pipeTo` matches
+  Workerd (#272).** Cancelling the readable while a pipe is feeding the
+  writable used to reject the feeder pipe with the cancel reason. Now the
+  pipe fulfills once the destination's writes have drained -- the source
+  is still cancelled with the reason -- as Workerd does, and a
+  `controller.error()` on an otherwise idle pipe fulfills the same way
+  instead of rejecting with the destination's error. A write the cancel
+  lands on still rejects, but with Workerd's `TypeError` naming the
+  readable side (`The readable side of this TransformStream is no longer
+  readable.`) rather than the cancel reason, while `writer.closed` and
+  later operations keep reporting that reason. A write whose transform
+  was already running still completes, as does one queued behind it. The
+  differential gate gained four cases -- the idle pipe, the running
+  transform, the completing destination error, and a flush-time cancel
+  that already agreed -- and the first three fail before this change.
+
 - **`writer.close()` across a same-turn readable cancel resolves on a
   compression stream, as Workerd does (#262).** With no `await` between a
   write, `close()` and `reader.cancel()`, both `close()` and `writer.closed`

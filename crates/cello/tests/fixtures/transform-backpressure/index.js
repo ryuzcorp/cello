@@ -182,7 +182,8 @@ const conformance = async () => {
   }
 
   // 6. Cancelling the readable fails a write parked on the handshake with
-  //    the cancel reason, instead of leaving it pending forever.
+  //    a TypeError naming the readable side (#272), instead of leaving it
+  //    pending forever; the stored error stays the cancel reason.
   {
     const { readable, writable } = new TransformStream();
     const writer = writable.getWriter();
@@ -193,7 +194,18 @@ const conformance = async () => {
     await readable.cancel(reason);
     let seen = null;
     await write.catch((e) => (seen = e));
-    check('cancel unblocks', seen === reason, `the parked write rejected with ${String(seen)}`);
+    check(
+      'cancel unblocks',
+      seen instanceof TypeError &&
+        seen.message ===
+          'The readable side of this TransformStream is no longer readable.',
+      `the parked write rejected with ${String(seen)}`,
+    );
+    check(
+      'cancel keeps reason',
+      (await writer.closed.catch((e) => e)) === reason,
+      'writer.closed did not keep the cancel reason',
+    );
   }
 
   // 7. The same for abort().
@@ -384,7 +396,10 @@ const conformance = async () => {
     );
     check(
       'overwritten hook readable cancel',
-      secondReleased.state === 'rejected' && secondReleased.value === cancelReason,
+      secondReleased.state === 'rejected' &&
+        secondReleased.value instanceof TypeError &&
+        secondReleased.value.message ===
+          'The readable side of this TransformStream is no longer readable.',
       `the parked write settled as ${secondReleased.state}:${String(secondReleased.value)}`,
     );
     check(

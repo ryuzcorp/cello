@@ -57,6 +57,11 @@ export const cases = [
   { name: "compression-trailing-bytes", fixture: "streams", path: "/compression-trailing-bytes" },
   { name: "transform-error", fixture: "streams", path: "/transform-error" },
   { name: "transform-close-after-cancel", fixture: "streams", path: "/transform-close-after-cancel" },
+  // #272: a plain TransformStream readable cancel racing an in-flight pipe.
+  { name: "transform-pipe-cancel-idle", fixture: "streams", path: "/transform-pipe-cancel-idle" },
+  { name: "transform-write-cancel-running", fixture: "streams", path: "/transform-write-cancel-running" },
+  { name: "pipe-dest-error-completing", fixture: "streams", path: "/pipe-dest-error-completing" },
+  { name: "transform-flush-cancel-drain", fixture: "streams", path: "/transform-flush-cancel-drain" },
   { name: "gzip-large", fixture: "streams", path: "/gzip-large" },
   { name: "writable-backpressure", fixture: "streams", path: "/writable-backpressure" },
   { name: "tee-basic", fixture: "streams", path: "/tee-basic" },

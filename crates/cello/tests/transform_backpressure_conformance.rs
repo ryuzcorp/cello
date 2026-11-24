@@ -250,7 +250,9 @@ fn boot_node() -> (tempfile::TempDir, TestNode) {
 /// `ready` pending with no consumer, a read releasing them, `desiredSize`
 /// following the highWaterMark, cancellation and abort releasing a parked
 /// write, a transform error reaching both sides, and `close()` after a
-/// readable cancel rejecting with the cancel reason (#129).
+/// readable cancel rejecting with the cancel reason (#129). A readable
+/// cancel fails the parked write itself with Workerd's `TypeError` naming
+/// the readable side (#272).
 #[test]
 fn transform_stream_applies_backpressure() {
     let (_dir, node) = boot_node();
