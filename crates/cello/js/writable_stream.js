@@ -543,7 +543,11 @@ function __finishErroring(st) {
 // (#257). Runs on every settle path that can empty the write queue.
 function __maybeCancelDrain(st) {
   if (st.cancelDrain === null) return;
-  if (st.inFlightWrite !== null || st.queue.length > 0) return;
+  // A close ends the compressor with its flush, so the drain must wait for
+  // one that is queued or in flight: releasing the id first leaves the flush
+  // with `zlib stream already closed` and rejects close() and closed (#262).
+  if (st.inFlightWrite !== null || st.queue.length > 0 ||
+      __closing(st)) return;
   const drain = st.cancelDrain;
   st.cancelDrain = null;
   drain();
@@ -669,6 +673,9 @@ function __finishClose(st) {
     __resolveReady(writerState);
     __resolveClosed(writerState);
   }
+  // The flush that just ended the compressor was the last thing a readable
+  // cancel was waiting on (#262).
+  __maybeCancelDrain(st);
 }
 
 function __finishCloseWithError(st, e) {
@@ -934,7 +941,6 @@ class TransformStream {
         return backpressureChangePromise;
       },
       async cancel(reason) {
-        if (flushing) return;
         const wst = writable ? __wsState(writable) : null;
         if (wst !== null && wst.closesOnError) {
           // Workerd's compression streams are internal on the read side: a
@@ -945,9 +951,13 @@ class TransformStream {
           // `abort()` is an ordinary abort (#252, #257). The compressor is
           // released now, or once the writes it accepted have run, and the
           // pending read rejects with the cancel error (see
-          // `__cancelStream`).
+          // `__cancelStream`). Recording the cancel before the `flushing`
+          // check is what makes a close that already started its flush skip
+          // the enqueue; that flush ends the compressor itself, so nothing
+          // is released here (#262).
           wst.cancelled = __cello.$$cancelError(reason);
           if (wst.unblockWrite) wst.unblockWrite();
+          if (flushing) return;
           const release = () => {
             Promise.resolve(runCancel(reason)).catch(() => {});
           };
@@ -956,6 +966,7 @@ class TransformStream {
           else release();
           return;
         }
+        if (flushing) return;
         // The readable is closed by now, so nothing will pull again:
         // error the writable before awaiting the transformer's cancel,
         // or a write parked on the handshake would wait on it forever.
@@ -984,6 +995,10 @@ class TransformStream {
     if (transformer.expectedLength !== undefined)
       __rsState(readable).expectedLength =
         Number(transformer.expectedLength);
+    // A readable cancel closes the readable side itself, so a compression
+    // flush that still ran must not close it a second time (#262).
+    const readableCancelled = () =>
+      writable !== undefined && __wsState(writable).cancelled !== null;
     // Track the first controller.error() so that
     // transformer.flush()'s side effect can be replayed
     // on writer.close() (rsc's error state is private).
@@ -1073,7 +1088,7 @@ class TransformStream {
           // propagate that to writer.close() so it
           // rejects with the original error.
           if (readableError !== null) throw readableError;
-          rsc.close();
+          if (!readableCancelled()) rsc.close();
         }, (e) => {
           rsc.error(e);
           throw e;

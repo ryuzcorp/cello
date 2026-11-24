@@ -901,6 +901,45 @@ export default {
           .then(() => "resolved", (e) => e.name);
         return Response.json({ wrote, read: await read, iwrote, iread: await iread });
       }
+      case "/close-cancel-loop": {
+        // writer.close() around a same-turn readable cancel, both orderings
+        // and with no write. Every round must release its native stream on
+        // its own: the wrappers stay held, so nothing here waits for the
+        // collector, and the 128th leaked stream would already be a
+        // RangeError (#262).
+        const errors = [];
+        const settle = async (promise, label) => {
+          try {
+            await promise;
+          } catch (e) {
+            errors.push(`${label}: ${e.message}`);
+          }
+        };
+        for (let round = 0; round < 300; round += 1) {
+          for (const mode of ["queued", "inflight", "noWrite"]) {
+            const stream = new CompressionStream("gzip");
+            held.push(stream);
+            const writer = stream.writable.getWriter();
+            const reader = stream.readable.getReader();
+            const pull = reader.read().catch(() => {});
+            if (mode !== "queued") await null;
+            const write = mode === "noWrite"
+              ? null
+              : writer.write(new Uint8Array(64).fill(0x61));
+            const close = writer.close();
+            const cancel = reader.cancel("done");
+            if (write !== null) await settle(write, `${mode} write ${round}`);
+            await settle(close, `${mode} close ${round}`);
+            await settle(cancel, `${mode} cancel ${round}`);
+            await pull;
+          }
+        }
+        return Response.json({
+          ok: errors.length === 0,
+          errors: errors.slice(0, 4),
+          held: held.length,
+        });
+      }
       case "/fill":
         for (let i = 0; i < n; i++) held.push(new DecompressionStream("deflate-raw"));
         return Response.json({ ok: true });
@@ -1147,6 +1186,22 @@ export default {
             assert_eq!(report["write"], "ok", "{report}");
             assert_eq!(report["cancel"], "ok", "{report}");
             assert_eq!(live(&worker), 0);
+        });
+    }
+
+    /// 300 rounds of writer.close() across a same-turn readable cancel, in
+    /// both orderings and with no write, release every native stream on its
+    /// own: the wrappers stay held, so a leak shows up as the cap's
+    /// `RangeError` well before the last round rather than as a later
+    /// collection (#262).
+    #[test]
+    fn close_across_cancel_releases_every_round() {
+        on_engine_thread(|| {
+            let mut worker = load();
+            let report = fetch(&mut worker, "/close-cancel-loop");
+            assert_eq!(report["ok"], true, "{report}");
+            assert_eq!(report["held"], 900, "{report}");
+            assert_eq!(live(&worker), 0, "{report}");
         });
     }
 
