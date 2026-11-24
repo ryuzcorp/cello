@@ -10381,18 +10381,15 @@ fn op_do_call_impl(
             // A handler exception is not a transport failure: it is the error
             // the stub call must reject with, name and message intact, so it
             // answers as a marked body the harness turns back into a throw.
+            // The object was aborted, not only its event: workerd leaves the
+            // handle that saw it broken, while one that saw a plain handler
+            // failure revives with the object.
             Ok(Err(e)) => match crate::engine_api::cell_handler_error(&e) {
                 Some(handler) => Ok(serde_json::json!({
-                    "__celloCellError": {
-                        "kind": handler.kind.as_str(),
-                        "name": handler.name,
-                        "message": handler.message,
-                        "value": handler.value,
-                        // The object was aborted, not only its event: workerd
-                        // leaves the handle that saw it broken, while one that
-                        // saw a plain handler failure revives with the object.
-                        "aborted": crate::engine_api::cell_aborted(&e),
-                    },
+                    "__celloCellError": crate::engine_api::cell_failure_json(
+                        handler,
+                        crate::engine_api::cell_aborted(&e),
+                    ),
                 })
                 .to_string()),
                 None => Err(format!("{e}")),
@@ -12648,6 +12645,13 @@ fn op_actor_fail(
         .lock()
         .expect("pending puts lock poisoned")
         .remove(&cell);
+    // The event dies below, so the transaction's own catch -- the code that
+    // would roll its still-open savepoint back -- never runs. Roll it back
+    // host-side first: a block that fails over an open transaction must
+    // still reset the object, and its uncommitted writes with it (#271 P1).
+    // A cell with no open savepoint answers `ROLLBACK` with a no-op, so the
+    // common path is unchanged.
+    let _ = crate::storage::transaction_control(&cell, "rollback", false, "");
     *state.termination.lock().expect("termination lock poisoned") = Some(ExecutionTermination {
         error: handler.message.clone(),
         actor_scope: Some(cell),

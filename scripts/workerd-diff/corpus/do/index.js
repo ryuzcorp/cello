@@ -1,3 +1,4 @@
+import { DurableObject } from "cloudflare:workers";
 // Durable Object probes: storage, SQL, alarms, WebSockets, ids and errors.
 const canonical = (value) => {
   if (value instanceof Date) return "<date>";
@@ -96,6 +97,47 @@ export class Thrower {
     if (kind === "/null") throw null;
     if (kind === "/empty") throw new TypeError("");
     throw new Error("handler exploded");
+  }
+}
+
+// The shape a stub caller sees when the call fails: class, name, message
+// and workerd's `remote` marker. The gate needs the class and the marker,
+// which the plain `errorInfo` below does not record.
+const rpcFailure = (error) => ({
+  ctor: error?.constructor?.name ?? String(error),
+  name: error?.name ?? null,
+  message: error?.message ?? null,
+  remote: error !== null && typeof error === "object" ? error.remote ?? null : null,
+});
+
+// #271 P2: RPC callers observe a block abort the way fetch callers do. The
+// class extends `DurableObject` so its methods serve RPC; plain classes do
+// not resolve methods on either runtime.
+export class Rpc extends DurableObject {
+  constructor(state, env) {
+    super(state, env);
+    this.state = state;
+    this.env = env;
+  }
+  async rpcBoom(kind) {
+    const make = () => kind === "type" ? new TypeError("rpc-boom")
+      : kind === "string" ? "plain rpc string"
+      : new Error("rpc-boom");
+    // A `catch` here would run on the old code and never on the new: the
+    // abort breaks the event before the handler can answer.
+    await this.state.blockConcurrencyWhile(() => { throw make(); });
+    return "settled";
+  }
+  async pong() {
+    return "pong";
+  }
+  async viaRpc(name) {
+    const stub = this.env.RPCDO.get(this.env.RPCDO.idFromName(name));
+    try {
+      return { ok: await stub.rpcBoom("error") };
+    } catch (error) {
+      return { error: rpcFailure(error) };
+    }
   }
 }
 
@@ -1378,16 +1420,27 @@ const routes = {
     out.first = await attempt(async () => {
       const response = await broken.fetch("https://do.test/block-fail-top");
       return { status: response.status, body: await response.text() };
-    });
+    }, rpcFailure);
     out.second = await attempt(async () => {
       const response = await broken.fetch("https://do.test/block-instance");
       return { status: response.status, body: await response.text() };
-    });
+    }, rpcFailure);
     const fresh = OBJ.getByName("block-fail-broken");
     const revived = await (await fresh.fetch("https://do.test/block-instance")).json();
     // The failure reset the object, so a fresh stub runs on a new instance;
     // the broken stub above keeps rejecting with the abort instead.
     out.revived = revived.instance - live.instance;
+    // P3: a repeat on the broken stub replays the value's class with no
+    // `remote` marker, for non-Error throws too.
+    const brokenStr = OBJ.getByName("block-fail-broken-string");
+    out.strFirst = await attempt(async () => {
+      const response = await brokenStr.fetch("https://do.test/block-fail-kind-string");
+      return { status: response.status, body: await response.text() };
+    }, rpcFailure);
+    out.strSecond = await attempt(async () => {
+      const response = await brokenStr.fetch("https://do.test/block-instance");
+      return { status: response.status, body: await response.text() };
+    }, rpcFailure);
     return report(out);
   },
   async "/block-fail-limit"() {
@@ -1407,6 +1460,29 @@ const routes = {
       const response = await type.fetch("https://do.test/block-fail-kind-type");
       return { status: response.status, body: await response.text() };
     });
+    return report(out);
+  },
+  // #271 P2: an RPC call observes a block abort the way a fetch does: the
+  // first call rejects with the value the block threw (class intact, no
+  // `remote` marker), the same stub stays broken, and a fresh stub works.
+  // The cell leg covers a caller in another cell. P3: repeats keep the
+  // class and still carry no marker.
+  async "/block-fail-rpc"() {
+    const out = {};
+    const stub = RPCDO.getByName("block-fail-rpc");
+    out.first = await attempt(() => stub.rpcBoom("error"), rpcFailure);
+    out.second = await attempt(() => stub.rpcBoom("error"), rpcFailure);
+    out.pongOnBroken = await attempt(() => stub.pong(), rpcFailure);
+    const fresh = RPCDO.getByName("block-fail-rpc");
+    out.revived = await attempt(() => fresh.pong());
+    const typeStub = RPCDO.getByName("block-fail-rpc-type");
+    out.typeFirst = await attempt(() => typeStub.rpcBoom("type"), rpcFailure);
+    out.typeSecond = await attempt(() => typeStub.rpcBoom("type"), rpcFailure);
+    const stringStub = RPCDO.getByName("block-fail-rpc-string");
+    out.stringFirst = await attempt(() => stringStub.rpcBoom("string"), rpcFailure);
+    out.stringSecond = await attempt(() => stringStub.rpcBoom("string"), rpcFailure);
+    const caller = RPCDO.getByName("block-fail-rpc-caller");
+    out.cell = await caller.viaRpc("block-fail-rpc-target");
     return report(out);
   },
   async "/ids"() {
@@ -1608,6 +1684,7 @@ export default {
     OBJ = env.OBJ;
     TIMER = env.TIMER;
     THROWER = env.THROWER;
+    RPCDO = env.RPCDO;
     const { pathname } = new URL(request.url);
     const route = routes[pathname];
     if (!route) {
@@ -1625,3 +1702,4 @@ export default {
 let OBJ;
 let TIMER;
 let THROWER;
+let RPCDO;
