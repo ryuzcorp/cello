@@ -19,8 +19,9 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
   stream, as on Workerd, for `gzip` and `deflate` in both orderings. Every
   round releases its native stream, pinned by a 300-round probe that keeps
   each wrapper held and still stays under the 128-stream cap. The
-  differential gate gained three cases that fail before this change and
-  every case agrees.
+  differential gate gained four cases -- the three orderings that failed
+  before this change plus a cancel-then-close control that already agreed --
+  and every case agrees.
 - **Compression streams deliver output per push and keep an accepted write
   across a cancel, as Workerd does (#257).** A `CompressionStream` now
   enqueues whatever the encoder emitted for each write instead of holding
