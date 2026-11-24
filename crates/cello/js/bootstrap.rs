@@ -496,6 +496,38 @@ pub(super) fn inject_workflows(
     Ok(())
 }
 
+/// `__cell.reservedClasses`: every class name the runtime supplies in this
+/// isolate, so the harness's `ctx.exports` filter asks `deploy::is_reserved_class`
+/// its own question instead of keeping a second copy of the answer.
+///
+/// The filter cannot be "skip a name beginning with `__`": a Worker may export
+/// `__Helper`, and workerd lists it. Its own list is exacter: the four fleet
+/// classes, plus this script's workflow class when the deployment declares a
+/// workflow -- that alias is reserved by shape (`is_workflow_class`), and its
+/// concrete name is only known here.
+pub(super) fn inject_reserved_classes(
+    scope: &mut v8::PinScope,
+    script_name: &str,
+    has_workflows: bool,
+) -> Result<()> {
+    let mut names: Vec<String> = crate::deploy::RESERVED_CLASSES
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+    if has_workflows {
+        names.push(crate::deploy::workflow_class(script_name));
+    }
+    let cell = cell_state(scope)?;
+    let list = v8::Array::new(scope, names.len() as i32);
+    for (index, name) in names.iter().enumerate() {
+        let value = v8::String::new(scope, name).ok_or_else(|| anyhow!("reserved class name"))?;
+        list.set_index(scope, index as u32, value.into());
+    }
+    let key = v8::String::new(scope, "reservedClasses").unwrap();
+    cell.set(scope, key.into(), list.into());
+    Ok(())
+}
+
 /// `__cell.containers`: the classes whose objects get a `ctx.container`.
 /// A class outside this map gets none, which is what the
 /// `@cloudflare/containers` constructor checks.

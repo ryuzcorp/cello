@@ -65,11 +65,26 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
   namespace (`get`, `getByName`, `idFromName`, `idFromString`, `newUniqueId`,
   `jurisdiction`, and calling it specializes the class for a facet), a class
   with no namespace is a loopback class handle, and a plain handler is a
-  loopback service stub whose `fetch` reaches that entrypoint. The handles
-  carry workerd's tags (`[object LoopbackDurableObjectNamespace]`,
-  `[object LoopbackDurableObjectClass]`, `[object LoopbackServiceStub]`) and
-  no own `name`/`length`/`prototype`. The differential gate gained
-  `do/exports-surface` (233 total) and every case agrees.
+  loopback service stub whose `fetch` reaches that entrypoint. Each kind keeps
+  workerd's two prototype levels -- one holding only an own non-enumerable
+  `constructor` and the tag, over the level carrying the members, which for a
+  namespace is `DurableObjectNamespace.prototype` itself (the same function
+  objects `env.NS` answers with) and for a service stub is a `Fetcher`-tagged
+  `ServiceStub.prototype` holding `fetch` and `connect` -- so the tags
+  (`[object LoopbackDurableObjectNamespace]`, `[object LoopbackDurableObjectClass]`,
+  `[object LoopbackServiceStub]`, `[object DurableObjectClass]`), the
+  `constructor` names and the specialized result all read as workerd's. The
+  refusals are workerd's too: a detached namespace method throws the full
+  `Illegal invocation: ...` error, and a handle called with no argument or a
+  non-object one reports `Failed to execute '(called as function)' on
+  '<interface>': parameter 1 is not of type 'Options'.`, with the `props`
+  field's own message. A handle carries no own `name`, `length` or
+  `prototype`.
+  `ctx.exports` also no longer exposes the runtime's own classes or the
+  script-scoped workflow alias (`__Workflow.<script>`), which the workflow
+  cell registered in the same class registry. The differential gate gained
+  `do/exports-surface` and `do-workflow/exports-surface` (235 total) and
+  every case agrees.
 - **A compression stream settles a cancel racing an abort the way Workerd
   does (#252).** A `DecompressionStream`/`CompressionStream` with a write in
   flight, a pending `read()` and a synchronous `reader.cancel()` followed by

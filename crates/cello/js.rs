@@ -7338,6 +7338,7 @@ impl Worker {
             inject_namespace_keys(scope, script_name, do_classes)?;
             inject_crons(scope, &config.crons)?;
             inject_workflows(scope, script_name, &config.workflow_bindings)?;
+            inject_reserved_classes(scope, script_name, !config.workflow_bindings.is_empty())?;
             inject_containers(scope, &config.containers)?;
             inject_kv_limits(scope)?;
             inject_queue_config(scope, &config)?;
@@ -15630,10 +15631,10 @@ mod v8_strings;
 use bootstrap::{
     adopt_cell, adopt_embedded_cell, begin_event_context, build_env, end_event_context,
     harness_env, inject_compatibility_flags, inject_containers, inject_crons, inject_kv_limits,
-    inject_namespace_keys, inject_queue_config, inject_routing, inject_storage_compatibility,
-    inject_workflows, install_harness, install_prelude, populate_cf_exports,
-    populate_loader_process_env, populate_process_env, register_class, register_entrypoints,
-    validate_workflow_classes, EmbeddedStartup,
+    inject_namespace_keys, inject_queue_config, inject_reserved_classes, inject_routing,
+    inject_storage_compatibility, inject_workflows, install_harness, install_prelude,
+    populate_cf_exports, populate_loader_process_env, populate_process_env, register_class,
+    register_entrypoints, validate_workflow_classes, EmbeddedStartup,
 };
 use modules::{
     compile_module, host_import_module_dynamically, install_lazy_globals, op_builtin_module,

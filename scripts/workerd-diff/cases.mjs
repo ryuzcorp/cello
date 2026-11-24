@@ -202,6 +202,10 @@ export const cases = [
       { path: "/nested-block-after-response" },
     ],
   },
+
+  // #259: the runtime's script-scoped workflow class is aliased into the
+  // classes registry, and `ctx.exports` must not expose it as a handle.
+  { name: "do-workflow/exports-surface", fixture: "do-workflow", path: "/exports-surface" },
   { name: "ws-pair", fixture: "ws", path: "/pair" },
   { name: "ws-upgrade", fixture: "ws", websocket: "/ws" },
   { name: "ws-hibernation", fixture: "ws-hib", websocket: { path: "/ws", close: false } },
