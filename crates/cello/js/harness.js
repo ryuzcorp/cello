@@ -587,10 +587,6 @@ const __webidlTag = (ctor, name) =>
 // WebIDL reports an interface's `length` as its number of required arguments;
 // every Fetch interface in workerd defines none. (A class's `prototype` stays
 // non-writable; V8 refuses to redefine it, and no Worker branch depends on it.)
-const __webidlLength = (ctor) =>
-  Object.defineProperty(ctor, "length", {
-    value: 0, configurable: true, writable: false,
-  });
 // A binding's methods are native functions in workerd, and V8 publishes a
 // native function's `length` as the zero parameters its template carries --
 // 0 for every JSG interface, whatever its C++ signature reads out of the
@@ -609,6 +605,10 @@ const __nativeMethodArities = (ctor) => {
     });
   }
 };
+const __webidlLength = (ctor) =>
+  Object.defineProperty(ctor, "length", {
+    value: 0, configurable: true, writable: false,
+  });
 
 // ---- request/response state ------------------------------------------------
 // Every field of a Request or Response lives in a private slot; the runtime's
@@ -1690,42 +1690,6 @@ const __boundInt32 = (value) => {
   }
   return Math.trunc(number);
 };
-// A value as JSG's `kj::String` conversion reads it: V8's ToString, which
-// takes any value but refuses a symbol, because a symbol has no string form.
-// `String(symbol)` would instead answer "Symbol(...)" and let a typo through.
-const __jsString = (value) => {
-  if (typeof value === "symbol")
-    throw new TypeError("Cannot convert a Symbol value to a string");
-  return `${value}`;
-};
-// One listing's request, converted as workerd's JSG converts the ListOptions
-// struct (#239): the four string fields read any value (an absent or
-// `undefined` field is absent), `reverse` is the boolean coercion, `limit` is
-// an `int` whose positivity is checked when the listing compiles, and the two
-// start fields are mutually exclusive. Reading the raw JSON into the store
-// reported serde's own text for a mistyped field, which no Worker matches on.
-const __storageListRequest = (options, method, target) => {
-  const o = __bindingOptions(options, method, target, 1, "ListOptions");
-  const request = {};
-  const start = o.start === undefined ? undefined : __jsString(o.start);
-  const startAfter = o.startAfter === undefined
-    ? undefined : __jsString(o.startAfter);
-  if (start !== undefined && startAfter !== undefined)
-    throw new TypeError(
-      "list() cannot be called with both start and startAfter values.",
-    );
-  if (start !== undefined) request.start = start;
-  if (startAfter !== undefined) request.startAfter = startAfter;
-  if (o.end !== undefined) request.end = __jsString(o.end);
-  if (o.prefix !== undefined) request.prefix = __jsString(o.prefix);
-  if (o.reverse !== undefined) request.reverse = !!o.reverse;
-  if (o.limit !== undefined) {
-    const limit = __boundInt32(o.limit);
-    if (limit <= 0) throw new TypeError("List limit must be positive.");
-    request.limit = limit;
-  }
-  return request;
-};
 // R2's key rules, checked here so a key the real thing refuses is refused
 // here too rather than quietly written.
 const __r2Key = (binding, method, key) => {
@@ -2412,7 +2376,6 @@ class SqlCursor {
       );
     }
   }
-  get columns() { return this.#columns; }
   get rowsRead() { return this.#rowsRead; }
   get rowsWritten() { return this.#rowsWritten; }
   #obj(r) { const o = {}; for (let i = 0; i < this.#columns.length; i++) o[this.#columns[i]] = r[i]; return o; }
@@ -2502,28 +2465,53 @@ class SqlCursor {
   }
   [Symbol.iterator]() { return this; }
 }
+// workerd's cursor reports its own interface, and its prototype members are
+// the enumerable ones a Worker walks (#251).
+Object.defineProperty(SqlCursor.prototype, Symbol.toStringTag, {
+  value: "Cursor", configurable: true, writable: true, enumerable: false,
+});
+__webidlPrototype(SqlCursor);
+for (const name of [
+  "next", "toArray", "one", "raw", "columnNames", "rowsRead", "rowsWritten",
+]) {
+  const descriptor = Object.getOwnPropertyDescriptor(SqlCursor.prototype, name);
+  if (descriptor === undefined) continue;
+  delete SqlCursor.prototype[name];
+  Object.defineProperty(SqlCursor.prototype, name, descriptor);
+}
+// The cell the SQL storage speaks for, for the runtime's own code (the D1
+// cell runs its ops against it). A private slot has no reader outside the
+// class, and a static block is the one place that may hand one out (#251).
+let __sqlStorageScope;
 class SqlStorage {
+  static {
+    __sqlStorageScope = (sql) => sql.#scope;
+  }
   // The state is what the abort guard in `exec` reads; a storage built
-  // without one would bypass the guard silently.
+  // without one would bypass the guard silently. All three live in private
+  // slots: workerd's object has no own property (#251).
+  #scope;
+  #state;
+  #storage;
   constructor(scope, state, storage) {
     if (!state) throw new TypeError("SqlStorage requires its DurableObjectState");
-    this._scope = scope;
-    this._state = state;
-    this._storage = storage;
+    this.#scope = scope;
+    this.#state = state;
+    this.#storage = storage;
   }
   prepare(query) {
-    this._storage._assertTransactionActive("sql.prepare");
+    __storageAssertActive(this.#storage, "sql.prepare");
     const storage = this;
     const source = String(query);
     return (...binds) => storage.exec(source, ...binds);
   }
   exec(query, ...binds) {
-    this._storage._assertTransactionActive("sql.exec");
+    __storageAssertActive(this.#storage, "sql.exec");
     // A callback that outlived its block runs on an object that was reset,
     // whose replacement uses the same connection: a statement from it
     // would land in the replacement's state. The KV surface drops such
     // writes silently; SQL refuses aloud, since a cursor can carry reads.
-    if (this._state._aborted) {
+    if (this.#state._aborted) {
       throw new Error("the Durable Object was reset; this event's storage is closed");
     }
     const jsonBinds = [];
@@ -2544,23 +2532,23 @@ class SqlStorage {
     }
     const json = JSON.stringify(jsonBinds);
     return new SqlCursor(byteBinds.length === 0
-      ? __sql_cursor_start(this._scope, query, json)
-      : __sql_cursor_start(this._scope, query, json, byteBinds));
+      ? __sql_cursor_start(this.#scope, query, json)
+      : __sql_cursor_start(this.#scope, query, json, byteBinds));
   }
   ingest(input) {
-    this._storage._assertTransactionActive("sql.ingest");
-    const result = JSON.parse(__sql_ingest(this._scope, String(input)));
+    __storageAssertActive(this.#storage, "sql.ingest");
+    const result = JSON.parse(__sql_ingest(this.#scope, String(input)));
     if (result.error) throw new Error("SQL error: " + result.error);
     return result;
   }
   get databaseSize() {
-    this._storage._assertTransactionActive("sql.databaseSize");
-    return __sql_database_size(this._scope);
+    __storageAssertActive(this.#storage, "sql.databaseSize");
+    return __sql_database_size(this.#scope);
   }
   setMaxPageCountForTest(pages) {
     if (typeof __sql_set_max_page_count_for_test !== "function")
       throw new Error("setMaxPageCountForTest is only available in tests");
-    __sql_set_max_page_count_for_test(this._scope, Number(pages));
+    __sql_set_max_page_count_for_test(this.#scope, Number(pages));
   }
   setWriteFaultForTest(enabled) {
     if (typeof __sql_set_write_fault_for_test !== "function")
@@ -2570,19 +2558,38 @@ class SqlStorage {
   setCacheSizeForTest(pages) {
     if (typeof __sql_set_cache_size_for_test !== "function")
       throw new Error("setCacheSizeForTest is only available in tests");
-    __sql_set_cache_size_for_test(this._scope, Number(pages));
+    __sql_set_cache_size_for_test(this.#scope, Number(pages));
   }
   setInterruptFaultForTest(enabled) {
     if (typeof __sql_set_interrupt_fault_for_test !== "function")
       throw new Error(
         "setInterruptFaultForTest is only available in tests");
-    __sql_set_interrupt_fault_for_test(this._scope, !!enabled);
+    __sql_set_interrupt_fault_for_test(this.#scope, !!enabled);
   }
   registerNomemFunctionForTest() {
     if (typeof __sql_register_nomem_function_for_test !== "function")
       throw new Error(
         "registerNomemFunctionForTest is only available in tests");
-    __sql_register_nomem_function_for_test(this._scope);
+    __sql_register_nomem_function_for_test(this.#scope);
+  }
+}
+// workerd's SqlStorage surface is `exec`, the `databaseSize` getter and two
+// nested constructors a cursor reports; Cello's own seams -- a bound
+// `prepare`, the multi-statement `ingest` and the fault hooks -- are not part
+// of it, so they exist only on a node booted with CELLO_TEST_WAIT=1, like
+// every other test seam (#231, #251).
+function Cursor() { throw new TypeError("Illegal constructor"); }
+function Statement() { throw new TypeError("Illegal constructor"); }
+SqlStorage.prototype.Cursor = Cursor;
+SqlStorage.prototype.Statement = Statement;
+__webidlPrototype(SqlStorage);
+if (!__test_wait_enabled()) {
+  for (const name of [
+    "prepare", "ingest", "setMaxPageCountForTest", "setWriteFaultForTest",
+    "setCacheSizeForTest", "setInterruptFaultForTest",
+    "registerNomemFunctionForTest",
+  ]) {
+    delete SqlStorage.prototype[name];
   }
 }
 __nativeMethodArities(SqlStorage);
@@ -2623,64 +2630,155 @@ class SyncKvListIterator {
   }
 }
 class SyncKvStorage {
+  // workerd's own object; its state is private, so a Worker reflecting it sees
+  // no property at all (#251).
+  #storage;
+  #root;
   constructor(storage) {
-    this._storage = storage;
-    this._root = storage._transactionRoot;
+    this.#storage = storage;
+    this.#root = storage._transactionRoot;
   }
   get(key) {
-    this._storage._assertTransactionActive("kv.get");
+    __storageAssertActive(this.#storage, "kv.get");
     key = String(key);
     return __unwrapStored(__readStoredValue(
-      this._storage._scope, key,
-      () => __storage_get(this._storage._scope, key,
+      this.#storage._scope, key,
+      () => __storage_get(this.#storage._scope, key,
                           __storedSentinel),
     ));
   }
   put(key, value) {
-    this._storage._assertTransactionActive("kv.put");
+    __storageAssertActive(this.#storage, "kv.put");
     key = String(key);
     try {
-      __storage_put(this._storage._scope, key, value);
+      __storage_put(this.#storage._scope, key, value);
     } catch (error) {
-      __storage_put_serialized(this._storage._scope, key,
+      __storage_put_serialized(this.#storage._scope, key,
                                __storedBytes(value, error));
     }
   }
   delete(key) {
-    this._storage._assertTransactionActive("kv.delete");
-    return __storage_delete(this._storage._scope, String(key));
+    __storageAssertActive(this.#storage, "kv.delete");
+    return __storage_delete(this.#storage._scope, String(key));
   }
   list(options) {
-    this._storage._assertTransactionActive("kv.list");
+    __storageAssertActive(this.#storage, "kv.list");
     const request = __storageListRequest(options, "list", "SyncKvStorage");
-    const generation = ++this._root._syncKvListGeneration;
+    const generation = ++this.#root._syncKvListGeneration;
     const cursor = __storage_sync_list_start(
-      this._storage._scope, JSON.stringify(request),
+      this.#storage._scope, JSON.stringify(request),
     );
     return new SyncKvListIterator(
-      this._root, generation, cursor,
+      this.#root, generation, cursor,
     );
   }
 }
-// Workerd's DurableObjectStorage.setAlarm argument conversion (actor-state.c++
-// setAlarm, jsg::Date): a Date or a number, finite and strictly after the Unix
-// epoch. Every other value is the WebIDL argument refusal workerd raises.
-const __alarmTime = (value) => {
+// A value as JSG's `kj::String` conversion reads it: V8's ToString, which
+// takes any value but refuses a symbol, because a symbol has no string form.
+// `String(symbol)` would instead answer "Symbol(...)" and let a typo through.
+const __jsString = (value) => {
+  if (typeof value === "symbol")
+    throw new TypeError("Cannot convert a Symbol value to a string");
+  return `${value}`;
+};
+// One listing's request, converted as workerd's JSG converts the ListOptions
+// struct (#239): the four string fields read any value (an absent or
+// `undefined` field is absent), `reverse` is the boolean coercion, `limit` is
+// an `int` whose positivity is checked when the listing compiles, and the two
+// start fields are mutually exclusive. Reading the raw JSON into the store
+// reported serde's own text for a mistyped field, which no Worker matches on.
+const __storageListRequest = (options, method, target) => {
+  const o = __bindingOptions(options, method, target, 1, "ListOptions");
+  const request = {};
+  const start = o.start === undefined ? undefined : __jsString(o.start);
+  const startAfter = o.startAfter === undefined
+    ? undefined : __jsString(o.startAfter);
+  if (start !== undefined && startAfter !== undefined)
+    throw new TypeError(
+      "list() cannot be called with both start and startAfter values.",
+    );
+  if (start !== undefined) request.start = start;
+  if (startAfter !== undefined) request.startAfter = startAfter;
+  if (o.end !== undefined) request.end = __jsString(o.end);
+  if (o.prefix !== undefined) request.prefix = __jsString(o.prefix);
+  if (o.reverse !== undefined) request.reverse = !!o.reverse;
+  if (o.limit !== undefined) {
+    const limit = __boundInt32(o.limit);
+    if (limit <= 0) throw new TypeError("List limit must be positive.");
+    request.limit = limit;
+  }
+  return request;
+};
+// Workerd's `jsg::Date` argument conversion: a Date or a number, and a finite
+// value. Every other value is the WebIDL argument refusal, which names the
+// method being called. `setAlarm` and `getBookmarkForTime` share it.
+const __storageDate = (value, method) => {
   let ms;
   if (value instanceof Date) ms = value.getTime();
   else if (typeof value === "number") ms = value;
   else
     throw new TypeError(
-      "Failed to execute 'setAlarm' on 'DurableObjectStorage': " +
+      "Failed to execute '" + method + "' on 'DurableObjectStorage': " +
       "parameter 1 is not of type 'date'.");
   if (!Number.isFinite(ms))
     throw new TypeError(
       "The value cannot be converted because it is not a valid Date.");
+  return ms;
+};
+// `setAlarm` additionally requires a time strictly after the Unix epoch.
+const __alarmTime = (value) => {
+  const ms = __storageDate(value, "setAlarm");
   if (ms <= 0)
     throw new TypeError("setAlarm() cannot be called with an alarm time <= 0");
   return ms;
 };
+// A local storage back-end has no point-in-time recovery, and workerd's own
+// says so instead of inventing a bookmark: the one answer both methods give
+// once their arguments convert (#251).
+const __noPointInTimeRecovery = () =>
+  new Error(
+    "This Durable Object's storage back-end does not implement " +
+      "point-in-time recovery.",
+  );
+// A bookmark's shape, as the local back-end reports it: a zero prefix, the
+// cell's own sequence in hex, another zero field and 32 zero hex digits.
+// Calling `getCurrentBookmark()` is what advances the sequence (a write does
+// not), and `deleteAll()` starts it over, which is what a fixture can observe
+// (#251).
+// `setHibernatableWebSocketEventTimeout`'s conversion: `undefined` and `null`
+// clear it, any other value is a number (a BigInt keeps V8's own refusal), a
+// non-finite one is "not an integer", a negative one is refused as negative,
+// and anything past a week is refused by the back-end's own limit.
+const __hibernationTimeout = (value) => {
+  if (value === undefined || value === null) return null;
+  if (typeof value === "bigint")
+    throw new TypeError("Cannot convert a BigInt value to a number");
+  const number = Number(value);
+  if (!Number.isFinite(number))
+    throw new TypeError(
+      "The value cannot be converted because it is not an integer.");
+  const ms = Math.trunc(number);
+  if (ms < 0)
+    throw new TypeError(
+      "The value cannot be converted because it is negative and this API " +
+        "expects a positive number.");
+  if (ms > 604800000)
+    throw new Error("Event timeout should not exceed 604800000 ms.");
+  return ms === 0 ? null : ms;
+};
+const __storageBookmark = (sequence) =>
+  "00000000-" + sequence.toString(16).padStart(8, "0") + "-00000000-" +
+  "0".repeat(32);
+// The storage guard `SqlStorage` and the synchronous KV view share with the
+// storage class: a static private method is reachable from a static block and
+// from nowhere else, so neither the prototype nor the class object publishes
+// it (#251).
+let __storageAssertActive;
 class DurableObjectStorage {
+  static {
+    __storageAssertActive = (storage, operation) =>
+      DurableObjectStorage.#assertTransactionActive(storage, operation);
+  }
   constructor(
     scope,
     state = null,
@@ -2688,37 +2786,69 @@ class DurableObjectStorage {
     transactionDepth = 0,
     transactionControl = null,
   ) {
-    // Non-writable: the scope reaches host ops, and a reassignment must
-    // not retarget them (H6). Tenant fixtures only read it.
+    // The host's own fields stay off reflection: workerd's storage exposes
+    // `kv` and `sql` as its only own, enumerable properties, so `Object.keys`
+    // and `JSON.stringify` of a storage answer exactly that much, and no
+    // `_`-prefixed member is left to find (#251). They are defined rather
+    // than assigned because assignment is what makes a property enumerable.
+    // The scope field is non-writable too: it reaches host ops, and a
+    // reassignment must not retarget them (H6).
     __primDefineProp(this, "_scope", {
-      value: scope, enumerable: true, configurable: false, writable: false,
+      value: scope, enumerable: false, configurable: false, writable: false,
     });
-    this._state = state;
-    this.sql = new SqlStorage(scope, state, this);
-    this._transactionRoot = transactionRoot || this;
-    this._transactionDepth = transactionDepth;
-    this._transactionControl = transactionControl;
+    __primDefineProp(this, "_state", {
+      value: state, enumerable: false, configurable: true, writable: true,
+    });
+    __primDefineProp(this, "_transactionRoot", {
+      value: transactionRoot || this,
+      enumerable: false, configurable: true, writable: true,
+    });
+    __primDefineProp(this, "_transactionDepth", {
+      value: transactionDepth, enumerable: false, configurable: true, writable: true,
+    });
+    __primDefineProp(this, "_transactionControl", {
+      value: transactionControl, enumerable: false, configurable: true, writable: true,
+    });
     if (!transactionRoot) {
-      this._transactionSerial = 0;
-      this._transactionTail = Promise.resolve();
-      this._transactionOwner = "";
-      this._activeTransaction = null;
-      this._activeSyncTransaction = null;
-      this._syncKvListGeneration = 0;
+      __primDefineProp(this, "_transactionSerial", {
+        value: 0, enumerable: false, configurable: true, writable: true,
+      });
+      __primDefineProp(this, "_transactionTail", {
+        value: Promise.resolve(),
+        enumerable: false, configurable: true, writable: true,
+      });
+      __primDefineProp(this, "_transactionOwner", {
+        value: "", enumerable: false, configurable: true, writable: true,
+      });
+      __primDefineProp(this, "_activeTransaction", {
+        value: null, enumerable: false, configurable: true, writable: true,
+      });
+      __primDefineProp(this, "_activeSyncTransaction", {
+        value: null, enumerable: false, configurable: true, writable: true,
+      });
+      __primDefineProp(this, "_syncKvListGeneration", {
+        value: 0, enumerable: false, configurable: true, writable: true,
+      });
+      __primDefineProp(this, "_bookmarkSequence", {
+        value: 0, enumerable: false, configurable: true, writable: true,
+      });
     }
-    this._kv = new SyncKvStorage(this);
+    // workerd's own enumerable properties, in its order.
+    this.kv = new SyncKvStorage(this);
+    this.sql = new SqlStorage(scope, state, this);
   }
-  get kv() { return this._kv; }
-  _transactionStatus() {
+
+  static #transactionStatus(self) {
     let status = null;
-    for (let control = this._transactionControl; control; control = control.parent) {
+    for (let control = self._transactionControl; control; control = control.parent) {
       if (control.rolledBack) return "rolled back";
       if (control.committed) status = "committed";
     }
     return status;
   }
-  _assertTransactionActive(operation) {
-    const status = this._transactionStatus();
+
+  static #assertTransactionActive(self, operation) {
+    const status = DurableObjectStorage.#transactionStatus(self);
     // workerd's wording, which applications match on.
     if (status === "committed")
       throw new Error(
@@ -2727,23 +2857,24 @@ class DurableObjectStorage {
       );
     if (status) throw new Error("Cannot " + operation + "() on " + status + " transaction");
   }
-  _flushPendingPuts() {
+
+  static #flushPendingPuts(self) {
     // An admitted put can resume after its boundary flushed and ended the
     // transaction. Its promise completes without flushing a later scope.
-    if (this._transactionStatus()) return false;
-    if (this._state && this._state._aborted) return false;
-    __storage_flush_pending_puts(this._scope);
+    if (DurableObjectStorage.#transactionStatus(self)) return false;
+    if (self._state && self._state._aborted) return false;
+    __storage_flush_pending_puts(self._scope);
     return true;
   }
   async get(k, options) {
-    this._assertTransactionActive("get");
+    DurableObjectStorage.#assertTransactionActive(this, "get");
     // `allowConcurrency`/`noCache` reach the host's own scheduling, which
     // this cell answers from its own storage; the argument is still
     // converted, because a typo in it must not read as "no options".
     __bindingOptions(options, "get", "DurableObjectStorage", 2, "GetOptions");
     // Transaction operations reach SQLite before their caller can roll back.
     if (!this._transactionControl) await Promise.resolve();
-    if (!this._flushPendingPuts()) return;
+    if (!DurableObjectStorage.#flushPendingPuts(this)) return;
     const key = Array.isArray(k) ? JSON.stringify(k) : String(k);
     return __readStoredValue(this._scope, key, () => {
       if (Array.isArray(k))
@@ -2754,7 +2885,7 @@ class DurableObjectStorage {
     });
   }
   async put(k, val, options) {
-    this._assertTransactionActive("put");
+    DurableObjectStorage.#assertTransactionActive(this, "put");
     // Workerd's put has one signature, `put(key: string or object, value,
     // options)`, and its WebIDL union decides the form: a non-array object is
     // the batch dictionary (the second argument is then its options), and
@@ -2769,9 +2900,9 @@ class DurableObjectStorage {
     const kind = typeof k;
     if (kind === "object" || kind === "function") {
       if (k !== null && !Array.isArray(k)) {
-        this._putEntries(k, val);
+        DurableObjectStorage.#putEntries(this, k, val);
         await Promise.resolve();
-        this._flushPendingPuts();
+        DurableObjectStorage.#flushPendingPuts(this);
         return;
       }
     }
@@ -2791,13 +2922,13 @@ class DurableObjectStorage {
                                      __storedBytes(val, error));
     }
     await Promise.resolve();
-    this._flushPendingPuts();
+    DurableObjectStorage.#flushPendingPuts(this);
   }
   // The batch form's writes: the dictionary conversion reads every own
   // enumerable string key, in property order, and drops a pair whose value is
   // undefined (`putMultiple` skips it rather than deleting the key). A Map, a
   // Set or a Date has no such key, so it writes nothing at all.
-  _putEntries(entries, options) {
+  static #putEntries(self, entries, options) {
     // Any object is the options dictionary, an array included: workerd's
     // struct conversion reads one positionally, and an array of any shape
     // leaves every PutOptions field at its default, so the write is the same
@@ -2819,7 +2950,7 @@ class DurableObjectStorage {
     }
     if (pairs.length === 0) return;
     try {
-      __storage_queue_put_many(this._scope, pairs);
+      __storage_queue_put_many(self._scope, pairs);
     } catch (error) {
       // A batch with a stub entry: encode every entry first (plain
       // entries keep their native clone bytes, stub entries take
@@ -2834,16 +2965,16 @@ class DurableObjectStorage {
         }
       });
       for (const [key, bytes] of encoded)
-        __storage_queue_put_serialized(this._scope, key, bytes);
+        __storage_queue_put_serialized(self._scope, key, bytes);
     }
   }
   async delete(k, options) {
-    this._assertTransactionActive("delete");
+    DurableObjectStorage.#assertTransactionActive(this, "delete");
     // Workerd's delete names PutOptions in its refusal: the two dictionaries
     // carry the same flags (`allowUnconfirmed`).
     __bindingOptions(options, "delete", "DurableObjectStorage", 2, "PutOptions");
     if (!this._transactionControl) await Promise.resolve();
-    if (!this._flushPendingPuts()) return;
+    if (!DurableObjectStorage.#flushPendingPuts(this)) return;
     if (Array.isArray(k)) {
       if (k.length === 0) return 0;
       return __storage_delete_many(this._scope, k);
@@ -2851,18 +2982,21 @@ class DurableObjectStorage {
     return __storage_delete(this._scope, k);
   }
   async list(options) {
-    this._assertTransactionActive("list");
+    DurableObjectStorage.#assertTransactionActive(this, "list");
     const request = __storageListRequest(options, "list", "DurableObjectStorage");
     if (!this._transactionControl) await Promise.resolve();
-    if (!this._flushPendingPuts()) return new Map();
+    if (!DurableObjectStorage.#flushPendingPuts(this)) return new Map();
     return __unwrapStoredMap(__storage_list(
       this._scope, JSON.stringify(request), __storedSentinel));
   }
   async deleteAll() {
-    this._assertTransactionActive("deleteAll");
+    DurableObjectStorage.#assertTransactionActive(this, "deleteAll");
     if (!this._transactionControl) await Promise.resolve();
-    if (!this._flushPendingPuts()) return;
+    if (!DurableObjectStorage.#flushPendingPuts(this)) return;
     __storage_delete_all(this._scope, __cell.deleteAllDeletesAlarm);
+    // `getCurrentBookmark` describes the storage it is called on, and starts
+    // over with it: the sequence advances per call, never per write (#251).
+    this._transactionRoot._bookmarkSequence = 0;
   }
   // Resolves once every write this cell committed before the call is
   // proven durable, by the proof the output gate requires before it releases
@@ -2871,14 +3005,14 @@ class DurableObjectStorage {
   // rejects when that proof fails or times out, so an application never
   // treats a lost write as safe.
   async sync() {
-    this._assertTransactionActive("sync");
+    DurableObjectStorage.#assertTransactionActive(this, "sync");
     await Promise.resolve();
-    const status = this._transactionStatus();
+    const status = DurableObjectStorage.#transactionStatus(this);
     // An admitted sync can resume after transactionSync commits or rolls
     // back. Its boundary settled the queued puts, so prove the surviving
     // state without flushing a later transaction through this handle. A
     // new call after that boundary still fails the entry guard above.
-    if (this._state?._aborted || (status === null && !this._flushPendingPuts()))
+    if (this._state?._aborted || (status === null && !DurableObjectStorage.#flushPendingPuts(this)))
       throw new Error(
         "storage.sync: " + this._scope + " was aborted; the object is no " +
         "longer running");
@@ -2893,9 +3027,9 @@ class DurableObjectStorage {
     // exactly workerd's Initializing state, where setAlarm is allowed
     // because the class may still produce an alarm() handler.
     const instance = __cell.instances[this._scope];
-    this._assertTransactionActive("setAlarm");
+    DurableObjectStorage.#assertTransactionActive(this, "setAlarm");
     if (!this._transactionControl) await Promise.resolve();
-    if (!this._flushPendingPuts()) return;
+    if (!DurableObjectStorage.#flushPendingPuts(this)) return;
     if (this._state?._facetDepth > 0)
       throw new Error("Facets currently cannot set alarms.");
     // Workerd validates the argument, then the instant, then whether the
@@ -2908,46 +3042,50 @@ class DurableObjectStorage {
     __alarm_set(this._scope, at);
   }
   async getAlarm() {
-    this._assertTransactionActive("getAlarm");
+    DurableObjectStorage.#assertTransactionActive(this, "getAlarm");
     if (!this._transactionControl) await Promise.resolve();
-    if (!this._flushPendingPuts()) return null;
+    if (!DurableObjectStorage.#flushPendingPuts(this)) return null;
     const v = __alarm_get(this._scope);
     return v === null ? null : v;
   }
   async deleteAlarm(options) {
     __bindingOptions(options, "deleteAlarm", "DurableObjectStorage", 1, "SetAlarmOptions");
-    this._assertTransactionActive("deleteAlarm");
+    DurableObjectStorage.#assertTransactionActive(this, "deleteAlarm");
     if (!this._transactionControl) await Promise.resolve();
-    if (!this._flushPendingPuts()) return;
+    if (!DurableObjectStorage.#flushPendingPuts(this)) return;
     __alarm_delete(this._scope);
   }
-  _transactionStart() {
-    const root = this._transactionRoot;
+
+  static #transactionStart(self) {
+    const root = self._transactionRoot;
     const savepoint = "cells_tx_" + (++root._transactionSerial);
     __storage_transaction_control(
-      this._scope, "start", this._transactionDepth > 0, savepoint,
+      self._scope, "start", self._transactionDepth > 0, savepoint,
     );
     return savepoint;
   }
-  _transactionCommit(savepoint) {
+
+  static #transactionCommit(self, savepoint) {
     __storage_transaction_control(
-      this._scope, "commit", this._transactionDepth > 0, savepoint,
+      self._scope, "commit", self._transactionDepth > 0, savepoint,
     );
   }
-  _transactionRollback(savepoint, explicit = false) {
+
+  static #transactionRollback(self, savepoint, explicit = false) {
     __storage_transaction_control(
-      this._scope,
+      self._scope,
       explicit ? "rollback_explicit" : "rollback",
-      this._transactionDepth > 0,
+      self._transactionDepth > 0,
       savepoint,
     );
   }
-  _transactionView(transactionControl) {
+
+  static #transactionView(self, transactionControl) {
     return new DurableObjectStorage(
-      this._scope,
-      this._state,
-      this._transactionRoot,
-      this._transactionDepth + 1,
+      self._scope,
+      self._state,
+      self._transactionRoot,
+      self._transactionDepth + 1,
       transactionControl,
     );
   }
@@ -2956,7 +3094,7 @@ class DurableObjectStorage {
     if (!control)
       throw new TypeError("rollback() must be called on a transaction");
     if (control.rolledBack) return;
-    this._assertTransactionActive("rollback");
+    DurableObjectStorage.#assertTransactionActive(this, "rollback");
     // An asynchronous child can still own a nested savepoint. Mark this view
     // terminal now, but let its runner release the child before it rolls this
     // layer back.
@@ -2964,7 +3102,7 @@ class DurableObjectStorage {
     control.rolledBack = true;
   }
   transactionSync(f) {
-    this._assertTransactionActive("transactionSync");
+    DurableObjectStorage.#assertTransactionActive(this, "transactionSync");
     const root = this._transactionRoot;
     if (this._transactionDepth === 0) {
       // A callback can call a helper that reaches the root `ctx.storage`
@@ -2985,9 +3123,9 @@ class DurableObjectStorage {
           root._activeTransaction !== null)
         return root._activeTransaction.transactionSync(f);
     }
-    const savepoint = this._transactionStart();
-    const control = this._newTransactionControl(savepoint);
-    const view = this._transactionView(control);
+    const savepoint = DurableObjectStorage.#transactionStart(this);
+    const control = DurableObjectStorage.#newTransactionControl(this, savepoint);
+    const view = DurableObjectStorage.#transactionView(this, control);
     // No owner check guards this slot, unlike `_activeTransaction`, which an
     // asynchronous transaction publishes across awaits and must therefore keep
     // with the event that opened it. The callback below runs to its end before
@@ -3000,17 +3138,17 @@ class DurableObjectStorage {
       // inside the transaction, and a throw rolls it back.
       const value = f();
       if (!control.rolledBack) {
-        this._transactionCommit(savepoint);
+        DurableObjectStorage.#transactionCommit(this, savepoint);
         control.committed = true;
       }
       return value;
     } catch (error) {
       if (!control.rolledBack) {
         try {
-          this._transactionRollback(savepoint);
+          DurableObjectStorage.#transactionRollback(this, savepoint);
           control.rolledBack = true;
         } catch (rollbackError) {
-          this._abortAfterFailedRollback(rollbackError, error);
+          DurableObjectStorage.#abortAfterFailedRollback(this, rollbackError, error);
         }
       }
       throw error;
@@ -3018,27 +3156,30 @@ class DurableObjectStorage {
       root._activeSyncTransaction = previousSync;
     }
   }
-  _newTransactionControl(savepoint) {
+
+  static #newTransactionControl(self, savepoint) {
     const control = {
       rolledBack: false,
       rollbackPerformed: false,
       committed: false,
-      parent: this._transactionControl,
+      parent: self._transactionControl,
       pending: new Set(),
       rollback: () => {
-        this._transactionRollback(savepoint, true);
+        DurableObjectStorage.#transactionRollback(self, savepoint, true);
         control.rollbackPerformed = true;
       },
     };
     return control;
   }
-  async _drainNestedTransactions(control) {
+
+  static async #drainNestedTransactions(self, control) {
     while (control.pending.size !== 0)
       await Promise.allSettled(Array.from(control.pending));
   }
-  async _runTransactionWith(f, savepoint, control) {
-    const view = this._transactionView(control);
-    const root = this._transactionRoot;
+
+  static async #runTransactionWith(self, f, savepoint, control) {
+    const view = DurableObjectStorage.#transactionView(self, control);
+    const root = self._transactionRoot;
     const owner = String(__io_context_id());
     const installsActive = owner !== "" && root._transactionOwner === owner;
     const previousActive = root._activeTransaction;
@@ -3049,16 +3190,16 @@ class DurableObjectStorage {
       // handle and omit the returned promise. That child already owns a
       // savepoint, so ending this layer first would make SQLite release the
       // child's savepoint and let its continuation run against a false owner.
-      await this._drainNestedTransactions(control);
+      await DurableObjectStorage.#drainNestedTransactions(self, control);
       if (!control.rolledBack) {
-        this._transactionCommit(savepoint);
+        DurableObjectStorage.#transactionCommit(self, savepoint);
         control.committed = true;
       } else if (!control.rollbackPerformed) {
         control.rollback();
       }
       return value;
     } catch (error) {
-      await this._drainNestedTransactions(control);
+      await DurableObjectStorage.#drainNestedTransactions(self, control);
       if (!control.rollbackPerformed) {
         // The flag records a rollback that happened, not one that was
         // attempted: a rollback that fails leaves the savepoint open, and a
@@ -3066,11 +3207,11 @@ class DurableObjectStorage {
         // Nothing can be said about the connection then, so the object is
         // aborted rather than left to serve from it.
         try {
-          this._transactionRollback(savepoint);
+          DurableObjectStorage.#transactionRollback(self, savepoint);
           control.rolledBack = true;
           control.rollbackPerformed = true;
         } catch (rollbackError) {
-          this._abortAfterFailedRollback(rollbackError, error);
+          DurableObjectStorage.#abortAfterFailedRollback(self, rollbackError, error);
         }
       }
       throw error;
@@ -3084,11 +3225,12 @@ class DurableObjectStorage {
   // rollback failure is reported even when the object is already aborted,
   // as it is after a block's limit: the abort then changes nothing, and the
   // log line is the only trace the failure leaves.
-  _abortAfterFailedRollback(rollbackError, cause) {
+
+  static #abortAfterFailedRollback(self, rollbackError, cause) {
     // Inside a catch, so the log must not become the throw that leaves it:
     // the slot release after the caller's rethrow depends on that.
     try { console.error("transaction rollback failed", rollbackError); } catch {}
-    const state = this._transactionRoot._state;
+    const state = self._transactionRoot._state;
     if (state && !state._aborted) {
       state.abort(
         new Error(
@@ -3098,14 +3240,46 @@ class DurableObjectStorage {
       );
     }
   }
-  async _runTransaction(f) {
-    const savepoint = this._transactionStart();
-    return this._runTransactionWith(f, savepoint, this._newTransactionControl(savepoint));
+
+  static async #runTransaction(self, f) {
+    const savepoint = DurableObjectStorage.#transactionStart(self);
+    return DurableObjectStorage.#runTransactionWith(self, f, savepoint, DurableObjectStorage.#newTransactionControl(self, savepoint));
+  }
+  // The session bookmarks workerd's storage reports. A local back-end has no
+  // point-in-time recovery, and workerd's own says so rather than inventing a
+  // value, so the two methods that would need it refuse with its message after
+  // their arguments convert. `getCurrentBookmark` needs none of that: the
+  // local back-end answers a sequence that advances once per call, and
+  // `deleteAll` starts it over (#251).
+  async getCurrentBookmark() {
+    DurableObjectStorage.#assertTransactionActive(this, "getCurrentBookmark");
+    const root = this._transactionRoot;
+    const sequence = root._bookmarkSequence;
+    root._bookmarkSequence = sequence + 1;
+    return __storageBookmark(sequence);
+  }
+  async getBookmarkForTime() {
+    DurableObjectStorage.#assertTransactionActive(this, "getBookmarkForTime");
+    __storageDate(arguments[0], "getBookmarkForTime");
+    throw __noPointInTimeRecovery();
+  }
+  async onNextSessionRestoreBookmark() {
+    DurableObjectStorage.#assertTransactionActive(
+      this, "onNextSessionRestoreBookmark");
+    // A required argument that is not a string is the WebIDL refusal; every
+    // other value coerces and then meets the same missing back-end.
+    if (arguments.length === 0)
+      throw new TypeError(
+        "Failed to execute 'onNextSessionRestoreBookmark' on " +
+          "'DurableObjectStorage': parameter 1 is not of type 'string'.",
+      );
+    __jsString(arguments[0]);
+    throw __noPointInTimeRecovery();
   }
   async transaction(f) {
-    this._assertTransactionActive("transaction");
+    DurableObjectStorage.#assertTransactionActive(this, "transaction");
     if (this._transactionDepth > 0) {
-      const nested = this._runTransaction(f);
+      const nested = DurableObjectStorage.#runTransaction(this, f);
       const pending = this._transactionControl.pending;
       pending.add(nested);
       nested.then(
@@ -3168,9 +3342,9 @@ class DurableObjectStorage {
         // a failure there is the transaction's to report, not the block's:
         // a throw that escaped here would reset the object.
         try {
-          const savepoint = this._transactionStart();
-          control = this._newTransactionControl(savepoint);
-          return { value: await this._runTransactionWith(f, savepoint, control) };
+          const savepoint = DurableObjectStorage.#transactionStart(this);
+          control = DurableObjectStorage.#newTransactionControl(this, savepoint);
+          return { value: await DurableObjectStorage.#runTransactionWith(this, f, savepoint, control) };
         } catch (error) {
           return { error };
         }
@@ -3206,7 +3380,7 @@ class DurableObjectStorage {
           if (control.pending.size === 0) control.rollback();
           control.rolledBack = true;
         } catch (rollbackError) {
-          this._abortAfterFailedRollback(rollbackError, error);
+          DurableObjectStorage.#abortAfterFailedRollback(this, rollbackError, error);
         }
       }
       if (!started) release();
@@ -3216,21 +3390,33 @@ class DurableObjectStorage {
     return outcome.value;
   }
 }
+// The two parts a namespace and the host need from an id, which workerd keeps
+// to itself: a private slot has no reader outside the class, and a static block
+// is the one place that may hand one out (#251).
+let __idClassName;
+let __idScope;
 __nativeMethodArities(DurableObjectStorage);
 class DurableObjectId {
+  static {
+    __idClassName = (id) => id.#className;
+    __idScope = (id) => id.#className + ":" + id.#value;
+  }
+  #className;
+  #value;
   constructor(className, value, name = undefined) {
-    Object.defineProperties(this, {
-      _className: { value: className },
-      _value: { value },
-    });
-    this.name = name;
+    this.#className = className;
+    this.#value = value;
+    // workerd's own enumerable properties, in its order.
     this.jurisdiction = undefined;
+    this.name = name;
   }
-  toString() { return this._value; }
+  // `String(id)` is the hex identity on workerd, because the interface's tag
+  // is the id itself.
+  get [Symbol.toStringTag]() { return this.#value; }
+  toString() { return this.#value; }
   equals(other) {
-    return other instanceof DurableObjectId && other._value === this._value;
+    return other instanceof DurableObjectId && other.#value === this.#value;
   }
-  _scope() { return this._className + ":" + this._value; }
 }
 __nativeMethodArities(DurableObjectId);
 // Internal to the runtime: workerd has no such global, and a bundle that
@@ -3449,7 +3635,7 @@ class DurableObjectFacets {
         // Keep the ID kind and name in one clone. A string round-trip erases
         // named IDs and turns a literal string ID into a DurableObjectId.
         const idSc = __sc_encode(id instanceof DurableObjectId
-          ? [id._className, id.toString(), id.name] : String(id));
+          ? [__idClassName(id), id.toString(), id.name] : String(id));
         // Keep the load alive after the startup callback and class are gone.
         return [loader, meta.name, idSc, meta.propsSc, meta];
       });
@@ -3940,34 +4126,50 @@ class Container {
 }
 class DurableObjectState {
   constructor(scope) {
-    // Non-writable like storage above (H6): `abort()` and the reset path
-    // drop pending puts for this scope, and the host derives it from the
-    // executing cell as well, so a forged scope reaches neither.
+    // The host's own fields stay off reflection, and the six workerd exposes
+    // are own, enumerable and in its order: `facets`, `container`, `storage`,
+    // `id`, `props`, `exports`. A Worker keying or stringifying `ctx` then
+    // sees exactly what it sees on workerd (#251).
+    //
+    // The scope is non-writable like storage above (H6): `abort()` and the
+    // reset path drop pending puts for this scope, and the host derives it
+    // from the executing cell as well, so a forged scope reaches neither.
     __primDefineProp(this, "_scope", {
-      value: scope, enumerable: true, configurable: false, writable: false,
+      value: scope, enumerable: false, configurable: false, writable: false,
     });
-    this._aborted = false;
-    this.storage = new DurableObjectStorage(scope, this);
-    this.facets = new DurableObjectFacets(this);
-    this._gate = Promise.resolve();
-    this._blockDepth = 0;
+    __primDefineProp(this, "_aborted", {
+      value: false, enumerable: false, configurable: true, writable: true,
+    });
+    __primDefineProp(this, "_gate", {
+      value: Promise.resolve(),
+      enumerable: false, configurable: true, writable: true,
+    });
+    __primDefineProp(this, "_blockDepth", {
+      value: 0, enumerable: false, configurable: true, writable: true,
+    });
+    __primDefineProp(this, "_hibernationTimeout", {
+      value: null, enumerable: false, configurable: true, writable: true,
+    });
     const facet = __cell.facetConfigs[scope];
-    this._facetDepth = facet?.depth ?? 0;
+    __primDefineProp(this, "_facetDepth", {
+      value: facet?.depth ?? 0,
+      enumerable: false, configurable: true, writable: true,
+    });
     const separator = scope.indexOf(":");
     const className = separator < 0 ? scope : scope.slice(0, separator);
+    this.facets = new DurableObjectFacets(this);
+    // A class outside `containers` has no `ctx.container`; the property is
+    // still own and enumerable, as workerd's is, so a key list matches.
+    this.container = __cell.containers[className] ? new Container(scope) : undefined;
+    this.storage = new DurableObjectStorage(scope, this);
     this.id = facet === undefined
       ? new DurableObjectId(
         className, separator < 0 ? scope : scope.slice(separator + 1),
         __cell.idNames[scope])
       : typeof facet.id === "string" ? facet.id : new DurableObjectId(...facet.id);
     this.props = facet?.props;
-    // A class outside `containers` has no `ctx.container`, which is what
-    // the `@cloudflare/containers` constructor checks.
-    if (__cell.containers[className]) this.container = new Container(scope);
+    this.exports = __ctxExports();
   }
-  // Workerd's DurableObjectState.exports (actor-state.h): the same
-  // loopback surface as ctx.exports on stateless entrypoints.
-  get exports() { return __ctxExports(); }
   blockConcurrencyWhile(f) {
     // The native context binds the gate and its operations to one driver.
     // Its async continuations keep that driver even inside a foreign turn.
@@ -4176,6 +4378,17 @@ class DurableObjectState {
   getWebSockets(tag) {
     return JSON.parse(__ws_list(this._scope, tag)).map((row) => __socketFromRow(row));
   }
+  // Workerd's hibernatable WebSocket event timeout: the value it reports, with
+  // its own conversion (an integer number of milliseconds, zero clearing it,
+  // at most a week) and its own two refusal messages. Cello stores and reports
+  // it; the hibernation driver here does not cut an event short on it, which
+  // the Durable Objects page records (#251).
+  setHibernatableWebSocketEventTimeout() {
+    this._hibernationTimeout = __hibernationTimeout(arguments[0]);
+  }
+  getHibernatableWebSocketEventTimeout() {
+    return this._hibernationTimeout;
+  }
   getTags(ws) {
     if (!(ws instanceof WebSocket) || !__wsState(ws).hibernatable) {
       throw new Error(
@@ -4270,8 +4483,10 @@ function _instance(scope) {
     // Workerd worker-rpc.c++ getTargetInfo(): RPC needs `extends
     // DurableObject` unless the js_rpc compat flag is on. Decided
     // once here; dispatch reads a boolean.
-    state._rpcOk = __cell.compat.jsRpc ||
-      __cell.doExports[className] === true;
+    __primDefineProp(state, "_rpcOk", {
+      value: __cell.compat.jsRpc || __cell.doExports[className] === true,
+      enumerable: false, configurable: true, writable: true,
+    });
     __cell.instances[scope] = inst;
   }
   return inst;
@@ -7790,22 +8005,55 @@ function makeNamespace(className) {
     throw new Error("no Durable Object namespace key for " + className);
   return new DurableObjectNamespace(className, namespaceKey);
 }
+// A Durable Object stub's interface, as workerd reflects it: a `Fetcher` with
+// `fetch` and `connect`, and a `DurableObject` level above it with no member of
+// its own, whose instances carry `name` and `id` as own, enumerable data
+// properties (#251). A method reads its stub's routing through a private slot
+// and throws "Illegal invocation" for any other receiver, so a detached
+// `fetch` is not a capability.
+let __stubRoutes;
+const __stubRoute = (receiver) => {
+  const route = __stubRoutes.get(receiver);
+  if (route === undefined) throw new TypeError("Illegal invocation");
+  return route;
+};
+class Fetcher {
+  static {
+    __stubRoutes = new WeakMap();
+  }
+  fetch() {
+    return __stubRoute(this).fetch(arguments[0], arguments[1]);
+  }
+  connect() {
+    return __stubRoute(this).connect(arguments[0], arguments[1]);
+  }
+}
+Object.defineProperty(Fetcher.prototype, Symbol.toStringTag, {
+  value: "Fetcher", configurable: true, writable: true, enumerable: false,
+});
+__webidlPrototype(Fetcher);
+class DurableObjectStub extends Fetcher {}
+Object.defineProperty(DurableObjectStub.prototype, Symbol.toStringTag, {
+  value: "DurableObject", configurable: true, writable: true, enumerable: false,
+});
 // A named class: SDKs sniff bindings by constructor name (workers-rs
 // EnvBinding requires `constructor.name === "DurableObjectNamespace"`).
 class DurableObjectNamespace {
+  #className;
+  #namespaceKey;
   constructor(className, namespaceKey) {
-    Object.defineProperty(this, "_className", { value: className });
-    Object.defineProperty(this, "_namespaceKey", { value: namespaceKey });
+    this.#className = className;
+    this.#namespaceKey = namespaceKey;
   }
   idFromName(name) {
     name = String(name);
     return new DurableObjectId(
-      this._className, __do_id(this._namespaceKey, "name", name), name,
+      this.#className, __do_id(this.#namespaceKey, "name", name), name,
     );
   }
   idFromString(value) {
     return new DurableObjectId(
-      this._className, __do_id(this._namespaceKey, "validate", String(value)),
+      this.#className, __do_id(this.#namespaceKey, "validate", String(value)),
     );
   }
   newUniqueId(options = {}) {
@@ -7813,7 +8061,7 @@ class DurableObjectNamespace {
     if (jurisdiction != null)
       throw new Error("Jurisdiction restrictions are not implemented");
     return new DurableObjectId(
-      this._className, __do_id(this._namespaceKey, "unique", ""),
+      this.#className, __do_id(this.#namespaceKey, "unique", ""),
     );
   }
   jurisdiction(value) {
@@ -7824,10 +8072,10 @@ class DurableObjectNamespace {
     return this.get(this.idFromName(name), options);
   }
   get(id) {
-    const className = this._className;
-    if (!(id instanceof DurableObjectId) || id._className !== className)
+    const className = this.#className;
+    if (!(id instanceof DurableObjectId) || __idClassName(id) !== className)
       throw new TypeError("Durable Object ID is not valid for this namespace");
-    const scope = id._scope();
+    const scope = __idScope(id);
     // Emulate production: the actor recovers its name only when it is
     // <= 1024 UTF-8 bytes; longer names are dropped so ctx.id.name is
     // undefined. The full name still seeds the routing hash, so
@@ -7840,7 +8088,9 @@ class DurableObjectNamespace {
     if (dispatchName !== undefined) __cell.idNames[scope] = dispatchName;
     // Fetch and native RPC use the same host routing/activation seam.
     // Never expose `.then`: a DO stub is not itself a promise.
-    const target = { id, name: dispatchName };
+    const target = new DurableObjectStub();
+    target.name = dispatchName;
+    target.id = id;
     const abortMarker = "__CELLO_ACTOR_ABORT__:";
     const processExitMarker = "__CELLO_PROCESS_EXIT__:";
     let brokenReason = null;
@@ -7943,8 +8193,12 @@ class DurableObjectNamespace {
     const stub = new Proxy(target, { get: (_target, prop) => {
       if (prop === "then") return undefined;
       if (Reflect.has(_target, prop)) return Reflect.get(_target, prop);
-      if (prop === "fetch") return doFetch;
       if (typeof prop !== "string") return undefined;
+      // `JSON.stringify` asks for `toJSON` on anything it serializes, and a
+      // stub answers it with the object it is (workerd's own interceptor gets
+      // a serialization of `name`/`id` the same way); answering with an RPC
+      // function would serialize the stub as `{}` (#251).
+      if (prop === "toJSON") return undefined;
       if (__cell.compat.fetcherGetPutDelete &&
           (prop === "get" || prop === "put" || prop === "delete"))
         return __fetcherHelper(doFetch, prop);
@@ -7959,7 +8213,15 @@ class DurableObjectNamespace {
         )),
       );
     }});
-    __do_brand_stub(stub, id._className, id._value, dispatchName ?? null);
+    __stubRoutes.set(target, {
+      fetch: doFetch,
+      connect: (address, options) =>
+        invoke(async () => __rpcDes(await __rpc_call(
+          scope, dispatchName ?? null, "connect", __rpcOut([address, options], "host"),
+        ))),
+    });
+    __stubRoutes.set(stub, __stubRoutes.get(target));
+    __do_brand_stub(stub, __idClassName(id), id.toString(), dispatchName ?? null);
     return stub;
   }
 }
@@ -10283,7 +10545,7 @@ class __QueueCell {
       // size, so a replayed batch cannot plant a forged identity.
       const { id, name } = __cell.makeNamespace("__Queue").getByName(targetName);
       await __rpcDes(await __queue_dlq_forward(
-        id._scope(),
+        __idScope(id),
         name ?? null,
         __rpcOut([{
           transfers: rows.map((row) => ({
@@ -10983,7 +11245,7 @@ class __D1DatabaseCell {
   // Takes an array so that `batch()` can ride this same method, and the
   // same turn, when it lands.
   __d1Query(statements) {
-    const scope = this.ctx.storage.sql._scope;
+    const scope = __sqlStorageScope(this.ctx.storage.sql);
     return statements.map((statement) =>
       __d1Run(scope, {
         mode: "prepared",
@@ -10994,7 +11256,7 @@ class __D1DatabaseCell {
     );
   }
   __d1Batch(statements) {
-    return __d1Run(this.ctx.storage.sql._scope, {
+    return __d1Run(__sqlStorageScope(this.ctx.storage.sql), {
       mode: "batch",
       statements: statements.map((statement) => ({
         sql: String(statement.sql),
@@ -11037,7 +11299,7 @@ class __D1DatabaseCell {
       } else if (body.exec !== undefined) {
         // The CLI asks for rows; the Worker binding's exec() never does.
         if (!!body.exec.rows && !operator) return refuse("exec with rows", "cello d1 execute");
-        result = __d1Run(this.ctx.storage.sql._scope, {
+        result = __d1Run(__sqlStorageScope(this.ctx.storage.sql), {
           mode: "exec",
           sql: String(body.exec.sql),
           rows: !!body.exec.rows,
@@ -11058,7 +11320,7 @@ class __D1DatabaseCell {
     }
   }
   __d1Exec(source) {
-    const result = __d1Run(this.ctx.storage.sql._scope, {
+    const result = __d1Run(__sqlStorageScope(this.ctx.storage.sql), {
       mode: "exec",
       sql: String(source),
       rows: false,
@@ -11070,7 +11332,7 @@ class __D1DatabaseCell {
   // the database takes writes.
   __d1Export(options) {
     const tables = Array.isArray(options.tables) ? options.tables.map(String) : [];
-    return __d1Run(this.ctx.storage.sql._scope, {
+    return __d1Run(__sqlStorageScope(this.ctx.storage.sql), {
       mode: "export",
       tables,
       no_schema: !!options.no_schema,
@@ -11084,7 +11346,7 @@ class __D1DatabaseCell {
   // operator fixes the file and re-runs. Without the transaction the
   // statements that DID land are exactly the ones a re-run trips over.
   __d1Migrate(name, source, table) {
-    return __d1Run(this.ctx.storage.sql._scope, {
+    return __d1Run(__sqlStorageScope(this.ctx.storage.sql), {
       mode: "migrate",
       name,
       sql: source,
