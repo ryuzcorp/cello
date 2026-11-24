@@ -94,6 +94,8 @@ Cello does not answer a successful `setAlarm()` until a durable wake entry in th
 
 Stubs kept in storage (`ctx.storage.put()` of a Durable Object stub) use a versioned envelope. Rows written before the binding-hardening release read back as plain data once; storing the stub again writes the current envelope and restores the live stub.
 
+A value whose state lives in a host object is refused rather than stored as `{}`: a `URL`, `URLSearchParams`, `Request`, `Response`, `Headers`, `FormData`, `Blob`, `ReadableStream` (and its writable/transform relatives), `CryptoKey`, `MessagePort`, `AbortSignal` or an R2 bucket binding throws a `DataCloneError` naming the interface. Workerd refuses the `URL`, `URLSearchParams`, `FormData` and stream values too; it accepts `Headers` and `Blob` and stores a value, so Cello is the stricter of the two there. A plain object that merely inherits one of those prototypes is data, as on workerd, and storing one never runs its getters.
+
 ## Handle the differences from Cloudflare
 
 | Area | Cello behavior |

@@ -2,7 +2,7 @@
 title: Cloudflare compatibility
 description: Which Cloudflare services and runtime APIs Cello supports, and how each difference behaves.
 ---
-<!-- Modified by Ryuz Corp (Cello): per-isolate ArrayBuffer memory cap; node:crypto scrypt; cloned streaming bodies; cross-isolate RPC stubs and streams; per-node Workers Cache API; receiver-held RPC streams; AbortSignal.timeout is unreferenced (upstream #306); loader 101 webSocket target (upstream #305); loader sibling cloudflare:workers imports (upstream #304); AES-KW and symmetric JWK (upstream #295); EC raw point format (upstream #271); writable request /tmp, node:url file helpers, and the CELLO_TMP_MAX_BYTES /tmp cap (upstream #280); workerd close codes (upstream #279); fetch gzip/deflate decoding (upstream #238); Symbol.dispose on RPC results (upstream #260); post-response DO dial (upstream #254); synchronous caller cancel (upstream #281). -->
+<!-- Modified by Ryuz Corp (Cello): per-isolate ArrayBuffer memory cap; node:crypto scrypt; cloned streaming bodies; cross-isolate RPC stubs and streams; per-node Workers Cache API; receiver-held RPC streams; AbortSignal.timeout is unreferenced (upstream #306); loader 101 webSocket target (upstream #305); loader sibling cloudflare:workers imports (upstream #304); AES-KW and symmetric JWK (upstream #295); EC raw point format (upstream #271); writable request /tmp, node:url file helpers, and the CELLO_TMP_MAX_BYTES /tmp cap (upstream #280); workerd close codes (upstream #279); fetch gzip/deflate decoding (upstream #238); Symbol.dispose on RPC results (upstream #260); post-response DO dial (upstream #254); synchronous caller cancel (upstream #281); workerd process identity and Buffer shape, iterator helper flags, and reportError's describer. -->
 
 This page lists only the differences from the linked Cloudflare APIs. An
 entry without a note matches Cloudflare.
@@ -576,12 +576,31 @@ synchronously. Mark and measure names are coerced with `String()`, and
   arrive, and anything that would push a request past
   `CELLO_TMP_MAX_BYTES` (default 64 MiB) fails with `ENOSPC`, while an
   overwrite frees the replaced bytes. `/bundle` is read-only and holds
-  the Worker modules.
+  the Worker modules, and it is also `process.cwd()`, so a relative path
+  resolves onto them. The entry module is projected as `worker.js`, while
+  workerd uses the configured `main` name.
 - `node:url` provides `pathToFileURL`/`fileURLToPath` plus the WHATWG URL
   API, with POSIX path rules only.
 - The global `process` matches workerd for each field that it defines,
-  such as `process.execPath`, `process.argv`, and `process.title`. Other
+  such as `process.execPath`, `process.argv`, `process.title`,
+  `process.version` (`v22.23.4`), `process.versions` (the same 28 keys,
+  only `node` carrying a value) and `process.cwd()` (`/bundle`). Other
   fields, such as `process.kill` and `process.features`, are undefined.
+- `Buffer` matches workerd's shape: `Buffer.poolSize` is `0` and
+  read-only, so `Buffer.from`/`allocUnsafe` never allocate out of a pool;
+  `Buffer.length` is `3`; `Buffer.prototype.inspect` prints Node's 50-byte
+  hex dump; and `offset`/`parent` exist as enumerable accessors.
+- `Iterator.prototype.includes`, `Iterator.prototype.join`, `Iterator.zip`
+  and `Iterator.zipKeyed` exist, as on workerd; V8 15.2 still gates them,
+  so Cello enables the flags (`--js-iterator-includes`,
+  `--js-iterator-join`, `--js-joint-iteration`) at startup.
+- `reportError` describes its value with V8's own no-side-effects
+  describer, never the guest `toString` and never a Proxy trap: a
+  `Proxy` (revoked ones included) is described by V8, and
+  `Object.create(null)` reports `Uncaught [object Object]` rather than
+  throwing. The event's `error` member is the reported value itself. A
+  `DOMException` reports its `name: message` where workerd's describer
+  finds none (workerd exposes those members as accessors).
 - The Cello bundler supports a synchronous CommonJS `require()` of a
   Node.js built-in module. A raw ESM Worker has no global `require()`.
 - A Node.js built-in module object is writable, so a dependency such as

@@ -236,4 +236,12 @@ export const cases = [
   { name: "timers-surface", fixture: "missing-apis", path: "/timers" },
   { name: "error-messages", fixture: "missing-apis", path: "/messages" },
   { name: "clone-wasm-module", fixture: "missing-apis", path: "/clone-wasm" },
+  // #210, #211, #212, #228: the process identity, Buffer shape, the iterator
+  // helpers V8 still gates behind flags, and reportError's describer.
+  { name: "process-surface", fixture: "missing-apis", path: "/process-surface" },
+  { name: "buffer-surface", fixture: "missing-apis", path: "/buffer-surface" },
+  { name: "iterator-surface", fixture: "missing-apis", path: "/iterator-surface" },
+  { name: "report-error", fixture: "missing-apis", path: "/report-error" },
+  // #233: storage refuses a URL/URLSearchParams instead of storing `{}`.
+  { name: "do-storage-refusals", fixture: "do", path: "/storage-refusals" },
 ];

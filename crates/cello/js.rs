@@ -2332,6 +2332,15 @@ fn handler_rejection(
     }
 }
 
+/// The V8 surface workerd ships that this V8 still gates behind a flag: the
+/// iterator helpers `includes`/`join` and joint iteration (`Iterator.zip` /
+/// `Iterator.zipKeyed`) (#212). They are the shipping implementations (V8
+/// turns them on by default in 15.3/15.4), not experimental shells, and the
+/// rest of the helper family -- `Iterator.from`, `map`, `take`, `drop` --
+/// already ships without a flag. Without these, a bundle written against
+/// workerd sees `undefined` here.
+const V8_COMPAT_FLAGS: &str = "--js-iterator-includes --js-iterator-join --js-joint-iteration";
+
 pub struct Engine;
 impl Engine {
     pub fn init() {
@@ -2374,10 +2383,12 @@ impl Engine {
             // would only mean "unbounded".
             let wasm_limit_pages = (external_limit / 65536).clamp(1, 65536);
             #[cfg(not(cello_internal_tests))]
-            v8::V8::set_flags_from_string(&format!("--wasm-max-mem-pages={wasm_limit_pages}"));
+            v8::V8::set_flags_from_string(&format!(
+                "{V8_COMPAT_FLAGS} --wasm-max-mem-pages={wasm_limit_pages}"
+            ));
             #[cfg(cello_internal_tests)]
             v8::V8::set_flags_from_string(&format!(
-                "--wasm-max-mem-pages={wasm_limit_pages} --expose-gc"
+                "{V8_COMPAT_FLAGS} --wasm-max-mem-pages={wasm_limit_pages} --expose-gc"
             ));
             // No `v8::icu::set_common_data_78` call: the rusty_v8 152 prebuilt
             // statically links the complete ICU data (full locale tables and
@@ -8171,6 +8182,7 @@ ops! { OP_NAMES, install_op_functions,
         "__d1_run" => storage_ops::op_d1_run,
         "__storage_transaction_control" => storage_ops::op_storage_transaction_control,
         "__log" => op_log,
+        "__detail_string" => op_detail_string,
         "__storage_put" => storage_ops::op_storage_put,
         "__storage_put_many" => storage_ops::op_storage_put_many,
         "__storage_queue_put" => storage_ops::op_storage_queue_put,
@@ -12591,6 +12603,27 @@ fn op_log(
         _ => body,
     };
     tracing::info!(target: "cell_console", "{}", displayed);
+}
+
+/// `__detail_string(value)` -> V8's no-side-effects description of a value.
+///
+/// `Value::ToDetailString` is V8's `Object::NoSideEffectsToString`, run under
+/// V8's own no-script scope: it reads only data properties, never calls a
+/// getter or a `toString`, never enters a Proxy trap (V8's `GetDataProperty`
+/// answers `undefined` on a `JSPROXY` state), and caps a long
+/// `Symbol.toStringTag` at 1000 characters. It is what workerd's error
+/// reporting uses to build an `Uncaught …` message, so building the text here
+/// rather than in `harness.js` gives the same text without an emulation that
+/// would have to run guest code to look like V8. `undefined` if V8 produced no
+/// string (a detached context).
+fn op_detail_string(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    if let Some(described) = args.get(0).to_detail_string(scope) {
+        rv.set(described.into());
+    }
 }
 /// `__isolate_condemn(reason)` -> whether this isolate will be replaced.
 ///

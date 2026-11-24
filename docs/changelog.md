@@ -16,6 +16,65 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
   body (version `1`), and an older caller still sees an error from a new
   owner, so a mixed fleet keeps forwarding. A thrown object whose clone does
   not fit the bound degrades to an `Error` carrying its message.
+The last workerd 1.20261121.1 divergences from the Low-severity tail of the
+sweep are closed: `reportError`'s message, the `process` identity, the
+`Buffer` shape, the iterator helpers V8 still gates behind flags, and
+`storage.put()` of a `URL` or `URLSearchParams`. The differential gate gained
+five cases (206 total) and every one agrees. No configuration, bucket-format
+or API-shape break.
+
+- **`reportError` describes its value the way workerd does** (#228). The
+  `error` event's message is `"Uncaught "` plus V8's own no-side-effects
+  describer (`Object::NoSideEffectsToString`, reached through a host op that
+  calls `Value::ToDetailString`), so building it runs no guest code at all: no
+  `toString`, no getter, and not a single Proxy trap. `Object.create(null)`
+  reports `Uncaught [object Object]` instead of throwing `TypeError: Cannot
+  convert object to primitive value` out of a non-throwing API; `{a: 1}`
+  reports `Uncaught #<Object>`, `[1, 2]` `Uncaught [object Array]`, a `Map`
+  `Uncaught #<Map>`, a `Date` `Uncaught [object Date]`, a `URL`
+  `Uncaught [object URL]`, and a function its source text. An own or inherited
+  `toString` is read as a *data* property and never called, an accessor
+  `toString` is treated as absent, an `Error` with an overridden `toString`
+  still reports `Error: m`, a string `Symbol.toStringTag` decides the
+  `[object <tag>]` text and is capped at 1000 characters plus `<...>`, and a
+  `Proxy` — including a revoked one, or a proxy of a function, array or
+  `Date` — is described by V8 with its traps never entered. The event's `error`
+  member is the reported value itself whatever its type (it was the value only
+  for an `Error`), as on workerd.
+- **`process.version`, `process.versions` and `process.cwd()` match workerd**
+  (#210). The reported Node line is `v22.23.4`, `versions` carries workerd's
+  28 keys in its order (only `node` has a value; the rest are `""`), and
+  `cwd()` is `/bundle`, the read-only projection of the deployed modules, so
+  a relative `node:fs` path now lands on the worker's own files. A library
+  that gates a feature on `process.versions.undici` sees the same answer it
+  sees on workerd. `node:path`'s `resolve` keeps resolving a relative path
+  against `/`, which is what workerd does despite its `cwd()`.
+- **`Buffer` has workerd's shape** (#211). `Buffer.poolSize` is `0`, read-only
+  and non-configurable, so `Buffer.from` and `allocUnsafe` never allocate out
+  of a pool; `Buffer.length` is `3`; `Buffer.prototype.inspect` exists with
+  Node's 50-byte hex dump and `... N more byte(s)` suffix (a non-Buffer
+  receiver produces Node's own odd output instead of throwing); and
+  `offset`/`parent` are enumerable, non-configurable accessors, which
+  serialization libraries read.
+- **The iterator helpers workerd ships exist** (#212). V8 15.2, the engine
+  this build links, still gates the shipping implementations of
+  `Iterator.prototype.includes`, `Iterator.prototype.join` and joint
+  iteration (`Iterator.zip`/`Iterator.zipKeyed`) behind
+  `--js-iterator-includes`, `--js-iterator-join` and
+  `--js-joint-iteration`, so Cello sets them at startup, as workerd's V8 has
+  them on. `Iterator.from`/`map`/`take`/`drop` already shipped without a flag.
+  `ReadableStreamBYOBRequest.atLeast` and the `TextEncoderStream`/
+  `TextDecoderStream` prototype tags already agreed and are now pinned by the
+  gate.
+- **`storage.put()` refuses a `URL` and a `URLSearchParams`** (#233). Both
+  carry their state in private slots, so the plain storage codec stored `{}`
+  where workerd throws `DataCloneError` naming the interface. The brand-only
+  host predicate that drives the serializer now covers both, so a forged
+  prototype still stores as plain data and a genuine instance never does; both
+  the single-key serializer and the batch/queue/attachment encoder throw the
+  `DOMException` class captured at bootstrap, so a Worker that replaces
+  `globalThis.DOMException` neither gets a call inside either path nor changes
+  the class its caller sees.
 
 ## v0.2.9
 

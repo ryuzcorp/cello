@@ -313,6 +313,69 @@ fn durable_object_and_websocket_match_workerd() {
         text(&storage, &["sym", "message"]),
         "Symbol(s) could not be cloned.",
     );
+    // #233: a URL and a URLSearchParams keep their state in private slots, so
+    // the plain codec would store `{}`; workerd refuses both. A forged
+    // prototype stays plain data (the brand decides, not the chain), and the
+    // refusal is the harness DOMException even when the Worker replaced the
+    // global one.
+    for kind in ["url", "searchParams"] {
+        let path = format!("storage.{kind}");
+        expect(
+            &mut failures,
+            &format!("{path}.name"),
+            text(&storage, &[kind, "name"]),
+            "DataCloneError",
+        );
+        let message = text(&storage, &[kind, "message"]);
+        assert!(
+            message.ends_with("could not be cloned."),
+            "{path}.message: {message}"
+        );
+        expect(
+            &mut failures,
+            &format!("{path}.back"),
+            text(&storage, &[kind, "back"]),
+            "null",
+        );
+    }
+    expect(
+        &mut failures,
+        "storage.forgedUrl.href",
+        text(&storage, &["forgedUrl", "stored", "href"]),
+        "https://example.com/",
+    );
+    expect(
+        &mut failures,
+        "storage.replaced.replaced",
+        text(&storage, &["replaced", "replaced"]),
+        "false",
+    );
+    expect(
+        &mut failures,
+        "storage.replaced.name",
+        text(&storage, &["replaced", "name"]),
+        "DataCloneError",
+    );
+    // The batch form (`put({k: value})`) refuses from the JS encoder, which
+    // must use the same captured class.
+    expect(
+        &mut failures,
+        "storage.replacedBatch.name",
+        text(&storage, &["replacedBatch", "name"]),
+        "DataCloneError",
+    );
+    expect(
+        &mut failures,
+        "storage.replacedBatch.replaced",
+        text(&storage, &["replacedBatch", "replaced"]),
+        "false",
+    );
+    expect(
+        &mut failures,
+        "storage.replacedBatch.back",
+        text(&storage, &["replacedBatch", "back"]),
+        "null",
+    );
     expect(
         &mut failures,
         "storage.proxy.name",

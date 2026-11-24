@@ -1221,6 +1221,11 @@ const __cloneHostName = (value) => {
   if (__cello.$$isResponseInstance(value)) return "Response";
   if (__cello.$$isHeadersInstance(value)) return "Headers";
   if (__cello.$$isFormDataInstance(value)) return "FormData";
+  // The URL and URLSearchParams brands are private-field checks, so a forged
+  // prototype stays plain data while a real instance is refused instead of
+  // stored as `{}` (#233). Workerd's storage refuses both.
+  if (__brandCheck("__isUrlInstance")(value)) return "URL";
+  if (__brandCheck("__isUrlSearchParamsInstance")(value)) return "URLSearchParams";
   if (__cello.$$isAbortSignalInstance(value)) return "AbortSignal";
   if (__brandCheck("$$isMessagePortInstance")(value)) return "MessagePort";
   if (__cello.__isBlobInstance(value)) return "Blob";
@@ -1253,7 +1258,12 @@ const __scRefuseHost = (value) => {
     __setAdd(seen, v);
     const host = __cloneHostName(v);
     if (host !== null) {
-      throw new DOMException(
+      // The captured class, not the global: a Worker that replaced
+      // `DOMException` must not get a call inside the serializer path, and
+      // the caller must still see `name === "DataCloneError"` (#233). This is
+      // the batch/queue/attachment site; the single-key path throws the same
+      // class from `throw_storage_data_clone_error`.
+      throw new __primDOMException(
         'Could not serialize object of type "' + host +
         '". This type does not support serialization.', "DataCloneError");
     }
@@ -14803,6 +14813,14 @@ globalThis.Crypto = Crypto;
 Object.defineProperty(globalThis, "origin", {
   value: "null", enumerable: true, writable: false, configurable: true,
 });
+// `reportError`'s message is workerd's `"Uncaught "` plus V8's no-side-effects
+// describer (#228). The text comes from the host op `__detail_string`, which
+// calls V8's `Object::NoSideEffectsToString`: it reads only data properties --
+// never a guest `toString`, never a getter, never a Proxy trap -- and caps a
+// long `Symbol.toStringTag` at 1000 characters. Describing the value here in
+// JS would have to walk the prototype chain with `getOwnPropertyDescriptor`
+// and `getPrototypeOf`, which a Proxy turns into guest code inside an API
+// whose contract is that it runs none.
 // reportError hands a value to the global "error" event. It is not a
 // constructor and takes one required Value.
 globalThis.reportError = function reportError(...args) {
@@ -14811,10 +14829,12 @@ globalThis.reportError = function reportError(...args) {
       "Failed to execute 'reportError' on 'ServiceWorkerGlobalScope': " +
       "parameter 1 is not of type 'Value'.");
   const value = args[0];
-  const error = value instanceof Error ? value : undefined;
+  const described = __detail_string(value);
   globalThis.dispatchEvent(new ErrorEvent("error", {
-    error,
-    message: "Uncaught " + String(value),
+    // Workerd carries the value itself, whatever its type; only the message
+    // is a description of it.
+    error: value,
+    message: "Uncaught " + (typeof described === "string" ? described : ""),
   }));
 };
 // Object URLs need a blob registry workerd does not implement either: both
@@ -15068,14 +15088,28 @@ __cello.__zlibModule = {
 // defined even though nothing in a cell has an executable path, a parent
 // process, or a real exit code. The values match workerd's
 // `src/node/internal/public_process.ts` at workerd revision 04a08513a419
-// (2026-09-04); cello does not invent its own, because a dependency that reads
-// them is comparing them to what workerd reports. A field whose workerd
+// (2026-09-04), including `version`, the 28-key `versions` record and the
+// `/bundle` cwd (#210): a dependency that reads them -- undici's feature
+// checks do -- is comparing them to what workerd reports. cello does not
+// invent its own. `cwd()` is `/bundle` there, and cello's own `/bundle`
+// projection is the same read-only view of the deployed modules, so a
+// relative path still resolves onto the worker's files. A field whose workerd
 // implementation throws at that revision -- `kill`, `binding`, `dlopen`,
 // `cpuUsage` -- stays absent, because it fails on both runtimes and a stub
 // here would only change the message.
 if (!globalThis.process) globalThis.process = {
-  env: {}, platform: "linux", arch: "x64", version: "v20.0.0",
-  versions: { node: "20.0.0" }, cwd: () => "/",
+  env: {}, platform: "linux", arch: "x64", version: "v22.23.4",
+  // The same keys, in workerd's (Node's) order. Every value but `node` is
+  // empty on workerd, which is what a library sees, so cello reports the same
+  // rather than a version this runtime does not have.
+  versions: {
+    node: "22.23.4", v8: "", modules: "", zlib: "", brotli: "", zstd: "",
+    ares: "", napi: "", llhttp: "", nghttp2: "", acorn: "", ada: "",
+    simdutf: "", nbytes: "", ncrypto: "", uvwasi: "", uv: "", openssl: "",
+    sqlite: "", icu: "", undici: "", simdjson: "", unicode: "", cldr: "",
+    tz: "", cjs_module_lexer: "", amaro: "", merve: "",
+  },
+  cwd: () => "/bundle",
   title: "workerd", argv: ["workerd"], argv0: "workerd", execArgv: [],
   execPath: "", pid: 1, ppid: 0, exitCode: undefined,
   allowedNodeEnvironmentFlags: new Set(),
