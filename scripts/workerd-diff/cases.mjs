@@ -243,9 +243,41 @@ export const cases = [
     fixture: "do",
     path,
   })),
+  // #268: while a nested section is open, workerd holds the enclosing body's
+  // timers and subrequests (microtasks and storage run free). Each case
+  // records completion order; the old code fires the timer while the
+  // section is still open.
+  ...["/nested-hold-timers", "/nested-hold-fetch"].map((path) => ({
+    name: `do${path}`,
+    fixture: "do",
+    path,
+  })),
+  // #268 P1a/P1b: pre-armed timers must wait for sections that open after
+  // they were armed, and a nested failure must leave no trace in the
+  // open-section records. The orchestration fails a nested block on one
+  // stub and then runs the pre-armed shapes on the same stub, so a leaking
+  // implementation poisons the second leg with the first leg's records.
+  ...["/nested-hold-prearmed-after-fail"].map((path) => ({
+    name: `do${path}`,
+    fixture: "do",
+    path,
+  })),
   // #261: the section outlives the guest's promise, so the nested block that
   // a response left running still writes, and a second event's block waits
   // behind it before it reads.
+  // #278: sibling nested sections in one body run one at a time, in
+  // schedule order: the second starts only after the first has fully
+  // settled, body and descendants alike. A failing sibling breaks the
+  // event and the sibling behind it never runs, so its write stays
+  // missing (the second request reads it back).
+  ...["/nested-siblings", "/nested-siblings-await", "/nested-siblings-await-second",
+    "/nested-siblings-child", "/nested-siblings-inner-timer",
+    "/nested-siblings-inner-fetch", "/nested-siblings-storage"].map((path) => ({
+    name: `do${path}`,
+    fixture: "do",
+    path,
+  })),
+  { name: "do/nested-siblings-fail", fixture: "do", path: "/nested-siblings-fail" },
   {
     name: "do/nested-block-drain",
     fixture: "do",
