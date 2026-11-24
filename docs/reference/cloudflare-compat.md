@@ -269,6 +269,13 @@ service; the [KV](../services/kv.md), [R2](../services/r2.md) and
   stream, where Cloudflare's local runtime sends each line as its own query
   (so a statement may not span lines there); its `count` follows Cloudflare's
   one-per-input-line rule in both.
+- **D1 binds a whole number or boolean as INTEGER, while local workerd binds
+  REAL.** Cello follows production D1's documented conversion (booleans to
+  INTEGER `0`/`1`, whole numbers to INTEGER), so `typeof()` on a bound value,
+  an untyped column's stored type, and anything distinguishing `1` from `1.0`
+  differ from workerd's local D1 shim, which binds REAL. That shim behavior
+  is a local-dev artifact; matching it would change stored types, so it is
+  not reproduced (#250).
 - **Durable Object SQL boolean binds are TEXT from compatibility date
   2026-11-24.** Workerd stores a `true`/`false` bind as `'true'`/`'false'`;
   Cello wrote INTEGER `1`/`0` before that date and keeps doing so at an older
@@ -316,9 +323,9 @@ service; the [KV](../services/kv.md), [R2](../services/r2.md) and
 - **R2 cursors are opaque tokens.** A string outside the token format that
   names no object gets the empty page R2 answers instead of a listing
   restarted from the top. A plain key is still read as the cursor 0.2.9
-  answered a page with, through 0.2.10, and only while the bucket holds an
+  answered a page with, through 0.3.0, and only while the bucket holds an
   object at that key -- a rolling upgrade must not truncate a client's
-  pagination; the plain-key path is removed in 0.2.11. A token is honoured as
+  pagination; the plain-key path is removed in 0.3.1. A token is honoured as
   a position inside the binding's own bucket and prefix; it is unsigned, so a
   client can mint one, but it cannot read another bucket, escape the prefix's
   directory, or widen a page bound.
