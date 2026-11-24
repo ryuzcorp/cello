@@ -982,6 +982,13 @@ class ReadableStream {
     const writer = destination.getWriter();
     let shuttingDown = false;
     let currentWrite = Promise.resolve();
+    // The first write failure the pipe saw (#272): the pipe rejects with
+    // it once the destination's closed promise settles, instead of with
+    // the destination's error. Undefined while every write succeeded.
+    let writeError;
+    // The pipe's own close failure on source-done (#272): the closed
+    // watcher below turns it into the pipe's rejection.
+    let closeError;
     return new Promise((resolve, reject) => {
       let abortListener;
       if (signal) {
@@ -1023,6 +1030,47 @@ class ReadableStream {
             .then(() => finish(true, err));
         }
       }
+      // A failed write rejects the pipe with the write's own error, while
+      // the source is still cancelled with the destination's error (#272):
+      // a readable cancel fails a parked TransformStream write with a
+      // TypeError naming the readable side, but the source sees the cancel
+      // reason. The destination's error is only known once its closed
+      // promise rejects, which always follows a failed write.
+      function shutdownWithWrite(
+        cancelErr, rejectErr, doCancel) {
+        if (shuttingDown) return;
+        shuttingDown = true;
+        currentWrite.then(doActions, doActions);
+        function doActions() {
+          if (!doCancel) {
+            finish(true, rejectErr);
+            return;
+          }
+          reader.cancel(cancelErr).catch(() => {}).then(
+            () => finish(true, rejectErr));
+        }
+      }
+      // A destination that errors while the pipe has no write outstanding
+      // cancels the source with the error and fulfills, as Workerd does
+      // (#272): a TransformStream whose readable is cancelled after its
+      // writes drained, or a controller.error() on an idle pipe. (With
+      // preventCancel there is nothing to wait on, so the pipe fulfills
+      // once the write settles; Workerd itself leaves that corner pending,
+      // which this implementation deliberately does not copy.)
+      function shutdownFulfill(cancelErr, doCancel) {
+        if (shuttingDown) return;
+        shuttingDown = true;
+        currentWrite.then(doActions, doActions);
+        function doActions() {
+          if (!doCancel) {
+            finish(false);
+            return;
+          }
+          reader.cancel(cancelErr).then(
+            () => finish(false),
+            () => finish(false));
+        }
+      }
       // Watch for source error.
       reader.closed.catch(re => {
         if (shuttingDown) return;
@@ -1031,7 +1079,12 @@ class ReadableStream {
       // Watch for dest error.
       writer.closed.catch(we => {
         if (shuttingDown) return;
-        shutdownWith(we, false, !preventCancel);
+        if (closeError !== undefined)
+          shutdownWith(closeError, false, !preventCancel);
+        else if (writeError !== undefined)
+          shutdownWithWrite(we, writeError, !preventCancel);
+        else
+          shutdownFulfill(we, !preventCancel);
       });
       function waitForReady() {
         if (shuttingDown) return;
@@ -1043,16 +1096,25 @@ class ReadableStream {
           if (shuttingDown) return;
           if (done) {
             if (!preventClose) {
+              // A failed close rejects the pipe with the close's own
+              // error; the destination's closed promise always settles
+              // after it, and its watcher above does the shutdown.
               writer.close().then(
                 () => finish(false),
-                e => finish(true, e));
+                e => { closeError = e; });
             } else {
               finish(false);
             }
             return;
           }
-          const writeP = writer.write(value)
-            .catch(() => {});
+          // A failed write does not pump again: the destination errored,
+          // so its closed promise (and the watcher above) will shut the
+          // pipe down with this write's own error (#272). Only the first
+          // failure is recorded, so the pipe reports the write that the
+          // destination failed first.
+          const writeP = writer.write(value).then(
+            () => {},
+            e => { if (writeError === undefined) writeError = e; });
           currentWrite = writeP;
           writeP.then(() => {
             if (shuttingDown) return;

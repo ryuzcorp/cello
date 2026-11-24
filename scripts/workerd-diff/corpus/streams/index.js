@@ -1507,6 +1507,143 @@ const routes = {
     });
   },
 
+  async "/transform-pipe-cancel-idle"() {
+    // Issue #272: a plain TransformStream readable cancelled while a pipeTo
+    // is feeding its writable, with no write outstanding -- both chunks
+    // drained before the cancel -- fulfills the feeder pipe on Workerd
+    // (the source is still cancelled with the reason), where Cello used
+    // to reject it with the cancel reason. Two reads prove the pipe is
+    // past the parked state without any timing: the second read resolves
+    // once the second chunk was enqueued, so the cancel after it lands
+    // while that write is finishing or done -- either way nothing is
+    // parked on the backpressure handshake, and both shapes fulfill.
+    let cancelled = null;
+    const source = new ReadableStream({
+      start: (c) => (c.enqueue("a"), c.enqueue("b")),
+      cancel: (reason) => (cancelled = reason),
+    });
+    const ts = new TransformStream();
+    const outcome = source.pipeTo(ts.writable).then(() => "done", errorInfo);
+    const reader = ts.readable.getReader();
+    const first = await reader.read().then(
+      ({ value, done }) => ({ value: String(value), done }),
+      (error) => errorInfo(error));
+    const second = await reader.read().then(
+      ({ value, done }) => ({ value: String(value), done }),
+      (error) => errorInfo(error));
+    reader.releaseLock();
+    await ts.readable.cancel("bye");
+    const settled = await outcome;
+    const writer = ts.writable.getWriter();
+    const post = {
+      closed: await writer.closed.then(() => "closed", errorInfo),
+      writeAfter: await writer.write("z").then(() => "ok", errorInfo),
+      closeAfter: await writer.close().then(() => "ok", errorInfo),
+      abortAfter: await writer.abort("again").then(() => "ok", errorInfo),
+    };
+    writer.releaseLock();
+    const reread = ts.readable.getReader();
+    post.readAfter = await reread.read().then(
+      ({ done }) => ({ done }),
+      (error) => errorInfo(error));
+    reread.releaseLock();
+    return report({
+      first,
+      second,
+      outcome: settled,
+      cancelled: cancelled === null ? null : String(cancelled),
+      sourceLocked: source.locked,
+      post,
+    });
+  },
+
+  async "/transform-write-cancel-running"() {
+    // Issue #272: the cancel lands while the first write's transform is
+    // already running (the entered gate proves it without timing), so both
+    // writes still complete on Workerd -- the queued second one included --
+    // and the same writer's ready stays fulfilled, while writer.closed
+    // rejects with the cancel reason. Cello used to reject the queued
+    // write and ready with the cancel reason.
+    let entered;
+    const enteredPromise = new Promise((resolve) => (entered = resolve));
+    const ts = new TransformStream({
+      transform(chunk, controller) {
+        entered();
+        controller.enqueue(chunk);
+      },
+    });
+    const writer = ts.writable.getWriter();
+    const reader = ts.readable.getReader();
+    const read = reader.read().then(
+      ({ value, done }) => ({ value: String(value), done }),
+      (error) => errorInfo(error));
+    const first = writer.write("a").then(() => "done", errorInfo);
+    const second = writer.write("b").then(() => "done", errorInfo);
+    await enteredPromise;
+    await reader.cancel("bye");
+    const readOut = await read;
+    reader.releaseLock();
+    const ready = await writer.ready.then(() => "done", errorInfo);
+    const closed = await writer.closed.then(() => "closed", errorInfo);
+    return report({
+      readOut,
+      first: await first,
+      second: await second,
+      ready,
+      closed,
+    });
+  },
+
+  async "/pipe-dest-error-completing"() {
+    // Issue #272: a controller.error() while a write is still running does
+    // not fail that write, so the pipe has no failed write and fulfills on
+    // Workerd (the source is still cancelled with the error), where Cello
+    // used to reject with the destination's error.
+    let cancelled = null;
+    const source = new ReadableStream({
+      start: (c) => c.enqueue("a"),
+      cancel: (reason) => (cancelled = reason),
+    });
+    let controller;
+    const dest = new WritableStream({
+      start(c) { controller = c; },
+      write() { controller.error(new Error("dest-broken")); },
+    });
+    const outcome = await source.pipeTo(dest).then(() => "done", errorInfo);
+    return report({
+      outcome,
+      cancelled: cancelled === null ? null : errorInfo(cancelled),
+      sourceLocked: source.locked,
+    });
+  },
+
+  async "/transform-flush-cancel-drain"() {
+    // A readable cancel from inside the writable's own flush, while a
+    // reader drains: the chunk arrives, the pipe fulfills, and the source
+    // -- already closed -- is never cancelled. Agrees on both runtimes.
+    let cancelled = false;
+    const source = new ReadableStream({
+      start: (c) => (c.enqueue("a"), c.close()),
+      cancel: () => (cancelled = true),
+    });
+    let ts;
+    ts = new TransformStream({
+      transform(chunk, controller) { controller.enqueue(chunk); },
+      flush() { ts.readable.cancel("bye"); },
+    });
+    const seen = [];
+    const reader = ts.readable.getReader();
+    const drained = (async () => {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) return seen;
+        seen.push(String(value));
+      }
+    })().then((value) => ({ out: value }), (error) => errorInfo(error));
+    const outcome = await source.pipeTo(ts.writable).then(() => "done", errorInfo);
+    return report({ drained: await drained, outcome, cancelled });
+  },
+
   async "/transform-backpressure"() {
     const order = [];
     const ts = new TransformStream(

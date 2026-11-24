@@ -79,6 +79,12 @@ class WritableStreamState {
     // compression_streams.js opts in through the private writable state
     // (`__cello.$$writableStreamState(...).closesOnError`).
     this.closesOnError = false;
+    // A plain TransformStream's readable cancel fails the writes it lands
+    // on with a TypeError naming the readable side, while the stored error
+    // stays the cancel reason (#272). Set only for writes outstanding when
+    // the cancel arrives that never started transforming; cleared when the
+    // error settles.
+    this.writeError = null;
     // Workerd's compression streams are also internal on the read side: a
     // readable cancel does not error the writable. It records the cancel
     // error here instead, so a write the writable accepted afterwards
@@ -524,8 +530,11 @@ function __finishErroring(st) {
   const err = st.storedError;
   // Reject queued writes in order, then settle abort,
   // then reject close/closed -- the spec's promise
-  // resolution order.
-  for (const entry of st.queue) entry.reject(err);
+  // resolution order. A plain TransformStream's readable cancel fails the
+  // writes it lands on with its own TypeError instead (#272).
+  const writeErr = st.writeError ?? err;
+  st.writeError = null;
+  for (const entry of st.queue) entry.reject(writeErr);
   st.queue = [];
   st.queueSize = 0;
   const abortReq = st.pendingAbort;
@@ -1063,10 +1072,45 @@ class TransformStream {
           return;
         }
         if (flushing) return;
-        // The readable is closed by now, so nothing will pull again:
-        // error the writable before awaiting the transformer's cancel,
-        // or a write parked on the handshake would wait on it forever.
-        if (writable) __errorStream(__wsState(writable), reason);
+        if (writable) {
+          const target = __wsState(writable);
+          // Workerd fails the writes a readable cancel lands on with a
+          // TypeError naming the readable side -- but only the ones that
+          // never started transforming. A write whose transform is already
+          // running still completes (its output is dropped), and so does a
+          // write queued behind it: the queue is resolved and dropped here
+          // while the in-flight write finishes on its own. Writes parked
+          // on the backpressure handshake, or queued behind one, fail with
+          // the TypeError instead; the stored error stays the cancel reason
+          // either way (#272).
+          if (target.state === 'writable' && target.started &&
+              (target.inFlightWrite !== null || target.queue.length > 0)) {
+            if (transformRunning) {
+              for (const entry of target.queue) {
+                target.queueSize -= entry.size;
+                entry.resolve();
+              }
+              if (target.queueSize < 0) target.queueSize = 0;
+              target.queue = [];
+              // The erroring path below rejects the pending ready with the
+              // stored error; detach it first so it stays fulfilled, as on
+              // Workerd.
+              if (target.writer) {
+                const ws = __wtrState(target.writer);
+                if (ws.readyResolve) ws.readyResolve();
+                ws.readyResolve = null;
+                ws.readyReject = null;
+              }
+            } else {
+              target.writeError = new TypeError(
+                "The readable side of this TransformStream is no longer " +
+                "readable.");
+              if (target.writer)
+                __rejectReady(__wtrState(target.writer), target.writeError);
+            }
+          }
+          __errorStream(target, reason);
+        }
         await runCancel(reason);
       },
     }, {
@@ -1135,11 +1179,18 @@ class TransformStream {
       ? new Promise((res) => res(startFn.call(transformer, ctrl)))
       : undefined;
     started?.catch((e) => rsc.error(e));
+    // Whether the in-flight write has started transforming. A readable
+    // cancel fails the writes it lands on with a TypeError naming the
+    // readable side, but only the ones that never started transforming;
+    // one whose transform is running still completes, and so does a write
+    // queued behind it (#272).
+    let transformRunning = false;
     // The transform itself, once the readable has asked for it. A throw
     // or rejection errors both sides and settles the write.
     const performTransform = (chunk) => {
       let result;
       try {
+        transformRunning = true;
         result = transformFn
           ? transformFn.call(transformer, chunk, ctrl)
           : ctrl.enqueue(chunk);
@@ -1158,16 +1209,18 @@ class TransformStream {
         // The default sink-write algorithm: stay parked while the
         // readable is full, so the producer's write -- and with it the
         // producer's `await` -- waits for the consumer to pull.
+        transformRunning = false;
         if (!backpressure) return performTransform(chunk);
         const change = backpressureChangePromise;
         return change.then(() => {
           // Abort, controller.error(), or a failed flush may have
           // errored the stream while this write was parked: fail it
           // with the stored error instead of transforming into a dead
-          // readable.
+          // readable. A readable cancel fails it with its own TypeError
+          // naming the readable side instead (#272).
           const parked = __wsState(writable);
           if (parked.state === 'erroring')
-            throw parked.storedError;
+            throw parked.writeError ?? parked.storedError;
           return performTransform(chunk);
         });
       },
