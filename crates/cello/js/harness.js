@@ -4136,7 +4136,20 @@ class Container {
     return Promise.reject(new Error("interceptOutboundTcp() is not implemented in cello"));
   }
 }
+// The state's parts the runtime reaches from outside the class. A static
+// private method cannot be named outside the class and a static block is the
+// one place that may hand it out, so these three closures are the runtime's
+// whole view: the prototype and the class object publish none of them (#256).
+let __stateReady;
+let __stateSocket;
+let __stateFailBlock;
 class DurableObjectState {
+  static {
+    __stateReady = (state) => state.#ready();
+    __stateSocket = (state, id) => state.#socket(id);
+    __stateFailBlock = (state, error) =>
+      state.#resetAfterConcurrencyFailure(error);
+  }
   constructor(scope) {
     // The host's own fields stay off reflection, and the six workerd exposes
     // are own, enumerable and in its order: `facets`, `container`, `storage`,
@@ -4193,9 +4206,12 @@ class DurableObjectState {
   blockConcurrencyWhile(f) {
     // The native context binds the gate and its operations to one driver.
     // Its async continuations keep that driver even inside a foreign turn.
-    return __with_input_gate_context(() => this._blockConcurrencyWhile(f));
+    return __with_input_gate_context(() => this.#blockConcurrencyWhile(f));
   }
-  _blockConcurrencyWhile(f) {
+  // The block path is the state's own: workerd has no member for it, and a
+  // guest cannot name a private method, so only `blockConcurrencyWhile` and
+  // the runtime's closures above reach it (#256).
+  #blockConcurrencyWhile(f) {
     if (typeof f !== "function")
       throw new TypeError("blockConcurrencyWhile() requires a function");
     if (this._blockDepth >= 64)
@@ -4220,7 +4236,7 @@ class DurableObjectState {
       // block that fails resets the object as any block does, and the outer
       // release must carry that failure, or the waiters would be admitted to
       // an object that no longer exists: the drain records it.
-      const nested = this._runConcurrencyBlock(f);
+      const nested = this.#runConcurrencyBlock(f);
       (this._nestedBlocks ||= []).push(nested.then(() => null, __describeFailure));
       return nested;
     }
@@ -4269,7 +4285,7 @@ class DurableObjectState {
         // instead of merely woken.
         let failure = null;
         try {
-          return await this._runConcurrencyBlock(f);
+          return await this.#runConcurrencyBlock(f);
         } catch (error) {
           failure = __describeFailure(error);
           throw error;
@@ -4294,27 +4310,27 @@ class DurableObjectState {
         __blockLeave(this._scope, block, event);
       }
     })();
-    // `_ready()` awaits this. The host gate stops *other* events, but a
+    // `__stateReady` awaits this. The host gate stops *other* events, but a
     // block taken in the constructor runs inside the very event that is
     // being delivered, so nothing external can hold that event back -- the
     // promise does. Concurrent blocks within one event go through
     // `_blockDepth` above and never reach here.
     this._gate = Promise.all([this._gate, record.ready]).then(() => undefined);
-    // `_ready()` observes the original promise. This extra handler prevents
+    // `__stateReady` observes the original promise. This extra handler prevents
     // a constructor-time rejection from becoming unhandled before an event
-    // reaches `_ready()`.
+    // reaches `__stateReady`.
     this._gate.catch(() => {});
     next.then(record.settleReady, record.rejectReady);
     return next;
   }
-  _runConcurrencyBlock(f) {
+  #runConcurrencyBlock(f) {
     this._blockDepth++;
     let result;
     try {
       result = f();
     } catch (error) {
       this._blockDepth--;
-      this._resetAfterConcurrencyFailure(error);
+      this.#resetAfterConcurrencyFailure(error);
       throw error;
     }
     const timerId = __timer_alloc();
@@ -4341,12 +4357,12 @@ class DurableObjectState {
         settled = true;
         __timer_cancel(timerId);
         this._blockDepth--;
-        this._resetAfterConcurrencyFailure(error);
+        this.#resetAfterConcurrencyFailure(error);
         throw error;
       },
     );
   }
-  _resetAfterConcurrencyFailure(error) {
+  #resetAfterConcurrencyFailure(error) {
     if (this._aborted) return;
     this._aborted = true;
     // Drop this scope's queued puts, not the executing cell's: under a
@@ -4394,7 +4410,7 @@ class DurableObjectState {
     __actorBreak(this._scope,
       reason instanceof Error ? reason : new Error(message));
   }
-  _ready() { return this._gate; }
+  #ready() { return this._gate; }
   getWebSockets(tag) {
     return JSON.parse(__ws_list(this._scope, tag)).map((row) => __socketFromRow(row));
   }
@@ -4441,7 +4457,7 @@ class DurableObjectState {
     wsState.tags = acceptedTags;
     __sockets.set(wsState.id, ws);
   }
-  _socket(id) {
+  #socket(id) {
     return __sockets.get(Number(id)) ||
       this.getWebSockets().find((ws) => __wsState(ws).id === id) ||
       __wsStub(id);
@@ -4490,10 +4506,11 @@ class DurableObjectState {
     __registerWaitUntil(promise);
   }
 }
-// Workerd's interface tag. The state's prototype members stay non-enumerable
-// and carry Cello's host-internal `_` methods for now; that leftover is
-// separate from this issue and recorded in the Durable Objects page (#251).
+// Workerd's interface: its tag names the state, and every prototype member a
+// Worker can walk is enumerable, as a JSG interface's are. No host-internal
+// member is left on the prototype (#251, #256).
 __webidlTag(DurableObjectState, "DurableObjectState");
+__webidlPrototype(DurableObjectState);
 __nativeMethodArities(DurableObjectState);
 function _instance(scope) {
   let inst = __cell.instances[scope];
@@ -4517,7 +4534,7 @@ function _instance(scope) {
 }
 async function _readyInstance(scope) {
   const inst = _instance(scope);
-  await inst.__celloState._ready();
+  await __stateReady(inst.__celloState);
   return inst;
 }
 const __actorEventStack = [];
@@ -9307,7 +9324,7 @@ __cello.__wsOpen = async (scope, wsId, protocol) => {
   const ctxId = __ctxNext();
   try {
     const inst = await _readyInstance(scope);
-    const socket = inst.__celloState._socket(wsId);
+    const socket = __stateSocket(inst.__celloState, wsId);
     if (socket.readyState !== WebSocket.READY_STATE_CONNECTING) return;
     await __ctxRun(ctxId, async () => {
       // Both are prototype accessors now, so the host writes the private
@@ -9327,7 +9344,7 @@ __cello.__wsMessage = async (scope, wsId, msg) => {
   const ctxId = __ctxNext();
   try {
     const inst = await _readyInstance(scope);
-    const socket = inst.__celloState._socket(wsId);
+    const socket = __stateSocket(inst.__celloState, wsId);
     await __ctxRun(ctxId, async () => {
       if (!__wsState(socket).hibernatable && socket instanceof WebSocket)
         __wsHooks.dispatchMessage(socket, msg);
@@ -9344,7 +9361,7 @@ __cello.__wsBinary = async (scope, wsId, data) => {
   const ctxId = __ctxNext();
   try {
     const inst = await _readyInstance(scope);
-    const socket = inst.__celloState._socket(wsId);
+    const socket = __stateSocket(inst.__celloState, wsId);
     const bytes = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
     await __ctxRun(ctxId, async () => {
       if (!__wsState(socket).hibernatable && socket instanceof WebSocket)
@@ -9362,7 +9379,7 @@ __cello.__wsClosed = async (scope, wsId, code, reason, wasClean) => {
   const ctxId = __ctxNext();
   try {
     const inst = await _readyInstance(scope);
-    const socket = inst.__celloState._socket(wsId);
+    const socket = __stateSocket(inst.__celloState, wsId);
     await __ctxRun(ctxId, async () => {
       if (!__wsState(socket).hibernatable && socket instanceof WebSocket)
         __wsHooks.dispatchClose(socket, code, reason, wasClean);
@@ -15755,7 +15772,7 @@ globalThis.process.exit = (code = 0) => {
   if (actorScope) {
     const instance = __cell.instances[actorScope];
     if (instance?.__celloState)
-      instance.__celloState._resetAfterConcurrencyFailure();
+      __stateFailBlock(instance.__celloState);
   }
   __process_exit(Number(code) || 0, actorScope);
 };

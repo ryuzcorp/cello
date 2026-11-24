@@ -220,10 +220,11 @@ Known reflection-only differences:
   `[object DurableObjectState]`, `[object SqlStorage]`, `[object Cursor]`,
   `[object DurableObjectId]`, `[object DurableObjectNamespace]`,
   `[object SyncKvStorage]`, `[object ListIterator]`, `[object DurableObject]`
-  and `[object Fetcher]`). `DurableObjectState` is the one object whose
-  prototype still carries host-internal `_`-prefixed members (`_ready`,
-  `_socket`, `_blockConcurrencyWhile`, `_runConcurrencyBlock`,
-  `_resetAfterConcurrencyFailure`, and the facets view's helpers): they are
+  and `[object Fetcher]`), and none of them publishes a host-internal member
+  on its prototype: `DurableObjectState`'s block path, readiness wait and
+  socket lookup are private methods the runtime reaches through a static
+  block. `ctx.facets` is the remaining object whose prototype carries
+  `_`-prefixed helpers (`_validName`, `_abort`, `_release`); they are
   non-enumerable, unsupported, and may disappear without notice.
 - `D1PreparedStatement` carries workerd's own `statement` and `params` data
   members. They are copies for reflection; the statement's behaviour reads
