@@ -783,23 +783,35 @@ const routes = {
   },
 
   async "/compression-cancel-then-abort"() {
-    // Issue #230 review: a readable cancel followed by an abort while a write
-    // is in flight must not lose the stored error -- the bug rejected both
-    // closed and abort with `undefined`. The rejection reason itself differs
-    // on base (workerd answers the abort reason), so only its presence is
-    // pinned here; the exact reason is asserted by the Rust test.
+    // Issue #230 review, tightened by #252: a readable cancel followed by an
+    // abort with a write in flight and a read pending. Workerd's compression
+    // writable is an internal stream, so the abort is an ordinary abort that
+    // resolves, `closed` rejects with the abort reason (never `undefined`
+    // and never the cancel reason), and the pending read rejects with an
+    // `Error` carrying the cancel reason.
     const stream = new CompressionStream("gzip");
     const writer = stream.writable.getWriter();
     const reader = stream.readable.getReader();
-    reader.read().catch(() => {});
+    const pull = reader.read().then(({ value }) => value.byteLength, errorInfo);
     await null;
     const write = writer.write(encoder.encode("payload")).then(() => "ok", errorInfo);
     const cancel = reader.cancel("cancel-reason").then(() => "ok", errorInfo);
-    // The abort is the call that used to overwrite the stored error; its own
-    // settlement differs from workerd's on base, so it is not asserted here.
-    writer.abort("abort-reason").catch(() => {});
-    const closed = writer.closed.then(() => "resolved", (error) => (error === undefined ? "undefined" : "rejected"));
-    return report({ write: await write, cancel: await cancel, closed: await closed });
+    const abort = writer.abort("abort-reason").then(() => "ok", errorInfo);
+    const closed = writer.closed.then(() => "ok", (error) => (error === undefined ? "undefined" : errorInfo(error)));
+    const out = {
+      write: await write,
+      cancel: await cancel,
+      abort: await abort,
+      closed: await closed,
+      pull: await pull,
+    };
+    // The writable ends in workerd's closed shape: still locked, nothing
+    // left to write into, and a later write reports the closed stream.
+    out.locked = stream.writable.locked;
+    out.desiredSize = attempt(() => writer.desiredSize);
+    out.getWriter = attempt(() => typeof stream.writable.getWriter());
+    out.writeAfter = await writer.write(encoder.encode("later")).then(() => "ok", errorInfo);
+    return report(out);
   },
 
   async "/locked-stream-messages"() {

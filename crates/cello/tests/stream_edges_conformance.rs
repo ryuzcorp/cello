@@ -1,7 +1,7 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
-// Modified by Ryuz Corp (Cello): released-writer and compression-stream
-// close-after-error conformance (#193, #223).
+// Modified by Ryuz Corp (Cello): released-writer, compression-stream
+// close-after-error and cancel-racing-abort conformance (#193, #223, #252).
 
 // A white-box driver test, not node code: it builds a Worker in-process and
 // drives one turn per request, so the execution boundary's injected
@@ -28,9 +28,17 @@
 //!   `desiredSize` is 0 and `abort()` resolves, while `writer.closed`
 //!   rejects with the failure and `writer.ready` resolves. Cello replayed
 //!   the stored error from `close()`.
+//! - A compression stream whose readable is cancelled while a write is in
+//!   flight and a read is pending (#252): the cancel records its error on
+//!   the writable instead of erroring it, so a following `abort()` is an
+//!   ordinary abort. Workerd resolves `abort()`, rejects `closed` with the
+//!   abort reason, and rejects the pending read with an `Error` carrying the
+//!   cancel reason, ending the writable in the closed shape. Cello answered
+//!   the cancel reason everywhere and left the writable errored.
 //!
 //! The `scripts/workerd-diff` gate pins the same transcripts against a real
-//! workerd (`writer-released`, `decompression-close-after-error`).
+//! workerd (`writer-released`, `decompression-close-after-error`,
+//! `compression-cancel-then-abort`).
 
 use cello::js::{Compat, RequestBody, Worker, WorkerConfig, WorkerConfigOptions};
 use serde_json::Value;
@@ -251,11 +259,13 @@ async function decompressionCloseAfterError() {
   check("compression round trip decodes", (await compressed) === 23, "unexpected compressed length");
 }
 
-// A readable cancel followed by an abort with the write still in flight: the
-// abort is recorded while the stream is already erroring, so it stores no
-// reason of its own. Settling the write must not overwrite the stored error
-// with `undefined` (#230 review; workerd answers the abort reason, base Cello
-// and this patch answer the cancel reason, and neither ever loses it).
+// A readable cancel followed by an abort with the write in flight and a read
+// pending: workerd's compression streams are internal streams, so the cancel
+// records its error on the writable without erroring it (the parked write
+// still completes) and the abort is an ordinary abort. `abort()` resolves,
+// `closed` rejects with the abort reason, the pending read rejects with an
+// `Error` carrying the cancel reason, and the writable ends in the closed
+// shape -- locked and `desiredSize` 0 (#252).
 const rejection = (promise) =>
   promise.then(
     () => "resolved",
@@ -264,14 +274,14 @@ const rejection = (promise) =>
         ? "undefined"
         : typeof error === "string"
           ? `string:${error}`
-          : errorOf(error).message,
+          : `${errorOf(error).name}:${errorOf(error).message}`,
   );
 
 async function compressionCancelThenAbort() {
   const stream = new CompressionStream("gzip");
   const writer = stream.writable.getWriter();
   const reader = stream.readable.getReader();
-  reader.read().catch(() => {});
+  const pull = rejection(reader.read());
   await null;
   const write = settles(writer.write(new TextEncoder().encode("payload")));
   const cancel = settles(reader.cancel("cancel-reason"));
@@ -280,9 +290,28 @@ async function compressionCancelThenAbort() {
   check("the parked write resolves", (await write) === "ok", "write failed");
   check("the cancel resolves", (await cancel) === "ok", "cancel failed");
   const closedResult = await closed;
-  check("closed keeps the stored error", closedResult === "string:cancel-reason", `closed: ${closedResult}`);
+  check("closed rejects with the abort reason", closedResult === "string:abort-reason", `closed: ${closedResult}`);
   const abortResult = await abort;
-  check("abort keeps the stored error", abortResult === "string:cancel-reason", `abort: ${abortResult}`);
+  check("abort resolves", abortResult === "resolved", `abort: ${abortResult}`);
+  const pullResult = await pull;
+  check("the pending read rejects with the cancel reason", pullResult === "Error:cancel-reason", `pull: ${pullResult}`);
+  const desired = desiredSizeOf(writer);
+  check("desiredSize is 0", desired === "ok 0", desired);
+  check("the writable stays locked", stream.writable.locked === true, "writable unlocked itself");
+  const getWriter = (() => {
+    try {
+      return typeof stream.writable.getWriter();
+    } catch (error) {
+      return errorOf(error);
+    }
+  })();
+  check(
+    "a new writer is refused",
+    isTypeError(getWriter, "This WritableStream is currently locked to a writer."),
+    `${JSON.stringify(getWriter)}`,
+  );
+  const writeAfter = await settles(writer.write(new TextEncoder().encode("later")));
+  check("a later write reports the closed stream", isTypeError(writeAfter, CLOSED), `${JSON.stringify(writeAfter)}`);
 }
 
 export default {
@@ -325,7 +354,7 @@ fn decompression_close_after_error_matches_workerd() {
 }
 
 #[test]
-fn compression_cancel_then_abort_keeps_the_stored_error() {
+fn compression_cancel_then_abort_matches_workerd() {
     ensure_engine();
     let mut worker = load_worker(WORKER, "stream-edges");
     check_route(&mut worker, "/compression-cancel-then-abort");

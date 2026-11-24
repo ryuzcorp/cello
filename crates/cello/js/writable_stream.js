@@ -79,6 +79,16 @@ class WritableStreamState {
     // compression_streams.js opts in through the private writable state
     // (`__cello.$$writableStreamState(...).closesOnError`).
     this.closesOnError = false;
+    // Workerd's compression streams are also internal on the read side: a
+    // readable cancel does not error the writable. It records the cancel
+    // error here instead, so a write dispatched afterwards refuses with it
+    // (and errors the stream), while the write in flight at cancel time
+    // still completes (#252).
+    this.cancelled = null;
+    // Settles when the write in flight does, so the transformer's cancel
+    // (which drops the native zlib stream) can wait for it.
+    this.inFlightSettled = null;
+    this.inFlightSettle = null;
   }
 }
 
@@ -511,6 +521,10 @@ function __finishErroring(st) {
   Promise.resolve(result).then(
     () => {
       abortReq.resolve();
+      // Workerd's internal streams end an aborted writable in the closed
+      // shape (desiredSize 0, later write()/close() report "has been
+      // closed"), not the errored shape a JS sink gets (#252).
+      if (st.closesOnError) st.state = 'closed';
       __rejectCloseAndClosed(st);
     },
     (e) => {
@@ -554,6 +568,17 @@ function __advanceQueue(st) {
 
 function __startWrite(st, entry) {
   st.inFlightWrite = entry;
+  // Settles with this write, so a readable cancel on a compression stream
+  // can drop the native state after the chunk that was already in flight
+  // has been transformed (#252). A fresh promise per write: the cancel
+  // captures the one live at the time it runs. Only an internal writable
+  // (the compression streams) can observe a readable cancel, so a JS sink
+  // never pays for the promise.
+  if (st.closesOnError) {
+    st.inFlightSettled = new Promise((resolve) => {
+      st.inFlightSettle = resolve;
+    });
+  }
   // A sync throw is deferred into a rejection so an
   // abort() issued between write() and the microtask
   // still sees the write as in flight (Workerd runs the
@@ -572,6 +597,9 @@ function __startWrite(st, entry) {
       entry.resolve(undefined);
       st.queueSize -= entry.size;
       if (st.queueSize < 0) st.queueSize = 0;
+      if (st.inFlightSettle) st.inFlightSettle();
+      st.inFlightSettled = null;
+      st.inFlightSettle = null;
       // A compression stream's abort deferred to this write (#230): the
       // chunk was written, so the abort now takes the normal path. Starting
       // the error here rejects the writes still queued, then finishErroring
@@ -589,6 +617,9 @@ function __startWrite(st, entry) {
       st.inFlightWrite = null;
       st.queueSize -= entry.size;
       if (st.queueSize < 0) st.queueSize = 0;
+      if (st.inFlightSettle) st.inFlightSettle();
+      st.inFlightSettled = null;
+      st.inFlightSettle = null;
       entry.reject(e);
       if (st.closesOnError) __closeAfterError(st, e);
       else __dealWithRejection(st, e);
@@ -898,6 +929,21 @@ class TransformStream {
       },
       async cancel(reason) {
         if (flushing) return;
+        const wst = writable ? __wsState(writable) : null;
+        if (wst !== null && wst.closesOnError) {
+          // Workerd's compression streams are internal on the read side: a
+          // cancel records its error on the writable and leaves it
+          // writable, so a write already dispatched still completes, a
+          // later one refuses with that error, `close()` still resolves and
+          // an `abort()` is an ordinary abort (#252). The pending read
+          // rejects with the cancel error (see `__cancelStream`).
+          wst.cancelled = __cello.$$cancelError(reason);
+          if (wst.unblockWrite) wst.unblockWrite();
+          const settled = wst.inFlightSettled;
+          if (settled) await settled;
+          await runCancel(reason);
+          return;
+        }
         // The readable is closed by now, so nothing will pull again:
         // error the writable before awaiting the transformer's cancel,
         // or a write parked on the handshake would wait on it forever.
@@ -978,6 +1024,11 @@ class TransformStream {
     writable = new WritableStream({
       start() { return started; },
       write(chunk) {
+        const wst = __wsState(writable);
+        // A write the readable's cancel did not catch in flight refuses
+        // with the cancel error and errors the stream, as workerd's internal
+        // compression streams do (#252).
+        if (wst.cancelled !== null) throw wst.cancelled;
         // The default sink-write algorithm: stay parked while the
         // readable is full, so the producer's write -- and with it the
         // producer's `await` -- waits for the consumer to pull.
@@ -988,9 +1039,9 @@ class TransformStream {
           // errored the stream while this write was parked: fail it
           // with the stored error instead of transforming into a dead
           // readable.
-          const wst = __wsState(writable);
-          if (wst.state === 'erroring')
-            throw wst.storedError;
+          const parked = __wsState(writable);
+          if (parked.state === 'erroring')
+            throw parked.storedError;
           return performTransform(chunk);
         });
       },

@@ -59,12 +59,22 @@ function make(format, decompress, name, missing) {
   // The TransformStream's readable and writable sides both close over
   // this object, so it is collectable exactly when neither side is
   // reachable any more.
+  let ts;
+  // A readable cancel leaves a write that was already in flight to finish
+  // (workerd's internal streams complete it) and that write's transform
+  // has nowhere to enqueue: the readable is cancelled. `cancelled` on the
+  // writable's private state is set before the parked write is released,
+  // so the chunk is compressed and dropped, as workerd does (#252).
+  const readableCancelled = () =>
+    ts !== undefined &&
+    __cello.$$writableStreamState(ts.writable).cancelled !== null;
   const transformer = {
     transform(chunk, controller) {
       let out;
       try {
         out = __zlib_stream_push(id, bytes(chunk));
-        if (out.byteLength) controller.enqueue(out);
+        if (out.byteLength && !readableCancelled())
+          controller.enqueue(out);
       } catch (e) {
         __zlib_stream_drop(id);
         throw e;
@@ -72,15 +82,20 @@ function make(format, decompress, name, missing) {
     },
     flush(controller) {
       const out = __zlib_stream_end(id);
-      if (out.byteLength) controller.enqueue(out);
+      if (out.byteLength && !readableCancelled())
+        controller.enqueue(out);
     },
     cancel() { __zlib_stream_drop(id); },
   };
-  const ts = new TransformStream(transformer);
+  ts = new TransformStream(transformer);
   // Workerd's compression streams are internal streams: a
   // pending read() rejects with the cancel reason instead
-  // of resolving {done: true}.
-  __cello.$$readableState(ts.readable).cancelRejectsReads = true;
+  // of resolving {done: true}, and it settles only after
+  // the microtask drain, so a cancel() called right after
+  // the producing write still rejects it (#252).
+  const rst = __cello.$$readableState(ts.readable);
+  rst.cancelRejectsReads = true;
+  rst.deferReads = true;
   // ... and a failed push or flush closes the writable side
   // instead of erroring it (#223).
   __cello.$$writableStreamState(ts.writable).closesOnError = true;
