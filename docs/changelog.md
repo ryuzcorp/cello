@@ -4,6 +4,15 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
 ---
 ## Unreleased
 
+- **An invalid chunk rejects only its own write on internal byte streams, as
+  Workerd does (#280).** The accept-time validation from #276 now also covers
+  `IdentityTransformStream` and `FixedLengthStream`: a non-`BufferSource`
+  chunk rejects only that write instead of erroring the readable, a later
+  valid write still runs, and the invalid write does not count toward a
+  `FixedLengthStream`'s expected length. The differential gate gained
+  `identity-invalid-chunk` and `fixed-length-invalid-chunk`, each in both
+  read/write orderings, all failing before this change.
+
 - **An invalid chunk rejects only its own write on compression streams, as
   Workerd does (#276).** Writing a chunk that is neither a `BufferSource`, a
   string nor `undefined` used to park the write until a read pulled it through
