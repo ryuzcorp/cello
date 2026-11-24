@@ -70,6 +70,36 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
   differential gate gained two cases -- taken or closed destinations, and
   `pipeThrough` onto taken sides -- pinning that every shape settles with
   Workerd's outcome instead of hanging, and every case agrees.
+- **Workflow instance errors answer workerd's text, and `get` with a
+  malformed id reports `not_found` (#275).** `get()` with a malformed id
+  was refused as invalid; workerd answers `instance.not_found` for a
+  malformed id exactly as for a missing one, so Cello does the same.
+  Every other covered error now matches workerd 1.20261121.1 verbatim --
+  `WorkflowError: (instance.already_exists)`, `(instance.cannot_resume)`
+  and `(instance.cannot_terminate)` with their sentences, the `batchCreate`
+  limit texts, and the `(body)` `batchDeleteInstances` texts -- with no
+  `WORKFLOW_ERROR` prefix where workerd has none, and the gate compares
+  the messages, not just the verdicts. Cello stays strict where workerd
+  is merely lax: a malformed `sendEvent`, a non-object `createBatch`
+  item, and unknown `restart()` options are still refused, as documented
+  under Workflows. The `binding` gate case gained the non-array and
+  over-limit `deleteBatch` refusals.
+- **`status()` answers Workerd's shape in every Workflow state, and
+  `sendEvent` to a terminal instance is accepted and dropped (#275).**
+  `status()` carried an extra `rollback: null` member and omitted `error`
+  and `output` when absent; workerd 1.20261121.1 answers exactly
+  `{status, error, output}` in every state, with `error` present but
+  `undefined` until the instance fails (then `{name, message}`) and
+  `output` `null` until `run()` returns. `sendEvent()` to a `complete`,
+  `errored` or `terminated` instance was refused; workerd acknowledges the
+  event and drops it, leaving the status untouched, so Cello commits no
+  ledger write and arms no wake for it. `deleteBatch()` refused the whole
+  batch on a malformed id; workerd reports it as a per-item `10400`
+  `workflows.api.error.instance.not_found` error, echoed back like any
+  other absent id with duplicates preserved, so Cello does the same. The
+  differential gate gained `workflow-status/shape-terminal`, `shape-live`,
+  `send-terminal`, `lifecycle-a`, `lifecycle-b` and `binding` (252 total)
+  and every case agrees.
 - **`writer.close()` across a same-turn readable cancel resolves on a
   compression stream, as Workerd does (#262).** With no `await` between a
   write, `close()` and `reader.cancel()`, both `close()` and `writer.closed`

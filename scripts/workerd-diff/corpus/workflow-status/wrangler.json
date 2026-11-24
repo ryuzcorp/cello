@@ -1,0 +1,1 @@
+{"compatibility_date": "2026-11-24", "main": "index.js", "name": "workflow-status", "no_bundle": true, "workflows": [{"binding": "QUICK", "class_name": "Quick", "name": "quick-flow"}, {"binding": "BOOM", "class_name": "Boom", "name": "boom-flow"}, {"binding": "BLOCK", "class_name": "Blocker", "name": "block-flow"}]}
