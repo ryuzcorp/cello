@@ -476,14 +476,18 @@ The `tail` and `email` handlers are unavailable.
   two reasons into an array; Workerd does not, and neither does Cello. A
   source that inspects its cancellation reason (a client abort versus a
   shutdown) reads the same value on both runtimes.
-- `CompressionStream` and `DecompressionStream` are capped at 128 live
+  - `CompressionStream` and `DecompressionStream` are capped at 128 live
   streams per isolate; Workerd has no such cap. The 129th constructor call
-  throws a `RangeError`. Finish or abort streams you no longer use: a
-  readable `cancel()` never releases the native stream, so that a `close()`
-  which follows still runs its flush -- reporting the member's true end --
-  and the stream is released by that flush, by an `abort()`, or by the
-  collector once neither side is reachable. A stream whose writable is left
-  open and never ended holds its slot until then.
+  throws a `RangeError`. A readable `cancel()` ends the native stream once
+  nothing it accepted is still outstanding -- right away when the cancel
+  finds the writable idle, otherwise when the last accepted write settles
+  -- so a cancel on its own frees the slot with no close, no abort, and no
+  wait for the collector; the outcome is stashed and a `close()` that
+  follows replays the member's true end instead of failing with `zlib
+  stream already closed`. Beyond that a stream is released by a close's
+  flush, by an `abort()`, or by the collector once neither side is
+  reachable. A stream whose writable is left open and never ended holds
+  its slot until then.
   Their writable side is an internal stream: once it has closed,
   `releaseLock()` is a no-op and the stream stays locked, as on Workerd. A
   readable `cancel()` records its error on the writable instead of erroring
@@ -497,13 +501,16 @@ The `tail` and `email` handlers are unavailable.
   the abort reason, and the writable ends in the closed shape
   (`desiredSize` 0, later `write()` and `close()` report the closed stream)
   instead of the errored one a JS sink gets. An `abort()` racing a queued
-  or in-flight `close()` wins: the close and `closed` reject with the abort
-  reason and the readable errors with it too. A `close()` or `write()` that
-  follows an `abort()` reports the closed stream. A `close()` already queued or
+  or in-flight `close()` wins -- even when the flush fails, in which case
+  a pending read still keeps the flush failure: the close and `closed`
+  reject with the abort reason, the abort fulfills, and the readable errors
+  with it too. A `close()` or `write()` that follows an `abort()` reports
+  the closed stream. A `close()` already queued or
   in flight when the readable is cancelled resolves too: its flush drops the
   output rather than enqueueing it into the cancelled readable and does not
-  close that side a second time, and the compressor is released by that
-  flush instead of ahead of it, so `writer.closed` resolves as on Workerd. An encoder enqueues what it
+  close that side a second time, and when the cancel already ended the
+  compressor the flush replays the stashed outcome, so `writer.closed`
+  resolves as on Workerd. An encoder enqueues what it
   emitted for each push -- the gzip or zlib header on the first write, and
   nothing more until deflate has a block or the stream ends, while
   `deflate-raw` and `brotli` stay silent until `close()` -- as Workerd does,

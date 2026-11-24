@@ -44,6 +44,11 @@ export const cases = [
   // #270: close() racing writer.abort(), and empty DecompressionStream closes.
   { name: "compression-close-abort", fixture: "streams", path: "/compression-close-abort" },
   { name: "decompression-empty-close", fixture: "streams", path: "/decompression-empty-close" },
+  // #270 round 2: cancel-only slot release, and abort over a failing flush.
+  { name: "compression-cancel-releases-slot", fixture: "streams", path: "/compression-cancel-releases-slot" },
+  { name: "compression-response-cancel-releases-slot", fixture: "streams", path: "/compression-response-cancel-releases-slot" },
+  { name: "compression-pipe-fail-releases-slot", fixture: "streams", path: "/compression-pipe-fail-releases-slot" },
+  { name: "compression-abort-failing-flush", fixture: "streams", path: "/compression-abort-failing-flush" },
   { name: "compression-encoder-chunks", fixture: "streams", path: "/compression-encoder-chunks" },
   { name: "locked-stream-messages", fixture: "streams", path: "/locked-stream-messages" },
   { name: "writable-ready-queued-close", fixture: "streams", path: "/writable-ready-queued-close" },

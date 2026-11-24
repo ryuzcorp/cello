@@ -36,23 +36,31 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
 - **`close()` racing `writer.abort()` settles as Workerd does, and an empty
   `DecompressionStream` close rejects, on compression streams (#270).** With
   no readable cancel involved, an `abort()` that lands while a `close()` is
-  queued or its flush is already in flight now wins: the close and
-  `writer.closed` reject with the abort reason, the abort fulfills, and the
-  readable errors with it too, where Cello used to resolve the close (and,
-  once the flush was running, the pending read with the flushed bytes). The
-  writable ends in the closed shape, so a `close()` or `write()` that follows
+  queued or its flush is already in flight now wins -- even when that flush
+  fails, where Cello used to reject the abort with the flush error: the
+  close and `writer.closed` reject with the abort reason, the abort
+  fulfills, and the readable errors with it too, where Cello used to
+  resolve the close (and, once the flush was running, the pending read with
+  the flushed bytes). A pending read keeps the flush failure while the
+  abort wins. The writable ends in the closed shape, so a `close()` or
+  `write()` that follows
   an `abort()` reports the closed stream instead of the abort reason, and a
   second `close()` after a raced one does too. Closing a
   `DecompressionStream` whose member never completed -- empty or truncated
   -- rejects `close()` and `closed` with `Called close() on a decompression
   stream with incomplete data` however the close lines up with a readable
   `cancel()`, where Cello used to resolve a close that followed the cancel;
-  a complete member still closes cleanly. The readable cancel no longer
-  releases the native compressor at all, so a close that follows always runs
-  its flush, which reports the member's true end. The differential gate
-  gained two cases -- the close/abort orderings over gzip, deflate and
-  deflate-raw, and the empty-decompression close variants -- that fail
-  before this change, and every case agrees.
+  a complete member still closes cleanly. A readable cancel ends the native
+  compressor once nothing it accepted is still outstanding -- right away
+  when the cancel finds the writable idle, otherwise when the last accepted
+  write settles -- so a cancel on its own frees the slot with no close, no
+  abort, and no wait for the collector; the outcome is stashed and a close
+  that follows replays the member's true end. The differential gate gained
+  six cases -- the close/abort orderings over gzip, deflate and
+  deflate-raw, the empty-decompression close variants, three cancel-only
+  slot-release loops (plain cancel, `Response`-body cancel, failed
+  `pipeTo`), and the abort racing a failing flush -- that fail before this
+  change, and every case agrees.
 - **`pipeTo` onto a closed destination and `cancel()` on a locked
   `ReadableStream` report Workerd's messages (#269).** A destination a
   previous pipe already closed is refused up front with `This destination
