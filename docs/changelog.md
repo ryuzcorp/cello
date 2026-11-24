@@ -227,6 +227,33 @@ workerd 1.20261121.1).
   resolves when the close lands. Bytes past a `deflate` or `deflate-raw`
   stream now report "Trailing bytes after end of compressed data" rather
   than a generic failure. The differential gate gained five cases.
+- **The last binding leftovers match workerd (#239).** `storage.put(entries)`
+  takes a plain object, as workerd's one-overload signature does: its own
+  enumerable string keys are the pairs and an `undefined` value is dropped, so
+  a `Map`, a `Set` or a `Date` writes nothing, a class instance writes its
+  fields, and an array is not a dictionary -- it falls to the single-pair form,
+  where the key is coerced (`put([["a", 1]])` stores nothing and throws
+  `put() called with undefined value.`, `put([["r", 1]], options)` stores
+  `"r,1"`). A primitive key coerces (`put(5, "five")` stores `"5"`), a symbol
+  key throws V8's conversion error, and `put()` with no argument names the
+  `string or object` parameter. `storage.list()` (and the synchronous
+  `kv.list()`) convert their `ListOptions` the way workerd's JSG does: the
+  string fields read any value, `reverse` is a boolean coercion, `limit` is an
+  `int` with the int32 range check and `List limit must be positive.`, `start`
+  with `startAfter` is refused, and an `undefined` field is absent, instead of
+  reporting serde's own text. `exec()` reports one count per input line that
+  carries a statement rather than one per statement, an empty or
+  comment-only input is refused before anything runs, and a fresh D1 database
+  reports `last_row_id` 0 for its first DDL and keeps reading after a write
+  where it reported 0; `size_after` counts only the application's pages, so a
+  fresh database is 4096 bytes as in workerd instead of 49152. Binding
+  methods report `length` 0 like the native functions they emulate. The
+  differential gate gained five cases (223 total). One deliberate deviation
+  remains: workerd's `exec()` sends each input line as its own query, so a
+  statement may not span lines there; Cello still runs the input as one
+  statement stream, and counts the lines. An array passed where `ListOptions`
+  is expected lists in reverse order on workerd, which reads as uninitialised
+  state rather than a rule, and is not reproduced.
 
 ## v0.2.9
 

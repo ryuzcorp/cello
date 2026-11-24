@@ -60,7 +60,7 @@ curl "http://127.0.0.1:9876/?name=b"   # {"n":1}
 
 - `env.COUNTER.idFromName(name)` returns an id, and `env.COUNTER.get(id)` returns a stub. `getByName(name)` performs both steps.
 - `newUniqueId()` and `idFromString()` create and parse a random id.
-- `ctx.storage.get()`, `put()`, `delete()`, `list()`, and `deleteAll()` are the key-value methods.
+- `ctx.storage.get()`, `put()`, `delete()`, `list()`, and `deleteAll()` are the key-value methods. `put(entries, options)` takes a plain object whose own enumerable string keys are the pairs, as Cloudflare's single `put(key, value, options)` signature resolves it: an `undefined` value leaves the key out, a `Map` or a `Set` writes nothing, and an array is not a dictionary -- it reads as the single-pair form, with its key coerced to a string. `list()` converts its options the way Cloudflare does: the string fields take any value, `reverse` is a boolean coercion, `limit` is a positive `int` of at most 2,147,483,647, and `start` with `startAfter` is refused.
 - `ctx.storage.sql.exec()` runs SQL on the database of the object.
 - `transaction()` and `transactionSync()` group several writes.
 - `storage.setAlarm()`, `getAlarm()`, and `deleteAlarm()` manage one alarm per object, and Cello calls the `alarm(alarmInfo)` handler.

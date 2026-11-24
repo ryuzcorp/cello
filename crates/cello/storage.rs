@@ -80,6 +80,12 @@ pub struct Cells {
     sql_critical_errors: RefCell<HashMap<String, String>>,
     /// The schema cookie last read for a cell, and what it was read against.
     schema_cookies: RefCell<HashMap<String, SchemaCookie>>,
+    /// The last row id an application statement assigned in each cell. SQLite's
+    /// `last_insert_rowid()` is connection-level, so Cello's own writes -- the
+    /// storage control tables, the alarm wake record, the replica's control
+    /// tables -- move it; workerd's D1 database has no such writes, and reports
+    /// what the application itself last assigned (#239).
+    app_last_row_ids: RefCell<HashMap<String, i64>>,
 }
 
 /// The database and the ownership epoch that authorized its activation.
@@ -1094,7 +1100,10 @@ pub fn close(scope: &str) {
     close_sql_cursors(scope);
     close_sql_statement_cache(scope);
     clear_sql_critical_error(scope);
-    cells(|c| c.schema_cookies.borrow_mut().remove(scope));
+    cells(|c| {
+        c.schema_cookies.borrow_mut().remove(scope);
+        c.app_last_row_ids.borrow_mut().remove(scope);
+    });
     dbs(|d| d.borrow_mut().remove(scope));
     active_alarms(|alarms| alarms.borrow_mut().remove(scope));
     alarm_moves(|moves| {
@@ -2925,6 +2934,11 @@ pub struct D1Meta {
     timings: D1Timings,
     rows_read: u64,
     rows_written: u64,
+    /// The last row id an application statement assigned on this cell, which
+    /// is what workerd's own connection reports (a read after a write still
+    /// reports it). Cello's storage tables and the replica's control tables
+    /// share the connection, so their writes are tracked out of the value
+    /// (#239).
     last_row_id: i64,
     /// The rows this statement changed: the delta of SQLite's
     /// `total_changes` across it, so a statement that changed nothing -- a
@@ -3448,6 +3462,132 @@ struct D1RunPolicy {
     refuse_incomplete: bool,
 }
 
+/// JavaScript's whitespace set: what `String.prototype.trim` strips and a
+/// regular expression's `\s` matches. That is Unicode `White_Space` without
+/// NEL (U+0085, which only Rust counts), plus the byte-order mark, which only
+/// JavaScript counts.
+fn js_whitespace(c: char) -> bool {
+    (c.is_whitespace() && c != '\u{85}') || c == '\u{feff}'
+}
+
+/// `text` as `String.prototype.trim` returns it.
+fn js_trim(text: &str) -> &str {
+    text.trim_matches(js_whitespace)
+}
+
+/// Where the last statement in `text` ends, as workerd's local D1 computes it
+/// (`d1.js` `end()`): the offset just past the last character that is neither
+/// whitespace nor a statement separator, stepping over `--` and `/* */`
+/// comments and over quoted strings. Zero means the line carries no statement,
+/// which is what a line of nothing, only `;`, or only comments is. An
+/// unterminated quote makes the whole text a statement, which then fails to
+/// parse -- the same loud answer workerd gives.
+fn d1_statement_end(text: &str) -> usize {
+    let bytes = text.as_bytes();
+    let mut last = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'-' && bytes.get(i + 1) == Some(&b'-') {
+            match text[i..].find('\n') {
+                // Past the newline, as the JS index does.
+                Some(offset) => i += offset,
+                None => break,
+            }
+        } else if c == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            match text[i + 2..].find("*/") {
+                Some(offset) => i += offset + 3,
+                None => break,
+            }
+        } else if matches!(c, b'\'' | b'"' | b'`' | b'[') {
+            let close = if c == b'[' { ']' } else { char::from(c) };
+            match text[i + 1..].find(close) {
+                Some(offset) => {
+                    i += offset + 1;
+                    last = i + 1;
+                }
+                None => return text.len(),
+            }
+        } else if c == b';' || js_whitespace(char::from(c)) {
+            // The statement separator and whitespace: past the last statement.
+        } else if c.is_ascii() {
+            last = i + 1;
+        } else {
+            // Decode the character: a multi-byte sequence is one unit of text,
+            // not bytes that could read as ASCII whitespace.
+            let ch = text[i..]
+                .chars()
+                .next()
+                .unwrap_or(char::REPLACEMENT_CHARACTER);
+            if !js_whitespace(ch) {
+                last = i + ch.len_utf8();
+            }
+            i += ch.len_utf8() - 1;
+        }
+        i += 1;
+    }
+    last
+}
+
+/// The number of lines of an `exec()` input that carry a statement, which is
+/// what workerd's `exec()` reports as its `count`: its client trims the input,
+/// splits it on newlines and sends each line as one query, so a line holding
+/// several statements counts once and a line holding none is never sent
+/// (#239).
+fn d1_exec_lines(input: &str) -> u64 {
+    js_trim(input)
+        .split('\n')
+        .filter(|line| d1_statement_end(line) > 0)
+        .count() as u64
+}
+
+// SQLite's own setter for `sqlite3_last_insert_rowid()`. The bindings Cello
+// builds against do not expose it (the generator skips that function), and it
+// is the only way to take Cello's own inserts back out of the value a D1
+// statement reports.
+extern "C" {
+    fn sqlite3_set_last_insert_rowid(database: *mut rusqlite::ffi::sqlite3, rowid: i64);
+}
+
+/// Start an application statement from the application's own row-id value.
+/// SQLite keeps `last_insert_rowid()` per connection, so a control-table write
+/// in between -- the alarm wake record, the actor name, the replica's own
+/// tables -- moves it; resetting first means the statement's own assignment is
+/// what the comparison in [`note_statement_row_id`] sees, even when a control
+/// table happened to assign the very rowid this statement will. SQLite never
+/// uses the value to assign rowids, so this changes no statement's behaviour.
+fn reset_statement_row_id(scope: &str, connection: &Connection) {
+    let application = app_last_row_id(scope);
+    if connection.last_insert_rowid() != application {
+        // SAFETY: the connection is live for this call, and the setter only
+        // writes the handle's own field.
+        unsafe { sqlite3_set_last_insert_rowid(connection.handle(), application) };
+    }
+}
+
+/// The last row id an application statement assigned in `scope`, or 0 while
+/// nothing has. This rather than SQLite's own connection value: Cello's
+/// storage tables and the replica's control tables share the connection, and
+/// workerd's D1 database has neither (#239).
+fn app_last_row_id(scope: &str) -> i64 {
+    cells(|c| c.app_last_row_ids.borrow().get(scope).copied().unwrap_or(0))
+}
+
+/// Record what a statement assigned, when it assigned anything at all.
+/// SQLite leaves `last_insert_rowid()` untouched for a statement that inserts
+/// no row -- a read, a DDL, an `INSERT OR IGNORE` that conflicts -- and workerd
+/// reports the previous assignment for those, so only a move is taken.
+fn note_statement_row_id(scope: &str, connection: &Connection, before: i64) {
+    let after = connection.last_insert_rowid();
+    if after != before {
+        cells(|c| {
+            c.app_last_row_ids
+                .borrow_mut()
+                .insert(scope.to_string(), after);
+        });
+    }
+}
+
 /// The count and rows of an exec-style run over `source`. On success the
 /// whole source ran; the caller owns any surrounding transaction.
 unsafe fn d1_run_statements(
@@ -3515,6 +3655,8 @@ unsafe fn d1_run_statements(
         } else {
             0
         };
+        reset_statement_row_id(scope, connection);
+        let row_id_before = connection.last_insert_rowid();
         let stepped = d1_step_to_done(
             scope,
             database,
@@ -3528,6 +3670,7 @@ unsafe fn d1_run_statements(
         if let Some(over) = stepped.over {
             return Err(failure(over));
         }
+        note_statement_row_id(scope, connection, row_id_before);
         count += 1;
         if keep > 0 {
             results.push(D1Rows {
@@ -3557,6 +3700,8 @@ unsafe fn d1_run_prepared(
     let database = connection.handle();
     let started_in_transaction = rusqlite::ffi::sqlite3_get_autocommit(database) == 0;
     let changes_before = total_changes_for_handle(database);
+    reset_statement_row_id(scope, connection);
+    let row_id_before = connection.last_insert_rowid();
     let schema_before = d1_schema_version(connection);
     let mut statement = std::ptr::null_mut();
     let mut tail = std::ptr::null();
@@ -3628,11 +3773,8 @@ unsafe fn d1_run_prepared(
     // one that changed nothing, and workerd reports the delta (0 for DDL, for
     // `UPDATE ... WHERE 0`, and for a read).
     let changes = rows_written;
-    let last_row_id = if readonly {
-        0
-    } else {
-        connection.last_insert_rowid()
-    };
+    note_statement_row_id(scope, connection, row_id_before);
+    let last_row_id = app_last_row_id(scope);
     let changed_db =
         !readonly && (rows_written > 0 || d1_schema_version(connection) != schema_before);
     let duration = started.elapsed().as_secs_f64() * 1000.0;
@@ -4708,6 +4850,18 @@ pub fn d1_run(scope: &str, request: &D1Request) -> Result<D1Response, D1Failure>
         D1Request::Exec { sql, rows } => {
             let source = CString::new(sql.as_str())
                 .map_err(|error| d1_exec_error(format!("invalid SQL text: {error}")))?;
+            // What workerd's `exec()` reports as its count: one per input line
+            // that carries a statement, not one per statement SQLite ran --
+            // `exec("CREATE TABLE a (x); CREATE TABLE b (y)")` is one line and
+            // so counts once (#239). An input with no such line is refused
+            // before anything runs.
+            let count = d1_exec_lines(sql);
+            if count == 0 {
+                return Err(d1_exec_line(
+                    sql,
+                    d1_exec_error("No SQL statements detected."),
+                ));
+            }
             with(scope, |connection| {
                 // One transaction per exec, as upstream D1 runs it (verified
                 // against workerd's D1 under miniflare: a failing line rolls
@@ -4745,7 +4899,7 @@ pub fn d1_run(scope: &str, request: &D1Request) -> Result<D1Response, D1Failure>
                     }
                 });
                 match ran {
-                    Ok((count, results)) => {
+                    Ok((_, results)) => {
                         d1_transaction_control(
                             scope,
                             connection,
@@ -4918,17 +5072,85 @@ fn d1_plain_identifier(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// The bytes workerd's D1 would report as `size_after`: the file's live pages
+/// less the pages of objects a D1 database there never has.
+///
+/// workerd's D1 database is a Durable Object's SQLite file, and workerd
+/// creates its control tables (`_cf_KV`, `_cf_ALARM`, ...) only when a Durable
+/// Object first uses storage -- a D1 database never does, so a fresh one is
+/// the single schema page. Cello creates those tables on open and keeps the
+/// alarm wake record and the replica's control tables in the same file, so
+/// the raw page count reports 12 pages where workerd reports 1, and 11 pages
+/// more at every size (#239). `dbstat` (compiled into Cello's SQLite) names
+/// the btree that owns each page, so those objects are subtracted exactly
+/// rather than estimated: the numbers stay equal as the database grows.
 fn d1_database_size(connection: &Connection) -> u64 {
     without_sql_authorizer(connection, || {
-        connection
+        let page_size: u64 = connection
+            .query_row("SELECT page_size FROM pragma_page_size()", [], |row| {
+                row.get(0)
+            })
+            .unwrap_or(0);
+        let live: u64 = connection
             .query_row(
-                "SELECT (page_count - freelist_count) * page_size \
-                 FROM pragma_page_count(), pragma_freelist_count(), pragma_page_size()",
+                "SELECT page_count - freelist_count \
+                 FROM pragma_page_count(), pragma_freelist_count()",
                 [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        live.saturating_sub(d1_internal_pages(connection)) * page_size
+    })
+}
+
+/// The pages of Cello's own objects in a cell file: the storage control
+/// tables and their indexes, and the replica's control tables. `sqlite_schema`
+/// is not among them -- workerd's empty database has that page too.
+///
+/// Each lookup names one btree, which `dbstat` walks alone, so the cost is the
+/// control tables' own size rather than the database's.
+fn d1_internal_pages(connection: &Connection) -> u64 {
+    let Ok(mut statement) =
+        connection.prepare("SELECT name FROM sqlite_master WHERE type IN ('table','index')")
+    else {
+        return 0;
+    };
+    let mut names: Vec<String> = match statement.query_map([], |row| row.get::<_, String>(0)) {
+        Ok(rows) => rows.filter_map(Result::ok).collect(),
+        Err(_) => return 0,
+    };
+    drop(statement);
+    names.sort();
+    names.dedup();
+    let mut pages = 0;
+    for name in names {
+        if !d1_internal_object(&name) {
+            continue;
+        }
+        // `name = ?` restricts the scan to that btree (dbstat's own query
+        // plan), so a control table costs its pages and nothing else.
+        pages += connection
+            .query_row(
+                "SELECT COUNT(*) FROM dbstat WHERE name = ?1",
+                [&name],
                 |row| row.get::<_, u64>(0),
             )
-            .unwrap_or(0)
-    })
+            .unwrap_or(0);
+    }
+    pages
+}
+
+/// Whether `name` is one of Cello's own objects rather than the application's.
+/// The `_cf_` prefix is reserved for the storage control tables (the
+/// authorizer refuses it in application SQL), and their implicit primary-key
+/// indexes carry SQLite's `sqlite_autoindex__cf_` names.
+fn d1_internal_object(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.starts_with("_cf_")
+        || lower.starts_with("sqlite_autoindex__cf_")
+        || lower.starts_with("_litestream_")
+        || lower.starts_with("sqlite_autoindex__litestream_")
+        || cello_ltx::db::is_control_table(&lower)
 }
 
 /// The string-in, string-out wrapper the V8 op calls: `{ok: ...}` or
@@ -7231,6 +7453,194 @@ mod d1_export_tests {
         })
         .expect("db present");
         assert_eq!(count, 100);
+    }
+}
+
+#[cfg(test)]
+mod binding_leftovers_tests {
+    //! #239: what an `exec()` counts, and what a fresh D1 database reports as
+    //! `last_row_id` and `size_after`. The differential gate pins the same
+    //! answers against workerd; these pin the two rules directly, so a
+    //! regression names the rule it broke.
+    use super::d1_test_db::TestDb;
+    use super::*;
+
+    fn prepared(db: &TestDb, sql: &str) -> D1Meta {
+        match d1_run(
+            &db.scope,
+            &D1Request::Prepared {
+                sql: sql.to_string(),
+                params: Vec::new(),
+                first: false,
+            },
+        ) {
+            Ok(D1Response::Prepared(result)) => result.meta,
+            Ok(_) => panic!("a prepared statement answered the wrong shape"),
+            Err(failure) => panic!("{sql} failed: {}", failure.message),
+        }
+    }
+
+    fn exec_count(db: &TestDb, sql: &str) -> u64 {
+        match d1_run(
+            &db.scope,
+            &D1Request::Exec {
+                sql: sql.to_string(),
+                rows: false,
+            },
+        ) {
+            Ok(D1Response::Exec { count, .. }) => count,
+            Ok(_) => panic!("an exec answered the wrong shape"),
+            Err(failure) => panic!("exec failed: {}", failure.message),
+        }
+    }
+
+    fn exec_failure(db: &TestDb, sql: &str) -> String {
+        match d1_run(
+            &db.scope,
+            &D1Request::Exec {
+                sql: sql.to_string(),
+                rows: false,
+            },
+        ) {
+            Err(failure) => failure.message,
+            Ok(_) => panic!("{sql:?} should have failed"),
+        }
+    }
+
+    /// workerd's `exec()` counts input lines that carry a statement: a line
+    /// holding two statements counts once, and blank, whitespace, `;`-only and
+    /// comment-only lines are never sent at all.
+    #[test]
+    fn exec_counts_lines_that_carry_a_statement() {
+        let db = TestDb::open("exec-lines");
+        assert_eq!(
+            exec_count(&db, "CREATE TABLE one (x); CREATE TABLE two (y)"),
+            1
+        );
+        assert_eq!(exec_count(&db, "SELECT 1;\nSELECT 2"), 2);
+        assert_eq!(exec_count(&db, "SELECT 1;\n\nSELECT 2"), 2);
+        assert_eq!(exec_count(&db, "SELECT 1;\n   \nSELECT 2"), 2);
+        assert_eq!(exec_count(&db, "SELECT 1;\n-- nothing\nSELECT 2"), 2);
+        assert_eq!(exec_count(&db, "SELECT 1;\n/* nothing */\nSELECT 2"), 2);
+        assert_eq!(exec_count(&db, "SELECT 1;\n;\nSELECT 2"), 2);
+        assert_eq!(exec_count(&db, "\n\n  SELECT 1  \n\n"), 1);
+        assert_eq!(exec_count(&db, "SELECT 1;\r\nSELECT 2"), 2);
+        assert_eq!(
+            exec_failure(&db, ";"),
+            "Error in line 1: ;: No SQL statements detected."
+        );
+        assert_eq!(
+            exec_failure(&db, "-- nothing\n/* nor this */"),
+            "Error in line 1: -- nothing: No SQL statements detected."
+        );
+    }
+
+    /// The scan itself, character by character: quotes and comments hold text
+    /// that is not a statement separator, and an unterminated quote is text
+    /// the parser will refuse rather than an empty line.
+    #[test]
+    fn a_line_ends_at_its_last_statement() {
+        assert_eq!(d1_statement_end(""), 0);
+        assert_eq!(d1_statement_end("  \t;"), 0);
+        assert_eq!(d1_statement_end("-- comment"), 0);
+        assert_eq!(d1_statement_end("/* comment */"), 0);
+        assert_eq!(d1_statement_end("SELECT 1 ;;"), 8);
+        assert_eq!(d1_statement_end("SELECT ';'"), 10);
+        assert_eq!(d1_statement_end("SELECT \";\""), 10);
+        assert_eq!(d1_statement_end("SELECT `;`"), 10);
+        assert_eq!(d1_statement_end("SELECT [;]"), 10);
+        assert_eq!(d1_statement_end("SELECT 1 -- trailing"), 8);
+        assert_eq!(d1_statement_end("SELECT 1 /* trailing */"), 8);
+        // An unterminated quote makes the whole text one statement, which then
+        // fails to parse: workerd's answer for `SELECT 'x` too.
+        assert_eq!(d1_statement_end("SELECT 'x"), 9);
+        assert_eq!(d1_exec_lines("SELECT 'x"), 1);
+    }
+
+    /// A fresh database reports the application's own row id: 0 for a DDL, the
+    /// first insert's rowid, and the same value again for a read -- never the
+    /// row Cello's own alarm wake record inserts when the cell opens.
+    #[test]
+    fn a_fresh_database_reports_the_applications_row_id() {
+        let db = TestDb::open("fresh-row-id");
+        let read = prepared(&db, "SELECT 1 AS one");
+        assert_eq!(read.last_row_id, 0);
+        assert_eq!(read.size_after, 4096);
+        let created = prepared(&db, "CREATE TABLE f (id INTEGER PRIMARY KEY, v TEXT)");
+        assert_eq!(created.last_row_id, 0);
+        assert!(created.changed_db);
+        assert_eq!(created.changes, 0);
+        assert_eq!(created.size_after, 8192);
+        let inserted = prepared(&db, "INSERT INTO f (v) VALUES ('a')");
+        assert_eq!(inserted.last_row_id, 1);
+        let read_back = prepared(&db, "SELECT * FROM f");
+        assert_eq!(read_back.last_row_id, 1);
+        assert_eq!(read_back.changes, 0);
+        assert!(!read_back.changed_db);
+        // An exec() assigns like any other write.
+        db.exec("INSERT INTO f (v) VALUES ('b')");
+        assert_eq!(prepared(&db, "SELECT * FROM f").last_row_id, 2);
+        assert_eq!(
+            prepared(&db, "INSERT INTO f (v) VALUES ('c')").last_row_id,
+            3
+        );
+    }
+
+    /// `size_after` is the database workerd would have: the file's live pages
+    /// without Cello's control tables (`_cf_KV`, the alarm wake record, the
+    /// replica's own), which a D1 database there never carries. The raw file
+    /// is 11 pages larger at every size, so the subtraction has to hold as the
+    /// database grows, not only when empty.
+    #[test]
+    fn size_after_leaves_out_cellos_own_objects() {
+        let db = TestDb::open("fresh-size");
+        let (live, page_size, internal) = with(&db.scope, |connection| {
+            without_sql_authorizer(connection, || {
+                let live: u64 = connection
+                    .query_row(
+                        "SELECT page_count - freelist_count FROM pragma_page_count(), \
+                         pragma_freelist_count()",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .expect("live pages");
+                let page_size: u64 = connection
+                    .query_row("SELECT page_size FROM pragma_page_size()", [], |row| {
+                        row.get(0)
+                    })
+                    .expect("page size");
+                (live, page_size, d1_internal_pages(connection))
+            })
+        })
+        .expect("db open");
+        // The four storage control tables and their three implicit indexes
+        // (the facets table is WITHOUT ROWID). A replicated cell -- a `cello
+        // dev` node, which the gate drives -- adds the alarm wake record and
+        // the replica's own two tables, for 11.
+        assert_eq!(internal, 7, "the control tables and their indexes");
+        assert!(d1_internal_object("_cf_KV"));
+        assert!(d1_internal_object("sqlite_autoindex__cf_KV_1"));
+        assert!(d1_internal_object("_litestream_seq"));
+        assert!(!d1_internal_object("sqlite_schema"));
+        assert!(!d1_internal_object("app_table"));
+
+        let read = prepared(&db, "SELECT 1 AS one");
+        assert_eq!(read.size_after, (live - internal) * page_size);
+        assert_eq!(read.size_after, 4096);
+
+        prepared(&db, "CREATE TABLE g (id INTEGER PRIMARY KEY, v TEXT)");
+        assert_eq!(prepared(&db, "SELECT 1 AS one").size_after, 8192);
+
+        db.exec(
+            "INSERT INTO g (v) SELECT hex(randomblob(200)) FROM \
+             (WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 300) \
+              SELECT i FROM n)",
+        );
+        let grown = prepared(&db, "SELECT COUNT(*) AS n FROM g");
+        // The file grew by the pages the rows needed; none of the growth is
+        // Cello's.
+        assert!(grown.size_after > 12288);
+        assert_eq!(grown.size_after % page_size, 0, "a whole number of pages");
     }
 }
 
