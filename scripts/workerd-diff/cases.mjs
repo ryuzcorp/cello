@@ -177,11 +177,24 @@ export const cases = [
     "/storage-surface", "/stub-surface",
     // #256: the state's prototype carries only workerd's members.
     "/state-surface",
+    // #261: argument refusal and nested-block scheduling.
+    "/block-refusals", "/nested-block-order",
   ].map((path) => ({
     name: `do${path}`,
     fixture: "do",
     path,
   })),
+  // #261: the section outlives the guest's promise, so the nested block that
+  // a response left running still writes, and a second event's block waits
+  // behind it before it reads.
+  {
+    name: "do/nested-block-drain",
+    fixture: "do",
+    requests: [
+      { path: "/nested-block-post-response" },
+      { path: "/nested-block-after-response" },
+    ],
+  },
   { name: "ws-pair", fixture: "ws", path: "/pair" },
   { name: "ws-upgrade", fixture: "ws", websocket: "/ws" },
   { name: "ws-hibernation", fixture: "ws-hib", websocket: { path: "/ws", close: false } },

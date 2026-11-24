@@ -740,6 +740,112 @@ export class Probe {
       async "/storage-sync"() {
         return report(await attempt(async () => typeof await this.state.storage.sync()));
       },
+      // #261: the section outlives the promise the guest holds, so a nested
+      // block still runs after the response -- and can still write -- and the
+      // gate releases only once it has. The second request takes a fresh
+      // block, which queues behind that section, and only then reads what the
+      // nested body wrote, so the pair is ordered without a timer.
+      async "/nested-block-post-response"() {
+        const log = [];
+        await this.state.blockConcurrencyWhile(() => {
+          log.push("outer-body");
+          this.state.blockConcurrencyWhile(async () => {
+            log.push("inner-body");
+            await this.state.storage.put("post-response-inner", "ran");
+            log.push("inner-wrote");
+          });
+          log.push("outer-returned");
+          return "outer-value";
+        });
+        log.push("outer-awaited");
+        return report({ log });
+      },
+      async "/nested-block-after-response"() {
+        const log = [];
+        log.push("block:" + await this.state.blockConcurrencyWhile(() => "ran"));
+        log.push("inner:" + ((await this.state.storage.get("post-response-inner")) ?? "missing"));
+        return report({ log });
+      },
+      // #261: `blockConcurrencyWhile` converts its argument as WebIDL
+      // `Function` before it touches the gate, and a non-function is refused
+      // by rejecting the promise the member answered -- the caller keeps
+      // running -- with WebIDL's message naming the member and the class. A
+      // refused section holds nothing, so a real block after five refusals
+      // still runs.
+      async "/block-refusals"() {
+        const refusal = async (value) => {
+          const log = [];
+          let promise;
+          try {
+            promise = this.state.blockConcurrencyWhile(value);
+            log.push("returned:" + Object.prototype.toString.call(promise));
+          } catch (error) {
+            log.push({ threw: errorInfo(error) });
+            return log;
+          }
+          log.push(await attempt(() => promise));
+          log.push("after");
+          return log;
+        };
+        const out = {
+          number: await refusal(5),
+          string: await refusal("x"),
+          object: await refusal({}),
+          null: await refusal(null),
+          undefined: await refusal(undefined),
+        };
+        out.noArgument = await attempt(async () => {
+          await this.state.blockConcurrencyWhile();
+        });
+        out.realBlock = await attempt(() => this.state.blockConcurrencyWhile(() => "ran"));
+        return report(out);
+      },
+      // #261: a nested block opens its section at the call, but workerd
+      // invokes the callback on a later turn: after the calling body's
+      // microtasks, and after the promise the enclosing block answered has
+      // settled and run its reactions. The `deep` log pins the same schedule
+      // one level down, where each level's callback waits for the one above.
+      async "/nested-block-order"() {
+        const order = [];
+        let innerPromise;
+        const outerPromise = this.state.blockConcurrencyWhile(() => {
+          order.push("outer-body");
+          Promise.resolve().then(() => order.push("mt-in-outer"));
+          innerPromise = this.state.blockConcurrencyWhile(() => {
+            order.push("inner-body");
+            Promise.resolve().then(() => order.push("mt-in-inner"));
+            return "inner-value";
+          });
+          order.push("inner-returned:" + Object.prototype.toString.call(innerPromise));
+          innerPromise.then((value) => order.push("inner-then:" + value));
+          order.push("inner-then-attached");
+          return "outer-value";
+        });
+        order.push("outer-returned:" + Object.prototype.toString.call(outerPromise));
+        outerPromise.then((value) => order.push("outer-then:" + value));
+        order.push("outer-then-attached");
+        await outerPromise;
+        order.push("outer-awaited");
+
+        const deep = [];
+        const d0 = this.state.blockConcurrencyWhile(() => {
+          deep.push("d0-body");
+          const d1 = this.state.blockConcurrencyWhile(() => {
+            deep.push("d1-body");
+            this.state.blockConcurrencyWhile(() => { deep.push("d2-body"); return "d2"; })
+              .then(() => deep.push("d2-then"));
+            deep.push("d1-inner-returned");
+            return "d1";
+          });
+          d1.then(() => deep.push("d1-then"));
+          deep.push("d0-inner-returned");
+          return "d0";
+        });
+        d0.then(() => deep.push("d0-then"));
+        await d0;
+        deep.push("d0-awaited");
+        return report({ order, deep });
+      },
       async "/state-surface"() {
         // #256: workerd's `DurableObjectState` publishes only its documented
         // members, all enumerable, and no host-internal name at all. Cello

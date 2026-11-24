@@ -4136,6 +4136,11 @@ class Container {
     return Promise.reject(new Error("interceptOutboundTcp() is not implemented in cello"));
   }
 }
+// How long a `blockConcurrencyWhile` body may run before the block is
+// cancelled and the object reset: workerd's 30 s. `CELLO_TEST_WAIT=1` takes
+// the value from `CELLO_TEST_BLOCK_LIMIT_MS` instead, so the conformance
+// suite reaches a timeout without waiting one out.
+const __blockLimitMs = __test_wait_enabled() ? __test_block_limit_ms() : 30_000;
 // The state's parts the runtime reaches from outside the class. A static
 // private method cannot be named outside the class and a static block is the
 // one place that may hand it out, so these three closures are the runtime's
@@ -4212,8 +4217,15 @@ class DurableObjectState {
   // guest cannot name a private method, so only `blockConcurrencyWhile` and
   // the runtime's closures above reach it (#256).
   #blockConcurrencyWhile(f) {
+    // workerd converts the argument as WebIDL `Function` before anything
+    // else, and refuses a non-function by rejecting, not by throwing: the
+    // caller keeps running and the promise it got back carries the refusal
+    // (#261). The message is WebIDL's own, naming the member and the class.
     if (typeof f !== "function")
-      throw new TypeError("blockConcurrencyWhile() requires a function");
+      return Promise.reject(new TypeError(
+        "Failed to execute 'blockConcurrencyWhile' on 'DurableObjectState': " +
+        "parameter 1 is not of type 'function'.",
+      ));
     if (this._blockDepth >= 64)
       throw new Error(
         "blockConcurrencyWhile() calls are nested too deeply.",
@@ -4236,7 +4248,10 @@ class DurableObjectState {
       // block that fails resets the object as any block does, and the outer
       // release must carry that failure, or the waiters would be admitted to
       // an object that no longer exists: the drain records it.
-      const nested = this.#runConcurrencyBlock(f);
+      //
+      // The section opens here but workerd invokes the callback on a later
+      // turn, never inside the call that made it (#261).
+      const nested = this.#scheduleConcurrencyBlock(f);
       (this._nestedBlocks ||= []).push(nested.then(() => null, __describeFailure));
       return nested;
     }
@@ -4267,6 +4282,17 @@ class DurableObjectState {
     if (owner === "") return acquired;
     const event = Number(eventText);
     const { block, record } = __blockEnter(this._scope, event, owner);
+    // The promise the caller holds settles when the block's body settles, as
+    // workerd's does. The section around it -- the drain of nested blocks and
+    // the release -- outlives it, and that is what a nested block's callback
+    // waits for: it runs after the enclosing promise has settled and its
+    // reactions have run (#261).
+    let settleGuest;
+    let rejectGuest;
+    const guest = new Promise((resolve, reject) => {
+      settleGuest = resolve;
+      rejectGuest = reject;
+    });
     const next = (async () => {
       try {
         await acquired;
@@ -4275,6 +4301,7 @@ class DurableObjectState {
         // ticket, but the retired callback must not run.
         if (record.retired) {
           __gate_release(this._scope, event, owner, null);
+          settleGuest(undefined);
           return;
         }
         block.holder = event;
@@ -4284,32 +4311,46 @@ class DurableObjectState {
         // failure rides with the release for that: waiters are woken with it
         // instead of merely woken.
         let failure = null;
+        let value;
+        let thrown = null;
         try {
-          return await this.#runConcurrencyBlock(f);
+          value = await this.#runConcurrencyBlock(f);
         } catch (error) {
+          thrown = error;
           failure = __describeFailure(error);
-          throw error;
-        } finally {
-          // Nested blocks are drained only after a body that returned: a
-          // body that failed has reset the object, its waiters are refused
-          // whatever the nested blocks do, and waiting for them would only
-          // delay the refusal and a transaction's rollback behind it. Each
-          // nested block has its own limit, so a drain is bounded by the
-          // last one started, as workerd's nested critical sections are.
-          while (failure === null && this._nestedBlocks && this._nestedBlocks.length > 0) {
-            for (const nestedFailure of await Promise.all(this._nestedBlocks.splice(0))) {
-              if (nestedFailure !== null && failure === null) failure = nestedFailure;
-            }
-          }
-          this._nestedBlocks = undefined;
-          __gate_release(this._scope, event, owner, failure);
         }
+        if (thrown === null) settleGuest(value);
+        else rejectGuest(thrown);
+        // Nested blocks are drained only after a body that returned: a
+        // body that failed has reset the object, its waiters are refused
+        // whatever the nested blocks do, and waiting for them would only
+        // delay the refusal and a transaction's rollback behind it. Each
+        // nested block has its own limit, so a drain is bounded by the
+        // last one started, as workerd's nested critical sections are.
+        while (failure === null && this._nestedBlocks && this._nestedBlocks.length > 0) {
+          for (const nestedFailure of await Promise.all(this._nestedBlocks.splice(0))) {
+            if (nestedFailure !== null && failure === null) failure = nestedFailure;
+          }
+        }
+        this._nestedBlocks = undefined;
+        __gate_release(this._scope, event, owner, failure);
+        if (thrown !== null) throw thrown;
+        return value;
+      } catch (error) {
+        // A block that never reached its body -- the acquisition refused, or
+        // the block ahead failed -- rejects the caller's promise too.
+        rejectGuest(error);
+        throw error;
       } finally {
         // Also on a rejected `acquired`: the block ahead failed, this one
         // never ran, and the cell must not stay shut on its behalf.
         __blockLeave(this._scope, block, event);
       }
     })();
+    // The section's own rejection is the readiness answer; the caller's copy
+    // is kept handled here, as it was when the two were one promise, so a
+    // guest that ignores the promise sees no unhandled rejection.
+    guest.catch(() => {});
     // `__stateReady` awaits this. The host gate stops *other* events, but a
     // block taken in the constructor runs inside the very event that is
     // being delivered, so nothing external can hold that event back -- the
@@ -4321,10 +4362,25 @@ class DurableObjectState {
     // reaches `__stateReady`.
     this._gate.catch(() => {});
     next.then(record.settleReady, record.rejectReady);
-    return next;
+    return guest;
   }
   #runConcurrencyBlock(f) {
     this._blockDepth++;
+    return this.#startConcurrencyBlock(f);
+  }
+  // A nested block's section is open from the call, so a block a body started
+  // from it counts as nested too, but the callback itself starts on a later
+  // turn: workerd's nested critical section is entered by the enclosing
+  // one's turn order, not by the caller's (#261). Rising above the caller's
+  // microtasks is what a guest can see, and it is what keeps a body that
+  // awaits its own nested block from running that block inside the call.
+  #scheduleConcurrencyBlock(f) {
+    this._blockDepth++;
+    return __block_turn().then(() => this.#startConcurrencyBlock(f));
+  }
+  // The body and the limit around it. A synchronous throw resets the object
+  // and rejects, as a body that throws any other way does.
+  #startConcurrencyBlock(f) {
     let result;
     try {
       result = f();
@@ -4337,7 +4393,7 @@ class DurableObjectState {
     let settled = false;
     const timeout = __op_timer(
       timerId,
-      30_000,
+      __blockLimitMs,
     ).then(() => {
       if (!settled) {
         throw new Error(

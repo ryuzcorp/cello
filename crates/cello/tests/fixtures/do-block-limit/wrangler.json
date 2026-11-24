@@ -1,0 +1,8 @@
+{
+  "name": "do-block-limit",
+  "main": "worker.js",
+  "compatibility_date": "2026-01-01",
+  "no_bundle": true,
+  "durable_objects": { "bindings": [{ "name": "HOLDER", "class_name": "Holder" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Holder"] }]
+}

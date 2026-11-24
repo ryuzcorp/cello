@@ -8269,6 +8269,7 @@ ops! { OP_NAMES, install_op_functions,
         "__stub_handoff" => op_stub_handoff,
         "__test_stub_stats_enabled" => op_test_stub_stats_enabled,
         "__test_wait_enabled" => op_test_wait_enabled,
+        "__test_block_limit_ms" => op_test_block_limit_ms,
         "__testwait_await" => op_testwait_await,
         "__testwait_fire" => op_testwait_fire,
         "__testexec_attach" => container::op_testexec_attach,
@@ -8323,6 +8324,7 @@ ops! { OP_NAMES, install_op_functions,
         "__with_input_gate_context" => op_with_input_gate_context,
         "__gate_acquire" => op_gate_acquire,
         "__gate_wait" => op_gate_wait,
+        "__block_turn" => op_block_turn,
         "__gate_release" => op_gate_release,
         "__timer_cancel" => op_timer_cancel,
         "__crypto_operation" => crypto::op_crypto_operation,
@@ -10557,6 +10559,35 @@ fn op_test_wait_enabled(
     rv.set(v8::Boolean::new(scope, test_wait_enabled()).into());
 }
 
+/// How long a `blockConcurrencyWhile` body may run: workerd's 30 s. The
+/// conformance suite shortens it to reach a timeout without waiting one
+/// out, and that knob exists only with `CELLO_TEST_WAIT=1`.
+fn block_limit_ms() -> u64 {
+    if !test_wait_enabled() {
+        return 30_000;
+    }
+    std::env::var("CELLO_TEST_BLOCK_LIMIT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| (1..=30_000).contains(value))
+        .unwrap_or(30_000)
+}
+
+/// `__test_block_limit_ms()` -> number; how long a `blockConcurrencyWhile`
+/// body may run before it is cancelled and the object reset. Throws unless
+/// `CELLO_TEST_WAIT=1`, like every other test seam, so a shipping node
+/// answers only workerd's 30 s.
+fn op_test_block_limit_ms(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    if !test_wait_enabled() {
+        return loader_throw(scope, "test block limits are disabled on this node");
+    }
+    rv.set(v8::Number::new(scope, block_limit_ms() as f64).into());
+}
+
 /// `__testwait_await(id)` -> Promise<string>; subscribe to one test-only
 /// retained wait, resolving with its fired value. Unrefed like the
 /// container exec wait it stands in for: the subscription belongs to
@@ -12187,6 +12218,22 @@ fn op_gate_wait(
             }
         }
     });
+    rv.set(promise_for(scope, id));
+}
+
+/// `__block_turn()` — settle on a later turn of this event's driver.
+///
+/// A nested `blockConcurrencyWhile` opens its section at the call, but
+/// workerd invokes the callback on a later turn, after the calling body's
+/// turn has drained its microtasks (#261). The harness starts the body from
+/// a reaction to this promise, which is delivered like every other op the
+/// event owns: one turn later, once that drain is over.
+fn op_block_turn(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let id = asyncrt::enqueue(async move { Ok(String::new()) });
     rv.set(promise_for(scope, id));
 }
 
