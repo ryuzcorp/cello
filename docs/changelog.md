@@ -17,10 +17,11 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
   while an old `0` is not, and integer and text predicates each see only their
   own rows. Pin `no_sql_boolean_text`, or rewrite the column with
   `UPDATE t SET flag = CASE flag WHEN 1 THEN 'true' WHEN 0 THEN 'false' ELSE
-  flag END` before bumping; the [Durable
-  Objects](../services/durable-objects.md#boolean-binds) page has the details,
-  and `tests/do_sql_boolean_compat.rs` runs the whole migration against a real
-  cell.
+  flag END` before bumping, then once more after the new version owns the
+  cell, because the old version keeps writing INTEGER until the takeover. The
+  [Durable Objects](../services/durable-objects.md#boolean-binds) page has the
+  details, and `tests/do_sql_boolean_compat.rs` runs the whole migration
+  against a real cell.
 - **A Durable Object handler failure keeps its shape across nodes (#226).** A
   `stub.fetch()` whose handler throws on another node now rejects with the
   value the handler threw, exactly as a local owner does: an `Error` subclass
