@@ -4,6 +4,26 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
 ---
 ## Unreleased
 
+- **A throw, the 64-level limit or the 30 s limit in
+  `blockConcurrencyWhile` breaks the event the way workerd breaks it
+  (#267).** A body that throws or rejects -- top-level or nested -- used to
+  hand the caller a catchable rejection while the event carried on; on
+  workerd every one of those, the nesting limit and the 30 s limit break the
+  event (500 `Internal Server Error`), reset the object and hand the stub
+  caller the value the block threw, exactly as an uncaught handler
+  exception crosses. Cello now terminates the executing cell instead of
+  letting a `catch` around the block run, so the stub call rejects with the
+  block's error carrying its name and message. A stub that observed an
+  aborted object stays broken for later calls, while a fresh stub to the
+  reset object works, as on workerd. The event's answer now waits for the
+  critical sections it opened, so a block that fails after the handler
+  returned still fails the event. The deferred start of a nested block also
+  gives its reserved depth back when the turn is cancelled instead of
+  leaving it elevated. The differential gate gained three cases
+  (`do/block-fail-top`, `do/block-fail-nested`, `do/block-fail-limit`) that
+  fail before this change and every case agrees, and the block-limit
+  conformance test now asserts the 500 and the reset behind its
+  `CELLO_TEST_BLOCK_LIMIT_MS` seam.
 - **`writer.close()` across a same-turn readable cancel resolves on a
   compression stream, as Workerd does (#262).** With no `await` between a
   write, `close()` and `reader.cancel()`, both `close()` and `writer.closed`

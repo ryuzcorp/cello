@@ -425,6 +425,8 @@ pub struct FailedInTurn {
     /// failing event was a cell's and `settle` could read its name. It rides
     /// here because `source()` deliberately hides the wrapped error's type.
     handler: Option<CellHandlerError>,
+    /// The failure aborted the cell rather than only its event (#267).
+    aborted: bool,
     source: anyhow::Error,
 }
 
@@ -495,6 +497,25 @@ impl std::fmt::Display for CellHandlerError {
 
 impl std::error::Error for CellHandlerError {}
 
+/// A cell event that was aborted because a `blockConcurrencyWhile` body threw
+/// or its limit expired (#267).
+///
+/// workerd breaks the event, resets the object and hands the stub caller the
+/// value the block threw, exactly as it does for an uncaught handler
+/// exception. The cell cannot run its own continuation to produce that answer
+/// -- a `catch` around the block must not see it -- so the termination carries
+/// the value here and every boundary reads it like any handler exception.
+#[derive(Debug)]
+pub struct CellAbort(pub CellHandlerError);
+
+impl std::fmt::Display for CellAbort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0.message)
+    }
+}
+
+impl std::error::Error for CellAbort {}
+
 /// The cell handler exception an error carries, when it has one.
 ///
 /// A failure a peer owner reported carries one too: the caller rebuilds it as
@@ -503,12 +524,27 @@ pub fn cell_handler_error(error: &anyhow::Error) -> Option<&CellHandlerError> {
     if let Some(handler) = error.downcast_ref::<CellHandlerError>() {
         return Some(handler);
     }
+    if let Some(abort) = error.downcast_ref::<CellAbort>() {
+        return Some(&abort.0);
+    }
     if let Some(remote) = error.downcast_ref::<crate::peer_failure::RemoteHandlerFailure>() {
         return Some(&remote.0);
     }
     error
         .downcast_ref::<FailedInTurn>()
         .and_then(|failed| failed.handler.as_ref())
+}
+
+/// Whether the failure aborted the cell, so the caller's stub is finished with
+/// it -- workerd keeps a handle that observed an aborted object broken for the
+/// rest of its life, while an object that merely had a failed event revives.
+pub fn cell_aborted(error: &anyhow::Error) -> bool {
+    if error.downcast_ref::<CellAbort>().is_some() {
+        return true;
+    }
+    error
+        .downcast_ref::<FailedInTurn>()
+        .is_some_and(|failed| failed.aborted)
 }
 
 /// Attach the positions a failing handler's turn sampled, when it has either.
@@ -522,11 +558,13 @@ pub(crate) fn fail_in_turn_error(
     if write_position.is_none() && observed_position.is_none() {
         return error;
     }
-    let handler = error.downcast_ref::<CellHandlerError>().cloned();
+    let handler = cell_handler_error(&error).cloned();
+    let aborted = cell_aborted(&error);
     anyhow::Error::new(FailedInTurn {
         write_position,
         observed_position,
         handler,
+        aborted,
         source: error,
     })
 }

@@ -191,6 +191,17 @@ export const cases = [
     fixture: "do",
     path,
   })),
+  // #267: a throw, the 64-level limit or the 30 s limit in
+  // blockConcurrencyWhile breaks the event on workerd: the stub call rejects
+  // with the value the block threw, the object resets, and a handle that saw
+  // the abort stays broken while a fresh stub works. (The 30 s limit itself
+  // is pinned by the `do_block_limit_conformance` test behind
+  // `CELLO_TEST_BLOCK_LIMIT_MS`; no gate case can wait out workerd's 30 s.)
+  ...["/block-fail-top", "/block-fail-nested", "/block-fail-limit"].map((path) => ({
+    name: `do${path}`,
+    fixture: "do",
+    path,
+  })),
   // #261: the section outlives the guest's promise, so the nested block that
   // a response left running still writes, and a second event's block waits
   // behind it before it reads.

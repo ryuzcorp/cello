@@ -99,10 +99,19 @@ export class Thrower {
   }
 }
 
+// How many Probe objects this isolate built. A block failure resets the
+// object, so the next event runs on a fresh instance and the counter moves.
+// The count is read as a delta across the failing event, never as an
+// absolute number: earlier cases build different counts of objects on the
+// two runtimes.
+let instances = 0;
+
 export class Probe {
   constructor(state, env) {
     this.state = state;
     this.env = env;
+    // #267: the construction order pins the reset a block failure performs.
+    this.instance = ++instances;
   }
   async fetch(request) {
     const { pathname } = new URL(request.url);
@@ -846,6 +855,94 @@ export class Probe {
         deep.push("d0-awaited");
         return report({ order, deep });
       },
+      // #267: a throw or reject inside a top-level or nested block breaks
+      // the whole event on workerd (500 Internal Server Error), and the stub
+      // caller receives the value the block threw -- a `catch` around the
+      // block never runs. Each route catches where the old code would carry
+      // on, so old and new transcripts differ exactly where the behavior
+      // does: the old code answers 200 with what the catch saw, the new
+      // code never answers and the stub call rejects.
+      async "/block-fail-top"() {
+        try {
+          await this.state.blockConcurrencyWhile(() => { throw new Error("top-boom"); });
+          return report({ settled: "resolved" });
+        } catch (error) {
+          return report({ caught: errorInfo(error) });
+        }
+      },
+      async "/block-fail-reject"() {
+        try {
+          await this.state.blockConcurrencyWhile(async () => { throw new Error("top-boom"); });
+          return report({ settled: "resolved" });
+        } catch (error) {
+          return report({ caught: errorInfo(error) });
+        }
+      },
+      async "/block-fail-nested"() {
+        const outer = await this.state.blockConcurrencyWhile(async () => {
+          try {
+            await this.state.blockConcurrencyWhile(() => { throw new Error("inner-boom"); });
+            return "inner-resolved";
+          } catch (error) {
+            return `inner-caught:${error?.message ?? error}`;
+          }
+        });
+        return report({ outer });
+      },
+      async "/block-fail-unawaited"() {
+        const outer = await this.state.blockConcurrencyWhile(() => {
+          const inner = this.state.blockConcurrencyWhile(() => { throw new Error("inner-boom"); });
+          inner.catch(() => {});
+          return "outer-value";
+        });
+        return report({ outer });
+      },
+      async "/block-fail-depth2"() {
+        const d0 = await this.state.blockConcurrencyWhile(async () => {
+          try {
+            await this.state.blockConcurrencyWhile(async () => {
+              try {
+                await this.state.blockConcurrencyWhile(() => { throw new Error("d2-boom"); });
+                return "d2-resolved";
+              } catch (error) {
+                return `d2-caught:${error?.message ?? error}`;
+              }
+            });
+            return "d1-resolved";
+          } catch (error) {
+            return `d1-caught:${error?.message ?? error}`;
+          }
+        });
+        return report({ d0 });
+      },
+      async "/block-fail-limit"() {
+        const nest = (depth) => depth === 0 ? "bottom"
+          : this.state.blockConcurrencyWhile(() => nest(depth - 1));
+        try {
+          return report({ top: await nest(70) });
+        } catch (error) {
+          return report({ caught: errorInfo(error) });
+        }
+      },
+      async "/block-fail-kind-string"() {
+        try {
+          await this.state.blockConcurrencyWhile(() => { throw "plain string"; });
+          return report({ settled: "resolved" });
+        } catch (error) {
+          return report({ caught: errorInfo(error) });
+        }
+      },
+      async "/block-fail-kind-type"() {
+        try {
+          await this.state.blockConcurrencyWhile(() => { throw new TypeError("type-msg"); });
+          return report({ settled: "resolved" });
+        } catch (error) {
+          return report({ caught: errorInfo(error) });
+        }
+      },
+      async "/block-instance"() {
+        return report({ instance: this.instance });
+      },
       async "/state-surface"() {
         // #256: workerd's `DurableObjectState` publishes only its documented
         // members, all enumerable, and no host-internal name at all. Cello
@@ -1232,6 +1329,84 @@ const routes = {
       }, failure);
     }
     out.rpc = await attempt(async () => JSON.stringify(await stub.missing()));
+    return report(out);
+  },
+  // #267: a throw or reject in a block, the 64-level limit, and the thrown
+  // value shapes all break the event on workerd: the stub call rejects with
+  // the value the block threw, and the object resets. A handle that observed
+  // an aborted object stays broken, while a fresh stub to the reset object
+  // works. The reset reads as a counter delta, never an absolute number:
+  // earlier cases build different counts of objects on the two runtimes.
+  async "/block-fail-top"() {
+    const out = {};
+    const top = OBJ.getByName("block-fail-top");
+    const before = await (await top.fetch("https://do.test/block-instance")).json();
+    out.throw = await attempt(async () => {
+      const response = await top.fetch("https://do.test/block-fail-top");
+      return { status: response.status, body: await response.text() };
+    });
+    const revived = OBJ.getByName("block-fail-top");
+    const after = await (await revived.fetch("https://do.test/block-instance")).json();
+    // The failure reset the object: the next event runs on a fresh instance.
+    out.reset = after.instance - before.instance;
+    const reject = OBJ.getByName("block-fail-reject");
+    out.reject = await attempt(async () => {
+      const response = await reject.fetch("https://do.test/block-fail-reject");
+      return { status: response.status, body: await response.text() };
+    });
+    return report(out);
+  },
+  async "/block-fail-nested"() {
+    const out = {};
+    const nested = OBJ.getByName("block-fail-nested");
+    out.nested = await attempt(async () => {
+      const response = await nested.fetch("https://do.test/block-fail-nested");
+      return { status: response.status, body: await response.text() };
+    });
+    const unawaited = OBJ.getByName("block-fail-unawaited");
+    out.unawaited = await attempt(async () => {
+      const response = await unawaited.fetch("https://do.test/block-fail-unawaited");
+      return { status: response.status, body: await response.text() };
+    });
+    const depth2 = OBJ.getByName("block-fail-depth2");
+    out.depth2 = await attempt(async () => {
+      const response = await depth2.fetch("https://do.test/block-fail-depth2");
+      return { status: response.status, body: await response.text() };
+    });
+    const broken = OBJ.getByName("block-fail-broken");
+    const live = await (await broken.fetch("https://do.test/block-instance")).json();
+    out.first = await attempt(async () => {
+      const response = await broken.fetch("https://do.test/block-fail-top");
+      return { status: response.status, body: await response.text() };
+    });
+    out.second = await attempt(async () => {
+      const response = await broken.fetch("https://do.test/block-instance");
+      return { status: response.status, body: await response.text() };
+    });
+    const fresh = OBJ.getByName("block-fail-broken");
+    const revived = await (await fresh.fetch("https://do.test/block-instance")).json();
+    // The failure reset the object, so a fresh stub runs on a new instance;
+    // the broken stub above keeps rejecting with the abort instead.
+    out.revived = revived.instance - live.instance;
+    return report(out);
+  },
+  async "/block-fail-limit"() {
+    const out = {};
+    const limit = OBJ.getByName("block-fail-limit");
+    out.limit = await attempt(async () => {
+      const response = await limit.fetch("https://do.test/block-fail-limit");
+      return { status: response.status, body: await response.text() };
+    });
+    const string = OBJ.getByName("block-fail-kind-string");
+    out.string = await attempt(async () => {
+      const response = await string.fetch("https://do.test/block-fail-kind-string");
+      return { status: response.status, body: await response.text() };
+    });
+    const type = OBJ.getByName("block-fail-kind-type");
+    out.type = await attempt(async () => {
+      const response = await type.fetch("https://do.test/block-fail-kind-type");
+      return { status: response.status, body: await response.text() };
+    });
     return report(out);
   },
   async "/ids"() {

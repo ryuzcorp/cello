@@ -4360,7 +4360,14 @@ class DurableObjectState {
       // The section opens here but workerd invokes the callback on a later
       // turn, never inside the call that made it (#261).
       const nested = this.#scheduleConcurrencyBlock(f);
-      (this._nestedBlocks ||= []).push(nested.then(() => null, __describeFailure));
+      // A body that failed reset the object and rides with the release. A
+      // block whose deferred turn was cancelled never ran, so it has no
+      // failure to carry and must not refuse the section's waiters the way a
+      // reset does (#267).
+      (this._nestedBlocks ||= []).push(nested.then(
+        () => null,
+        (error) => this._aborted ? __describeFailure(error) : null,
+      ));
       return nested;
     }
     // The host owns the gate (cello_logic::gate::InputGate). It replaces a
@@ -4470,6 +4477,11 @@ class DurableObjectState {
     // reaches `__stateReady`.
     this._gate.catch(() => {});
     next.then(record.settleReady, record.rejectReady);
+    // The event's answer waits for this section (#267). A nested block rides
+    // the section above it, so one promise per top-level block is the whole
+    // set: `next` settles after the drain and the gate release.
+    const actorEvent = __currentActorEvent();
+    if (actorEvent !== undefined) actorEvent.sections.push(next);
     return guest;
   }
   #runConcurrencyBlock(f) {
@@ -4484,7 +4496,14 @@ class DurableObjectState {
   // awaits its own nested block from running that block inside the call.
   #scheduleConcurrencyBlock(f) {
     this._blockDepth++;
-    return __block_turn().then(() => this.#startConcurrencyBlock(f));
+    return __block_turn().then(() => this.#startConcurrencyBlock(f), (error) => {
+      // The deferred turn never arrived -- the event ended and its ops were
+      // rejected -- so the body never ran and the depth its section reserved
+      // must come back (#267). Left behind, it makes the next block read as
+      // nested and ride a hold nobody took.
+      this._blockDepth--;
+      throw error;
+    });
   }
   // The body and the limit around it. A synchronous throw resets the object
   // and rejects, as a body that throws any other way does.
@@ -4540,12 +4559,19 @@ class DurableObjectState {
     const instance = __cell.instances[this._scope];
     if (instance && instance.__celloState === this)
       delete __cell.instances[this._scope];
-    // Under a stub-mediated caller (this scope is not the current
-    // event) the failure breaks the actor, as Workerd joins it
-    // into the on-abort promise; a direct event keeps reset-only
-    // semantics -- its caller sees the rejection itself.
-    if (__currentActorScope() !== this._scope)
-      __actorBreak(this._scope, error);
+    // workerd does not hand a block's failure to the code that called it:
+    // the event is broken, so a `catch` around the block never runs, and the
+    // stub caller receives the value the block threw (#267). Terminating the
+    // executing cell is the only way to stop its continuation.
+    if (__currentActorScope() === this._scope) {
+      __actor_fail(this._scope, error);
+      return;
+    }
+    // A block that failed while this scope was not the executing cell -- a
+    // stale reaction, or one a previous event started -- cannot break an
+    // event. It breaks the actor, as Workerd joins it into the on-abort
+    // promise.
+    __actorBreak(this._scope, error);
   }
   abort(reason) {
     if (this._aborted) return;
@@ -4715,9 +4741,26 @@ const __currentActorScope = () => __currentActorEvent()?.scope ?? "";
 const __beginActorEvent = (scope) => {
   __rpcSignalRefresh();
   __refreshRetainedWaits(scope);
-  const event = { scope, context: String(__io_context_id()) };
+  // `sections` is every critical section this event opened. workerd does not
+  // answer an event until they have drained: a block that fails afterwards
+  // fails the event, not just the object, so the answer waits (#267).
+  const event = { scope, context: String(__io_context_id()), sections: [] };
   __actorEventStack.push(event);
   return event;
+};
+// Wait out the sections an event opened, then let the answer go. A section
+// never started (its deferred turn was cancelled) answers like a drained one:
+// there is nothing left to wait for, and it must not fail the event.
+const __awaitActorSections = async (actorEvent) => {
+  const sections = actorEvent.sections;
+  while (sections.length > 0) {
+    try {
+      await sections.shift();
+    } catch {
+      // The section failed. It aborted the cell, so the host already carries
+      // the failure and the answer this event would produce is gone.
+    }
+  }
 };
 const __endActorEvent = (event) => {
   const index = __actorEventStack.lastIndexOf(event);
@@ -8596,8 +8639,16 @@ class DurableObjectNamespace {
         // The host answers a handler exception with a marked body instead of
         // a failed transport, so the caller rejects with the handler's own
         // error (name and message) rather than a host-formatted string.
-        if (r.__celloCellError !== undefined)
-          throw __cellHandlerThrow(r.__celloCellError);
+        if (r.__celloCellError !== undefined) {
+          const failure = __cellHandlerThrow(r.__celloCellError);
+          // An aborted object is not one that merely failed an event: workerd
+          // keeps this handle broken and answers every later call with the
+          // failure, while a handler exception leaves the next call working.
+          if (r.__celloCellError.aborted === true)
+            brokenReason = failure && failure.message !== undefined
+              ? String(failure.message) : String(failure);
+          throw failure;
+        }
         const body = __hostReplyBody(r.status, r);
         // An upgrade the cell answered with. The pair straddles two isolates,
         // so the client end cannot be the peer object itself -- it is a new
@@ -8758,6 +8809,11 @@ const __dispatchTo = __cello.__dispatchTo = async (
     // __do_call_cancel/__abortIncomingRequest, which aborts the fresh incoming
     // signal made above; the host dispatcher passes no caller signal here.
     const response = await dispatch;
+    // #267: an event is not finished when its handler answers. The answer
+    // waits for the critical sections this event opened, so a block that
+    // fails after the handler returned fails the event instead of leaving a
+    // caller with a response the object no longer stands behind.
+    await __awaitActorSections(actorEvent);
     // Not wrapped: the host holds this response and gates it, and the caller
     // that would cancel the body reaches it through the routed channel's own
     // controller rather than this one.
@@ -8897,13 +8953,15 @@ __cello.__dispatchRpc = async (scope, method, args, trusted) => {
       // A string is the legacy JSON flavor; bytes are V8 structured clone.
       // Answer in kind.
       if (typeof args === "string") {
-        return await __ctxRun(ctxId, async () => {
+        const answer = await __ctxRun(ctxId, async () => {
           const [inst, fn] = await resolve(scope, method);
           const result = await fn.apply(inst, JSON.parse(args));
           return JSON.stringify(result) ?? "null";
         });
+        await __awaitActorSections(actorEvent);
+        return answer;
       }
-      return await __ctxRun(ctxId, () => (async () => {
+      const answer = await __ctxRun(ctxId, () => (async () => {
         const decoded = __rpcDesArgs(args);
         try {
           return await __rpcRun(async () => {
@@ -8920,6 +8978,8 @@ __cello.__dispatchRpc = async (scope, method, args, trusted) => {
           __disposeReceived(decoded.received);
         }
       })());
+      await __awaitActorSections(actorEvent);
+      return answer;
     } finally {
       __ctxEnd(ctxId);
     }
@@ -8988,6 +9048,7 @@ __cello.__dispatchStubOp = async (scope, hostId, path, args) => {
           return __rpcErrOut(aborted instanceof __ActorAbort
             ? aborted.reason : aborted);
       }
+      await __awaitActorSections(actorEvent);
       return reply;
     };
     // Race the op against its hosting context's abort, as `__stubOp`
