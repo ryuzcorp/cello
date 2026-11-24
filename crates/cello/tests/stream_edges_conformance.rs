@@ -251,12 +251,47 @@ async function decompressionCloseAfterError() {
   check("compression round trip decodes", (await compressed) === 23, "unexpected compressed length");
 }
 
+// A readable cancel followed by an abort with the write still in flight: the
+// abort is recorded while the stream is already erroring, so it stores no
+// reason of its own. Settling the write must not overwrite the stored error
+// with `undefined` (#230 review; workerd answers the abort reason, base Cello
+// and this patch answer the cancel reason, and neither ever loses it).
+const rejection = (promise) =>
+  promise.then(
+    () => "resolved",
+    (error) =>
+      error === undefined
+        ? "undefined"
+        : typeof error === "string"
+          ? `string:${error}`
+          : errorOf(error).message,
+  );
+
+async function compressionCancelThenAbort() {
+  const stream = new CompressionStream("gzip");
+  const writer = stream.writable.getWriter();
+  const reader = stream.readable.getReader();
+  reader.read().catch(() => {});
+  await null;
+  const write = settles(writer.write(new TextEncoder().encode("payload")));
+  const cancel = settles(reader.cancel("cancel-reason"));
+  const abort = rejection(writer.abort("abort-reason"));
+  const closed = rejection(writer.closed);
+  check("the parked write resolves", (await write) === "ok", "write failed");
+  check("the cancel resolves", (await cancel) === "ok", "cancel failed");
+  const closedResult = await closed;
+  check("closed keeps the stored error", closedResult === "string:cancel-reason", `closed: ${closedResult}`);
+  const abortResult = await abort;
+  check("abort keeps the stored error", abortResult === "string:cancel-reason", `abort: ${abortResult}`);
+}
+
 export default {
   async fetch(request) {
     failures.length = 0;
     const { pathname } = new URL(request.url);
     if (pathname === "/writer-released") await writerReleased();
     else if (pathname === "/decompression-close-after-error") await decompressionCloseAfterError();
+    else if (pathname === "/compression-cancel-then-abort") await compressionCancelThenAbort();
     else return Response.json({ ok: false, failures: [`no route ${pathname}`] }, { status: 404 });
     return Response.json({ ok: failures.length === 0, failures });
   },
@@ -287,4 +322,11 @@ fn decompression_close_after_error_matches_workerd() {
     ensure_engine();
     let mut worker = load_worker(WORKER, "stream-edges");
     check_route(&mut worker, "/decompression-close-after-error");
+}
+
+#[test]
+fn compression_cancel_then_abort_keeps_the_stored_error() {
+    ensure_engine();
+    let mut worker = load_worker(WORKER, "stream-edges");
+    check_route(&mut worker, "/compression-cancel-then-abort");
 }

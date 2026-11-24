@@ -368,6 +368,18 @@ The `tail` and `email` handlers are unavailable.
 - `CompressionStream` and `DecompressionStream` are capped at 128 live
   streams per isolate; Workerd has no such cap. The 129th constructor call
   throws a `RangeError`. Finish, cancel, or abort streams you no longer use.
+  Their writable side is an internal stream: once it has closed,
+  `releaseLock()` is a no-op and the stream stays locked, as on Workerd. A
+  string chunk is UTF-8 encoded and `undefined` is an empty chunk; any
+  other non-`ArrayBuffer`/`ArrayBufferView` chunk fails the same way. A
+  gzip header CRC (FHCRC) is verified, and the trailer's CRC-32 and ISIZE
+  are checked by the push that completes each field; a member whose trailer
+  never arrived reports the incomplete-data error on `close()`, and bytes
+  after the member report the trailing-bytes error.
+- `releaseLock()` recomputes backpressure after dropping the released
+  writer's queued writes, so a new writer's `ready` settles exactly as on
+  Workerd, and `desiredSize` keeps reporting the queue formula while the
+  stream is erroring (it can go negative) instead of `null`.
 - Byte streams cross isolate boundaries on the same node as part of
   Durable Object RPC, in both directions: a `ReadableStream` your cell
   returns reads chunk by chunk, and a `WritableStream` it returns accepts
