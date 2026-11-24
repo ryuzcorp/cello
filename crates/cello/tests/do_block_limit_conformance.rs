@@ -270,7 +270,10 @@ fn a_limit_over_an_open_transaction_rolls_it_back() {
     let node = TestNode::boot(project.path());
 
     let (status, _) = get(&node.public, "/hold-open-tx").expect("GET /hold-open-tx");
-    assert_eq!(status, 500, "the limit breaks the event over an open transaction");
+    assert_eq!(
+        status, 500,
+        "the limit breaks the event over an open transaction"
+    );
 
     let state = body_json(&node.public, "/tx-state");
     assert_eq!(state["tk"], serde_json::Value::Null, "{state}");

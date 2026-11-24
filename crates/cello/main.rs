@@ -1537,9 +1537,9 @@ async fn dispatch_rpc_call(app: AppHandle, call: RpcCallReq) {
                                     .into(),
                                 ),
                                 None => {
-                                    return Err(local_request_error(
-                                        LocalRequestFailure::Handler(error),
-                                    ))
+                                    return Err(local_request_error(LocalRequestFailure::Handler(
+                                        error,
+                                    )))
                                 }
                             }
                         }
