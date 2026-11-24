@@ -382,28 +382,146 @@ fn assert_shapes(failures: &mut Vec<String>, label_prefix: &str, answer: &Value)
     );
 }
 
-#[test]
-fn a_handler_failure_keeps_its_shape_across_nodes() {
-    let fixture = fixture_dir();
-    let project = fixture_tempdir("cello-do-remote-");
-    copy_dir(&fixture, project.path());
-    deploy_fixture(project.path());
-    let store = project.path().join(".cello/dev/objects.sqlite3");
-    let a = TestNode::boot(project.path(), &store, "remote-test-a");
-    let b = TestNode::boot(project.path(), &store, "remote-test-b");
+/// What an RPC method must reject with, as workerd's RPC surface does:
+/// `(method, ctor, name, message)`. The stack is the first line plus the
+/// caller's own frames in both directions, so only the first line is fixed
+/// here and the local/remote answers are compared whole.
+const RPC_THROWN: &[(&str, &str, &str, &str)] = &[
+    ("dom", "DOMException", "AbortError", "aborted!"),
+    ("range", "RangeError", "RangeError", "bad range"),
+    ("str", "Error", "Error", "plain string"),
+    ("empty", "TypeError", "TypeError", ""),
+];
 
-    // Activation claims ownership, so the node that serves a new instance
-    // owns it from then on. Create the instance on one node and dial the
-    // other: the caller's top-level Worker then makes every `stub.fetch()` in
-    // the route a cross-node call, while the creator's own answer stays local.
-    // Both directions are tried because either node can refuse the claim
-    // under load.
-    let mut found = None;
+fn assert_rpc_shapes(failures: &mut Vec<String>, label_prefix: &str, answer: &Value) {
+    for (label, ctor, name, message) in RPC_THROWN {
+        expect(
+            failures,
+            &format!("{label_prefix}.{label}.ctor"),
+            text(answer, &[label, "ctor"]),
+            ctor,
+        );
+        expect(
+            failures,
+            &format!("{label_prefix}.{label}.name"),
+            text(answer, &[label, "name"]),
+            name,
+        );
+        expect(
+            failures,
+            &format!("{label_prefix}.{label}.message"),
+            text(answer, &[label, "message"]),
+            message,
+        );
+        expect(
+            failures,
+            &format!("{label_prefix}.{label}.remote"),
+            text(answer, &[label, "remote"]),
+            "true",
+        );
+        let stack = text(answer, &[label, "stack"]);
+        expect(
+            failures,
+            &format!("{label_prefix}.{label}.stackFirst"),
+            stack.split('\n').next().unwrap_or_default().to_string(),
+            &if message.is_empty() {
+                (*name).to_string()
+            } else {
+                format!("{name}: {message}")
+            },
+        );
+    }
+    expect(
+        failures,
+        &format!("{label_prefix}.dom.isDom"),
+        text(answer, &["dom", "isDom"]),
+        "true",
+    );
+    expect(
+        failures,
+        &format!("{label_prefix}.obj.ctor"),
+        text(answer, &["obj", "ctor"]),
+        "Object",
+    );
+    expect(
+        failures,
+        &format!("{label_prefix}.obj.isError"),
+        text(answer, &["obj", "isError"]),
+        "false",
+    );
+    expect(
+        failures,
+        &format!("{label_prefix}.obj.name"),
+        text(answer, &["obj", "name"]),
+        "ObjError",
+    );
+    expect(
+        failures,
+        &format!("{label_prefix}.obj.message"),
+        text(answer, &["obj", "message"]),
+        "obj msg",
+    );
+    expect(
+        failures,
+        &format!("{label_prefix}.obj.remote"),
+        text(answer, &["obj", "remote"]),
+        "true",
+    );
+    expect(
+        failures,
+        &format!("{label_prefix}.obj.stack"),
+        text(answer, &["obj", "stack"]),
+        "null",
+    );
+    // The reply envelope is not the 64 KiB handler-failure body, so this 70 KB
+    // clone still arrives as the object.
+    expect(
+        failures,
+        &format!("{label_prefix}.oversize.ctor"),
+        text(answer, &["oversize", "ctor"]),
+        "Object",
+    );
+    expect(
+        failures,
+        &format!("{label_prefix}.oversize.name"),
+        text(answer, &["oversize", "name"]),
+        "BigError",
+    );
+    expect(
+        failures,
+        &format!("{label_prefix}.oversize.message"),
+        text(answer, &["oversize", "message"]),
+        "too big",
+    );
+    expect(
+        failures,
+        &format!("{label_prefix}.oversize.remote"),
+        text(answer, &["oversize", "remote"]),
+        "true",
+    );
+    expect(
+        failures,
+        &format!("{label_prefix}.oversize.isError"),
+        text(answer, &["oversize", "isError"]),
+        "false",
+    );
+}
+
+/// The `(local, cross-node)` answers of one test route, from an instance
+/// whose owner is the other node than the one the top-level Worker runs on.
+///
+/// Activation claims ownership, so the node that serves a new instance owns
+/// it from then on. Create the instance on one node and dial the other: the
+/// caller's top-level Worker then makes every stub call in the route cross
+/// nodes, while the creator's own answer stays local. Both directions are
+/// tried because either node can refuse the claim under load. `endpoint`
+/// must accept `?name=` and report `caller`/`throwerNode`.
+fn across_nodes(a: &TestNode, b: &TestNode, endpoint: &str) -> Result<(Value, Value), Vec<String>> {
     let mut see = Vec::new();
-    for (creator, caller) in [(&a, &b), (&b, &a)] {
+    for (creator, caller) in [(a, b), (b, a)] {
         for index in 0..8 {
-            let name = format!("probe-{index}");
-            let local = match route(&creator.public, &format!("/throw?name={name}")) {
+            let path = format!("{endpoint}?name=probe-{index}");
+            let local = match route(&creator.public, &path) {
                 Ok(answer) => answer,
                 Err(error) => {
                     see.push(error);
@@ -414,14 +532,14 @@ fn a_handler_failure_keeps_its_shape_across_nodes() {
                 || text(&local, &["caller"]) != creator.name
             {
                 see.push(format!(
-                    "{name} on {}: caller={} owner={}",
+                    "{path} on {}: caller={} owner={}",
                     creator.name,
                     text(&local, &["caller"]),
                     text(&local, &["throwerNode"])
                 ));
                 continue;
             }
-            let cross_node = match route(&caller.public, &format!("/throw?name={name}")) {
+            let cross_node = match route(&caller.public, &path) {
                 Ok(answer) => answer,
                 Err(error) => {
                     see.push(error);
@@ -432,25 +550,32 @@ fn a_handler_failure_keeps_its_shape_across_nodes() {
                 || text(&cross_node, &["throwerNode"]) != creator.name
             {
                 see.push(format!(
-                    "{name} on {}: caller={} owner={}",
+                    "{path} on {}: caller={} owner={}",
                     caller.name,
                     text(&cross_node, &["caller"]),
                     text(&cross_node, &["throwerNode"])
                 ));
                 continue;
             }
-            found = Some((local, cross_node));
-            break;
-        }
-        if found.is_some() {
-            break;
+            return Ok((local, cross_node));
         }
     }
-    let Some((local, cross_node)) = found else {
-        panic!(
-            "no instance crossed nodes; saw {:?}",
-            &see[..see.len().min(8)]
-        );
+    Err(see)
+}
+
+#[test]
+fn a_handler_failure_keeps_its_shape_across_nodes() {
+    let fixture = fixture_dir();
+    let project = fixture_tempdir("cello-do-remote-");
+    copy_dir(&fixture, project.path());
+    deploy_fixture(project.path());
+    let store = project.path().join(".cello/dev/objects.sqlite3");
+    let a = TestNode::boot(project.path(), &store, "remote-test-a");
+    let b = TestNode::boot(project.path(), &store, "remote-test-b");
+
+    let (local, cross_node) = match across_nodes(&a, &b, "/throw") {
+        Ok(pair) => pair,
+        Err(see) => panic!("no instance crossed nodes; saw {see:?}"),
     };
 
     let mut failures = Vec::new();
@@ -503,6 +628,30 @@ fn a_handler_failure_keeps_its_shape_across_nodes() {
         text(&local, &["oversize", "message"]),
         "too big",
     );
+
+    // RPC (`stub.method()`) is a different peer reply: the callee's exception
+    // rides the structured-clone reply envelope as a 200 body, not the bounded
+    // `x-cells-handler-failure` body, so the two-node hop must change nothing —
+    // including a clone larger than that body bound (#238).
+    let (rpc_local, rpc_cross) = match across_nodes(&a, &b, "/rpc-throw") {
+        Ok(pair) => pair,
+        Err(see) => panic!("no RPC instance crossed nodes; saw {see:?}"),
+    };
+    assert_rpc_shapes(&mut failures, "rpc.remote", &rpc_cross);
+    assert_rpc_shapes(&mut failures, "rpc.local", &rpc_local);
+    for label in ["dom", "range", "str", "obj", "empty", "oversize"] {
+        for field in [
+            "ctor", "name", "message", "isDom", "isError", "remote", "stack",
+        ] {
+            let from_local = text(&rpc_local, &[label, field]);
+            let from_cross = text(&rpc_cross, &[label, field]);
+            if from_local != from_cross {
+                failures.push(format!(
+                    "rpc.{label}.{field}: local {from_local:?} != cross-node {from_cross:?}"
+                ));
+            }
+        }
+    }
 
     assert!(
         failures.is_empty(),
