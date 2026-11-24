@@ -2322,6 +2322,12 @@ const __isNestedSection = (record, ancestor) => {
   }
   return false;
 };
+ // A section releases once it settled and every timer it held has fired.
+ // Called wherever the settled flag flips and wherever a held fire lands,
+ // so whichever comes last opens the gate for the enclosing scope (#282).
+ const __maybeResolveRelease = (record) => {
+   if (record.settledFlag && record.pendingFires === 0) record.resolveRelease();
+ };
  const __holdNestedSections = (hold) => {
    // The zero path: no section is open anywhere in the isolate, so nothing
    // can be waiting. This is the completion-time fast path that keeps the
@@ -2339,7 +2345,7 @@ const __isNestedSection = (record, ancestor) => {
       const deeper = [...open]
         .filter(([, record]) => section === undefined ||
           (record !== section && __isNestedSection(record, section)))
-        .map(([, record]) => record.settled.then(() => {}, () => {}));
+        .map(([, record]) => record.release.then(() => {}, () => {}));
       if (deeper.length === 0) return;
       await Promise.all(deeper);
     }
@@ -2397,7 +2403,24 @@ class Timeout {
     __op_timer(op, this.#delay).then(
       () => {
         if (hold === undefined || (hold.state._openNested?.size ?? 0) === 0) fire();
-        else __holdNestedSections(hold).then(fire);
+        else {
+          // Staged release: register this fire with the owning section so
+          // the section releases only after it lands, then wait for every
+          // inner scope to release first (#282). A settled owner counts as
+          // sectionless, the way the wait itself treats it. Scopes with no
+          // open descendants resolve immediately, preserving deadline order
+          // within a scope.
+          const owner = hold.section !== undefined && !hold.section.settledFlag
+            ? hold.section : null;
+          if (owner !== null) owner.pendingFires++;
+          __holdNestedSections(hold).then(() => {
+            fire();
+            if (owner !== null) {
+              owner.pendingFires--;
+              __maybeResolveRelease(owner);
+            }
+          });
+        }
       },
       fire,
     );
@@ -4521,7 +4544,6 @@ class DurableObjectState {
       this._blockDepth++;
       // The reservation order is the section order: a sibling scheduled
       // later reserves a deeper number without being enclosed.
-      const reservedDepth = this._blockDepth;
       const frame = __als_get();
       const entered = frame === undefined ? undefined : frame.get(__holdKey);
       let parent;
@@ -4553,9 +4575,17 @@ class DurableObjectState {
         children: [],
         settledFlag: false,
         settled: null,
+        // Timers the section held past their deadlines, still to fire: the
+        // section releases only after they do, so an outer scope's timers
+        // never jump the queue ahead of an inner scope's (#282).
+        pendingFires: 0,
+        release: null,
       };
       let resolveSettled;
       record.settled = new Promise((resolve) => { resolveSettled = resolve; });
+      let resolveRelease;
+      record.release = new Promise((resolve) => { resolveRelease = resolve; });
+      record.resolveRelease = resolveRelease;
       const prev = parent === null || parent.children.length === 0
         ? undefined
         : parent.children[parent.children.length - 1];
@@ -4569,9 +4599,10 @@ class DurableObjectState {
             if (open.delete(nested)) __openSectionCount--;
             record.settledFlag = true;
             resolveSettled(prevFailure);
+            __maybeResolveRelease(record);
             throw prevFailure;
           }
-          return this.#startConcurrencyBlock(f, reservedDepth, record);
+          return this.#startConcurrencyBlock(f, record);
         },
         (error) => {
           // The deferred turn never arrived -- the event ended and its ops
@@ -4582,6 +4613,7 @@ class DurableObjectState {
           if (open.delete(nested)) __openSectionCount--;
           record.settledFlag = true;
           resolveSettled(this._aborted ? error : null);
+          __maybeResolveRelease(record);
           throw error;
         },
       );
@@ -4599,11 +4631,13 @@ class DurableObjectState {
           if (open.delete(nested)) __openSectionCount--;
           record.settledFlag = true;
           resolveSettled(failure);
+          __maybeResolveRelease(record);
         }),
         (error) => {
           if (open.delete(nested)) __openSectionCount--;
           record.settledFlag = true;
           resolveSettled(this._aborted ? error : null);
+          __maybeResolveRelease(record);
         },
       );
       return nested;
@@ -4635,6 +4669,28 @@ class DurableObjectState {
     if (owner === "") return acquired;
     const event = Number(eventText);
     const { block, record } = __blockEnter(this._scope, event, owner);
+    // The root of this block's section tree, recorded synchronously: bodies
+    // scheduled while it runs nest under it, and a completion that lands in
+    // the microtasks before the gate ticket arrives must already see it
+    // open, or pre-armed work armed just ahead of the block would escape
+    // the hold (#282). Keyed by itself, as only the record identifies it.
+    const rootSection = {
+      seq: this._blockSeq++,
+      state: this,
+      parent: null,
+      children: [],
+      settledFlag: false,
+      settled: null,
+      pendingFires: 0,
+      release: null,
+    };
+    let resolveRootRelease;
+    rootSection.release =
+      new Promise((resolve) => { resolveRootRelease = resolve; });
+    rootSection.resolveRelease = resolveRootRelease;
+    const openRootSections = (this._openNested ??= new Map());
+    openRootSections.set(rootSection, rootSection);
+    __openSectionCount++;
     // The promise the caller holds settles when the block's body settles, as
     // workerd's does. The section around it -- the drain of nested blocks and
     // the release -- outlives it, and that is what a nested block's callback
@@ -4653,6 +4709,12 @@ class DurableObjectState {
         // owns this queued acquisition. The owner still has to consume its
         // ticket, but the retired callback must not run.
         if (record.retired) {
+          // The section never ran: forget the synchronously opened root so
+          // the counter and the map do not keep a section that never
+          // existed, exactly as a cancelled deferred turn does (#267).
+          rootSection.settledFlag = true;
+          __maybeResolveRelease(rootSection);
+          if (openRootSections.delete(rootSection)) __openSectionCount--;
           __gate_release(this._scope, event, owner, null);
           settleGuest(undefined);
           return;
@@ -4666,16 +4728,9 @@ class DurableObjectState {
         let failure = null;
         let value;
         let thrown = null;
-        // The root of this block's section tree: bodies scheduled while it
-        // runs nest under it, and the drain below waits for them (#278).
-        const rootSection = {
-          seq: this._blockSeq++,
-          state: this,
-          parent: null,
-          children: [],
-          settledFlag: false,
-          settled: null,
-        };
+        // Bodies scheduled while the root runs nest under it, and the drain
+        // below waits for them (#278). The record itself was opened
+        // synchronously at the call, so pre-armed work already sees it.
         try {
           value = await this.#runConcurrencyBlock(f, rootSection);
         } catch (error) {
@@ -4697,6 +4752,8 @@ class DurableObjectState {
           if (failure !== null) failure = this._aborted ? __describeFailure(failure) : null;
         }
         rootSection.settledFlag = true;
+        __maybeResolveRelease(rootSection);
+        if (openRootSections.delete(rootSection)) __openSectionCount--;
         __gate_release(this._scope, event, owner, failure);
         if (thrown !== null) throw thrown;
         return value;
@@ -4735,7 +4792,7 @@ class DurableObjectState {
   }
   #runConcurrencyBlock(f, section) {
     this._blockDepth++;
-    return this.#startConcurrencyBlock(f, this._blockDepth, section);
+    return this.#startConcurrencyBlock(f, section);
   }
   // Drain a section's child sections, in schedule order: each child runs
   // only after the sibling ahead of it has fully settled, so awaiting them
@@ -4758,7 +4815,7 @@ class DurableObjectState {
   }
   // The body and the limit around it. A synchronous throw resets the object
   // and rejects, as a body that throws any other way does.
-  #startConcurrencyBlock(f, reservedDepth, section) {
+  #startConcurrencyBlock(f, section) {
     // Name this section for the timer hold and the section tree: timers and
     // subrequests the body schedules -- synchronously or after an `await` --
     // wait while a section nested inside this one is open, while the section
@@ -4766,10 +4823,7 @@ class DurableObjectState {
     // themselves (#268). Bodies the section schedules nest under it, and a
     // sibling scheduled later waits behind it (#278). The frame rides the
     // body's continuations the way `__ctxRun` frames do; the `finally`
-    // restores the prior frame for the synchronous caller. `reservedDepth`
-    // is the depth this section reserved when it opened, which the deferred
-    // start must not re-read: a sibling scheduled later reserves deeper
-    // without being enclosed.
+    // restores the prior frame for the synchronous caller.
     const prior = __als_get();
     const frame = new Map(prior);
     frame.set(__holdKey, { state: this, section });

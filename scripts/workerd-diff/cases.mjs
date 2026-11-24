@@ -262,6 +262,13 @@ export const cases = [
     fixture: "do",
     path,
   })),
+  // #282: several timers held past their deadlines release innermost
+  // scope first, deadline order within a scope, scopeless timers last.
+  ...["/nested-hold-order"].map((path) => ({
+    name: `do${path}`,
+    fixture: "do",
+    path,
+  })),
   // #261: the section outlives the guest's promise, so the nested block that
   // a response left running still writes, and a second event's block waits
   // behind it before it reads.
