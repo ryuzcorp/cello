@@ -461,16 +461,31 @@ The `tail` and `email` handlers are unavailable.
   Cancelling the readable while a `pipeTo` is feeding the writable fulfills
   the feeder pipe once the destination's writes have drained -- the source
   is still cancelled with the reason -- and a `controller.error()` on an
-  otherwise idle pipe fulfills the same way, as on Workerd. A write the
+  otherwise idle pipe fulfills the same way, as on Workerd. When the source
+  is already done and the destination `close()` fails, the pipe rejects with
+  the close error without cancelling the source. A write the
   cancel lands on rejects with `TypeError: The readable side of this
   TransformStream is no longer readable.`, while `writer.closed` and later
   operations keep reporting the cancel reason; a write whose transform was
-  already running still completes, as does one queued behind it.
+  already running still completes, as does one queued behind it, and a
+  cancel landing on parked writes leaves `writer.ready` fulfilled.
   `IdentityTransformStream` and
-  `FixedLengthStream` resolve a write only once its bytes have been read. A
+  `FixedLengthStream` resolve a write only once its bytes have been read, and
+  their writable side is an internal stream like a compression stream's: once
+  `close()` was called every later write reports the closed stream, a failed
+  push or flush settles the writable as closed (later `write()`/`close()`
+  report the closed stream while `writer.closed` rejects with the failure),
+  `releaseLock()` on the closed writable is a no-op, and `abort()` ends in
+  the closed shape -- ready fulfills, `closed` rejects with the abort reason,
+  and later operations report the closed stream. A
   chunk that is not a `BufferSource` rejects only that write with a
   `TypeError`, leaving both sides usable and -- for `FixedLengthStream` --
-  not counting toward the expected length.
+  not counting toward the expected length; a string chunk is UTF-8 encoded
+  and `undefined` is an empty chunk, as on compression streams. A
+  `FixedLengthStream` overflow resolves the write that trips it and errors
+  the readable, a further write keeps rejecting with the overflow error,
+  the `close` reports the closed stream, and `closed` rejects with the
+  overflow error.
 - A pull source runs on Workerd's schedule, which differs from the WHATWG
   text: `pull()` is called when a read request is registered and again while
   an `enqueue` leaves the desired size positive, but not after a `read()`

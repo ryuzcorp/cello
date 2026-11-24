@@ -1084,8 +1084,11 @@ class ReadableStream {
       // Watch for dest error.
       writer.closed.catch(we => {
         if (shuttingDown) return;
+        // The close path only runs after the source is done, so cancelling
+        // it would only fire its cancel hook with the close error: report
+        // the close error without cancelling, as Workerd does.
         if (closeError !== undefined)
-          shutdownWith(closeError, false, !preventCancel);
+          shutdownWith(closeError, false, false);
         else if (writeError !== undefined)
           shutdownWithWrite(we, writeError, !preventCancel);
         else if (writesCompleted > 0)

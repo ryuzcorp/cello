@@ -65,6 +65,13 @@ export const cases = [
   { name: "transform-write-cancel-running", fixture: "streams", path: "/transform-write-cancel-running" },
   { name: "pipe-dest-error-completing", fixture: "streams", path: "/pipe-dest-error-completing" },
   { name: "transform-flush-cancel-drain", fixture: "streams", path: "/transform-flush-cancel-drain" },
+  // #272 round 2: close-error pipes skip the source cancel, invalid chunks
+  // report dead-stream state errors, parked-cancel keeps ready fulfilled,
+  // and internal-stream writes after close() report the closed stream.
+  { name: "pipe-close-error-no-cancel", fixture: "streams", path: "/pipe-close-error-no-cancel" },
+  { name: "byte-transform-invalid-on-dead", fixture: "streams", path: "/byte-transform-invalid-on-dead" },
+  { name: "transform-parked-cancel-ready", fixture: "streams", path: "/transform-parked-cancel-ready" },
+  { name: "internal-stream-write-while-closing", fixture: "streams", path: "/internal-stream-write-while-closing" },
   { name: "gzip-large", fixture: "streams", path: "/gzip-large" },
   { name: "writable-backpressure", fixture: "streams", path: "/writable-backpressure" },
   { name: "tee-basic", fixture: "streams", path: "/tee-basic" },
@@ -80,6 +87,10 @@ export const cases = [
   // #280: an invalid chunk rejects only its own write on internal byte streams.
   { name: "identity-invalid-chunk", fixture: "streams", path: "/identity-invalid-chunk" },
   { name: "fixed-length-invalid-chunk", fixture: "streams", path: "/fixed-length-invalid-chunk" },
+  // #280 round 2: overflow/close/write shapes, string chunks, abort shape.
+  { name: "fixed-length-overflow-write-close", fixture: "streams", path: "/fixed-length-overflow-write-close" },
+  { name: "identity-string-chunks", fixture: "streams", path: "/identity-string-chunks" },
+  { name: "identity-fixed-abort-shape", fixture: "streams", path: "/identity-fixed-abort-shape" },
   { name: "gzip-roundtrip", fixture: "streams", path: "/gzip-roundtrip" },
   { name: "deflate-roundtrip", fixture: "streams", path: "/deflate-roundtrip" },
   { name: "text-encoder-stream", fixture: "streams", path: "/text-encoder-stream" },

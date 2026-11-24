@@ -1140,6 +1140,345 @@ const routes = {
     });
   },
 
+  async "/pipe-close-error-no-cancel"() {
+    // Round-2 P2-1 (#272): the source is done and the destination close
+    // fails, so the pipe rejects with the close error instead of hanging
+    // on the closed promise -- and the source is never cancelled with it.
+    let cancelled = "unset";
+    const source = new ReadableStream({
+      start(c) { c.enqueue("a"); c.close(); },
+      cancel(reason) { cancelled = reason; },
+    });
+    const dest = new WritableStream({
+      write() {},
+      close() { throw new Error("close-boom"); },
+    });
+    const outcome = await source.pipeTo(dest).then(() => "done", errorInfo);
+    return report({
+      outcome,
+      cancelled: cancelled === "unset" ? null : errorInfo(cancelled),
+      locked: source.locked,
+    });
+  },
+
+  async "/byte-transform-invalid-on-dead"() {
+    // Round-2 P2-2 (#276, #280): an invalid chunk written to a closed,
+    // closing, or aborted internal stream reports the state error, not
+    // the chunk TypeError. `whileClosing` issues the write in the same
+    // tick as close(), so the close has not dispatched yet.
+    const kinds = {
+      compress: () => new CompressionStream("gzip"),
+      identity: () => new IdentityTransformStream(),
+      fixed: () => new FixedLengthStream(10),
+    };
+    const out = {};
+    for (const [kind, mk] of Object.entries(kinds)) {
+      const cells = {};
+      {
+        const stream = mk();
+        const writer = stream.writable.getWriter();
+        await writer.close().catch(() => {});
+        cells.afterClose = await writer.write(42).then(() => "ok", errorInfo);
+        writer.releaseLock();
+      }
+      {
+        const stream = mk();
+        const writer = stream.writable.getWriter();
+        const close = writer.close();
+        const invalid = await writer.write(42).then(() => "ok", errorInfo);
+        cells.whileClosing = {
+          invalid,
+          close: await close.then(() => "ok", errorInfo),
+        };
+        writer.releaseLock();
+      }
+      {
+        const stream = mk();
+        const writer = stream.writable.getWriter();
+        await writer.abort(new Error("abort-boom")).catch(() => {});
+        cells.afterAbort = await writer.write(42).then(() => "ok", errorInfo);
+        writer.releaseLock();
+      }
+      out[kind] = cells;
+    }
+    return report(out);
+  },
+
+  async "/transform-parked-cancel-ready"() {
+    // Round-2 P2-3 (#272): a readable cancel landing on parked plain-transform
+    // writes rejects them with the readable-side TypeError while ready stays
+    // fulfilled and closed keeps the cancel reason. No reader is attached,
+    // so the writes park on the backpressure handshake; `flip` is a bounded
+    // microtask drain (never wall time) that gets them parked without
+    // falling into the same-turn shape, which resolves the writes instead.
+    const flip = async () => {
+      for (let index = 0; index < 16; index += 1) await null;
+    };
+    const shape = async (count) => {
+      const ts = new TransformStream();
+      const writer = ts.writable.getWriter();
+      const writes = [];
+      for (let index = 0; index < count; index += 1)
+        writes.push(writer.write(`c${index}`).then(() => "done", errorInfo));
+      await flip();
+      const ready = writer.ready.then(() => "ready-ok", errorInfo);
+      const closed = writer.closed.then(() => "closed", errorInfo);
+      await ts.readable.cancel("parked-bye");
+      const settled = [];
+      for (const write of writes) settled.push(await write);
+      const out = { writes: settled, ready: await ready, closed: await closed };
+      writer.releaseLock();
+      return out;
+    };
+    return report({ single: await shape(1), queued: await shape(2) });
+  },
+
+  async "/internal-stream-write-while-closing"() {
+    // Round-2 gap (#272): once close() was called on an internal
+    // (compression/identity/fixed) stream, every later write reports the
+    // closed stream -- whether the close already dispatched or is still
+    // queued. Plain streams keep "This ReadableStream is closed." in both
+    // positions. `flip` is a bounded microtask drain, never wall time.
+    const flip = async () => {
+      for (let index = 0; index < 16; index += 1) await null;
+    };
+    const out = {};
+    {
+      const stream = new IdentityTransformStream();
+      const writer = stream.writable.getWriter();
+      const reader = stream.readable.getReader();
+      const drained = (async () => {
+        for (;;) {
+          try {
+            const { value, done } = await reader.read();
+            if (done) return "done";
+          } catch (error) { return errorInfo(error); }
+        }
+      })();
+      await flip();
+      const close = writer.close();
+      const invalid = writer.write(42);
+      const valid = writer.write(new Uint8Array([9]));
+      out.dispatched = {
+        invalid: await invalid.then(() => "ok", errorInfo),
+        valid: await valid.then(() => "ok", errorInfo),
+        close: await close.then(() => "ok", errorInfo),
+        drain: await drained,
+      };
+      reader.releaseLock();
+      writer.releaseLock();
+    }
+    {
+      const stream = new CompressionStream("gzip");
+      const writer = stream.writable.getWriter();
+      const reader = stream.readable.getReader();
+      const drained = (async () => {
+        const chunks = [];
+        for (;;) {
+          try {
+            const { value, done } = await reader.read();
+            if (done) return { done: true, chunks };
+            chunks.push(value.byteLength);
+          } catch (error) { return { ...errorInfo(error), chunks }; }
+        }
+      })();
+      await flip();
+      const first = writer.write(new Uint8Array([1, 2, 3]));
+      const close = writer.close();
+      const invalid = writer.write(42);
+      out.queuedInvalid = {
+        invalid: await invalid.then(() => "ok", errorInfo),
+        first: await first.then(() => "ok", errorInfo),
+        close: await close.then(() => "ok", errorInfo),
+        drain: await drained,
+      };
+      reader.releaseLock();
+      writer.releaseLock();
+    }
+    {
+      const stream = new CompressionStream("gzip");
+      const writer = stream.writable.getWriter();
+      const reader = stream.readable.getReader();
+      const drained = (async () => {
+        for (;;) {
+          try {
+            const { value, done } = await reader.read();
+            if (done) return "done";
+          } catch (error) { return errorInfo(error); }
+        }
+      })();
+      await flip();
+      const first = await writer.write(new Uint8Array([1, 2, 3])).then(() => "ok", errorInfo);
+      const close = writer.close();
+      const valid = writer.write(new Uint8Array([9]));
+      out.dispatchedValid = {
+        first,
+        valid: await valid.then(() => "ok", errorInfo),
+        close: await close.then(() => "ok", errorInfo),
+        drain: await drained,
+      };
+      reader.releaseLock();
+      writer.releaseLock();
+    }
+    {
+      // A write parked in the sink with a close queued behind it: a
+      // further valid write still reports "This ReadableStream is closed."
+      let release;
+      const gate = new Promise((done) => (release = done));
+      const ws = new WritableStream({ write() { return gate; } });
+      const writer = ws.getWriter();
+      await flip();
+      const first = writer.write("a");
+      const close = writer.close();
+      const valid = await writer.write("b").then(() => "ok", errorInfo);
+      release();
+      out.plainQueued = {
+        valid,
+        first: await first.then(() => "ok", errorInfo),
+        close: await close.then(() => "ok", errorInfo),
+      };
+      writer.releaseLock();
+    }
+    {
+      // A close dispatched in the sink: a further valid write still
+      // reports "This ReadableStream is closed."
+      let release;
+      const gate = new Promise((done) => (release = done));
+      const ws = new WritableStream({ close() { return gate; } });
+      const writer = ws.getWriter();
+      await flip();
+      const close = writer.close();
+      const valid = await writer.write("b").then(() => "ok", errorInfo);
+      release();
+      out.plainDispatched = {
+        valid,
+        close: await close.then(() => "ok", errorInfo),
+      };
+      writer.releaseLock();
+    }
+    return report(out);
+  },
+
+  async "/fixed-length-overflow-write-close"() {
+    // Issue #280 (a): a FixedLength overflow resolves the write that trips
+    // it and errors the readable; a further write keeps rejecting with the
+    // overflow error, while the close -- and any write after it -- reports
+    // the closed stream, and closed rejects with the overflow error.
+    const drain = (reader) => (async () => {
+      const chunks = [];
+      for (;;) {
+        try {
+          const { value, done } = await reader.read();
+          if (done) return { done: true, chunks };
+          chunks.push(value.byteLength);
+        } catch (error) { return { ...errorInfo(error), chunks }; }
+      }
+    })();
+    const out = {};
+    {
+      const stream = new FixedLengthStream(5);
+      const writer = stream.writable.getWriter();
+      const reader = stream.readable.getReader();
+      const drained = drain(reader);
+      const first = await writer.write(new Uint8Array([1, 2, 3])).then(() => "ok", errorInfo);
+      const second = await writer.write(new Uint8Array([4, 5, 6])).then(() => "ok", errorInfo);
+      const third = await writer.write(new Uint8Array([7])).then(() => "ok", errorInfo);
+      const close = await writer.close().then(() => "ok", errorInfo);
+      const closed = await writer.closed.then(() => "closed", errorInfo);
+      const ready = await writer.ready.then(() => "ok", errorInfo);
+      out.writeThenClose = {
+        first, second, third, close, closed, ready, drain: await drained,
+      };
+      reader.releaseLock();
+      writer.releaseLock();
+    }
+    {
+      const stream = new FixedLengthStream(5);
+      const writer = stream.writable.getWriter();
+      const reader = stream.readable.getReader();
+      const drained = drain(reader);
+      const first = await writer.write(new Uint8Array([1, 2, 3])).then(() => "ok", errorInfo);
+      const second = await writer.write(new Uint8Array([4, 5, 6])).then(() => "ok", errorInfo);
+      const close = await writer.close().then(() => "ok", errorInfo);
+      const closed = await writer.closed.then(() => "closed", errorInfo);
+      const ready = await writer.ready.then(() => "ok", errorInfo);
+      const after = await writer.write(new Uint8Array([7])).then(() => "ok", errorInfo);
+      out.closeThenWrite = {
+        first, second, close, closed, ready, after, drain: await drained,
+      };
+      reader.releaseLock();
+      writer.releaseLock();
+    }
+    return report(out);
+  },
+
+  async "/identity-string-chunks"() {
+    // Issue #280 (b): IdentityTransformStream takes a string (encoded as
+    // UTF-8) and treats undefined as an empty chunk, like compression does.
+    const out = {};
+    for (const chunk of ["s", undefined]) {
+      const stream = new IdentityTransformStream();
+      const writer = stream.writable.getWriter();
+      const reader = stream.readable.getReader();
+      const drained = (async () => {
+        const chunks = [];
+        for (;;) {
+          try {
+            const { value, done } = await reader.read();
+            if (done) return { done: true, chunks };
+            chunks.push(value.byteLength);
+          } catch (error) { return { ...errorInfo(error), chunks }; }
+        }
+      })();
+      let write;
+      try {
+        write = await writer.write(chunk).then(() => "ok", errorInfo);
+      } catch (error) { write = { sync: errorInfo(error) }; }
+      const close = await writer.close().then(() => "ok", errorInfo);
+      const closed = await writer.closed.then(() => "closed", errorInfo);
+      out[String(chunk)] = { write, close, closed, drain: await drained };
+      reader.releaseLock();
+      writer.releaseLock();
+    }
+    return report(out);
+  },
+
+  async "/identity-fixed-abort-shape"() {
+    // Issue #280 (d): abort() on an identity/fixed stream ends the writable
+    // in the closed shape -- ready fulfills, closed rejects with the abort
+    // reason, and later writes and closes report the closed stream.
+    const out = {};
+    for (const kind of ["identity", "fixed"]) {
+      const stream = kind === "identity"
+        ? new IdentityTransformStream()
+        : new FixedLengthStream(5);
+      const writer = stream.writable.getWriter();
+      const reader = stream.readable.getReader();
+      const drained = (async () => {
+        for (;;) {
+          try {
+            const { value, done } = await reader.read();
+            if (done) return "done";
+          } catch (error) { return errorInfo(error); }
+        }
+      })();
+      const abort = await writer.abort(new Error("abort-boom")).then(() => "ok", errorInfo);
+      const ready = await writer.ready.then(() => "ok", errorInfo);
+      const closed = await writer.closed.then(() => "closed", errorInfo);
+      const desiredSize = attempt(() => writer.desiredSize);
+      const write = await writer.write(new Uint8Array([1])).then(() => "ok", errorInfo);
+      const close = await writer.close().then(() => "ok", errorInfo);
+      const abortAgain = await writer.abort(new Error("second")).then(() => "ok", errorInfo);
+      out[kind] = {
+        abort, ready, closed, desiredSize, write, close,
+        abortAgain, drain: await drained,
+      };
+      reader.releaseLock();
+      writer.releaseLock();
+    }
+    return report(out);
+  },
+
   async "/pipe-to-destination-states"() {
     // Issue #269: pipeTo onto a destination it cannot take rejects instead
     // of hanging. A destination locked by a held writer or by another pipe
