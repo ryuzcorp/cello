@@ -505,6 +505,14 @@ fn assert_rpc_shapes(failures: &mut Vec<String>, label_prefix: &str, answer: &Va
         text(answer, &["oversize", "isError"]),
         "false",
     );
+    // Not just the metadata: the whole 70,000-character clone crossed, so a
+    // dropped or truncated payload fails here.
+    expect(
+        failures,
+        &format!("{label_prefix}.oversize.payloadLength"),
+        text(answer, &["oversize", "payloadLength"]),
+        "70000",
+    );
 }
 
 /// The `(local, cross-node)` answers of one test route, from an instance
@@ -628,6 +636,21 @@ fn a_handler_failure_keeps_its_shape_across_nodes() {
         text(&local, &["oversize", "message"]),
         "too big",
     );
+    // The local caller keeps the whole 70 KB clone; the degraded remote answer
+    // has no payload at all, which is the bound doing its job rather than a
+    // truncation that silently lost data.
+    expect(
+        &mut failures,
+        "local.oversize.payloadLength",
+        text(&local, &["oversize", "payloadLength"]),
+        "70000",
+    );
+    expect(
+        &mut failures,
+        "remote.oversize.payloadLength",
+        text(&cross_node, &["oversize", "payloadLength"]),
+        "null",
+    );
 
     // RPC (`stub.method()`) is a different peer reply: the callee's exception
     // rides the structured-clone reply envelope as a 200 body, not the bounded
@@ -641,7 +664,14 @@ fn a_handler_failure_keeps_its_shape_across_nodes() {
     assert_rpc_shapes(&mut failures, "rpc.local", &rpc_local);
     for label in ["dom", "range", "str", "obj", "empty", "oversize"] {
         for field in [
-            "ctor", "name", "message", "isDom", "isError", "remote", "stack",
+            "ctor",
+            "name",
+            "message",
+            "isDom",
+            "isError",
+            "remote",
+            "stack",
+            "payloadLength",
         ] {
             let from_local = text(&rpc_local, &[label, field]);
             let from_cross = text(&rpc_cross, &[label, field]);
