@@ -69,6 +69,7 @@ curl "http://127.0.0.1:9876/?name=b"   # {"n":1}
 - `storage.sync()` waits for the durability of the earlier committed writes.
 - `storage.getCurrentBookmark()`, `getBookmarkForTime()`, and `onNextSessionRestoreBookmark()` are the session-bookmark methods. A local storage back-end has no point-in-time recovery, so the last two refuse with workerd's own error, and `getCurrentBookmark()` answers a per-object bookmark: see [Bookmarks](#bookmarks).
 - `ctx.props` is a facet's props, and `{}` for a class declared without props.
+- `ctx.exports` holds one callable handle per module export, as it does in a stateless entrypoint: a Durable Object class handle is also its namespace (`getByName`, `get`, `idFromName`, ...) and specializes for a facet when called, and `ctx.exports.default.fetch()` reaches the default export. See the [Cloudflare compatibility](../reference/cloudflare-compat.md#context) page for the handle shapes.
 
 ## Address a cell
 

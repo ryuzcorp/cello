@@ -184,6 +184,8 @@ export const cases = [
     "/state-surface",
     // #261: argument refusal and nested-block scheduling.
     "/block-refusals", "/nested-block-order",
+    // #259: `ctx.exports` lists every export as a callable handle.
+    "/exports-surface",
   ].map((path) => ({
     name: `do${path}`,
     fixture: "do",

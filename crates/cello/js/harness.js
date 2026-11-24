@@ -3583,8 +3583,9 @@ const __makeDurableObjectClass = (loadPromise, name, propsSc) => {
 // props now, so later mutation of the caller's options cannot change startup.
 const __makeLoopbackDurableObjectClass = (name) => {
   const loadPromise = Promise.resolve({ id: 0 });
-  const specialize = function(options) {
-    if (arguments.length === 0)
+  const specialize = (...args) => {
+    const [options] = args;
+    if (args.length === 0)
       throw new TypeError("DurableObjectClass requires an options argument.");
     if (options !== undefined && options !== null &&
         typeof options !== "object" && typeof options !== "function")
@@ -3596,10 +3597,60 @@ const __makeLoopbackDurableObjectClass = (name) => {
     return __makeDurableObjectClass(
       loadPromise, name, __rpcOut(props === undefined ? {} : props, false));
   };
+  // workerd's loopback handles carry no own `name`/`length` and report the
+  // interface's tag, which comes from the prototype there (#259).
+  delete specialize.name;
+  delete specialize.length;
+  Object.defineProperty(specialize, Symbol.toStringTag, {
+    value: "LoopbackDurableObjectClass", configurable: true,
+  });
   __durableClassMeta.set(specialize, {
     loadPromise, name, propsSc: __rpcOut({}, false),
   });
   return specialize;
+};
+// workerd's `ctx.exports` entry for a Durable Object class is its loopback
+// namespace: callable (calling it specializes the class for a facet, as a
+// DurableObjectClass handle does) and carrying the namespace methods. The
+// namespace's own state lives in private slots, so the methods are bound
+// wrappers on one shared prototype whose level and tag are workerd's (#259).
+let __loopbackNamespaceHandles;
+let __loopbackNamespacePrototype;
+const __loopbackNamespaceProto = () => {
+  if (__loopbackNamespacePrototype !== undefined)
+    return __loopbackNamespacePrototype;
+  const proto = Object.create(DurableObjectNamespace.prototype);
+  Object.defineProperty(proto, Symbol.toStringTag, {
+    value: "LoopbackDurableObjectNamespace", configurable: true,
+  });
+  for (const method of [
+    "get", "getByName", "idFromName", "idFromString", "newUniqueId",
+    "jurisdiction",
+  ]) {
+    Object.defineProperty(proto, method, {
+      value: function (...args) {
+        const namespace = __weakGet(__loopbackNamespaceHandles, this);
+        if (namespace === undefined) throw new TypeError("Illegal invocation");
+        return namespace[method](...args);
+      },
+      enumerable: true, configurable: true, writable: true,
+    });
+  }
+  __loopbackNamespacePrototype = proto;
+  return proto;
+};
+const __makeLoopbackNamespace = (name) => {
+  __loopbackNamespaceHandles ??= new __primWeakMap();
+  const namespace = __cell.makeNamespace(name);
+  const specialize = __makeLoopbackDurableObjectClass(name);
+  const handle = (...args) => specialize(...args);
+  delete handle.name;
+  delete handle.length;
+  Object.setPrototypeOf(handle, __loopbackNamespaceProto());
+  __weakSet(__loopbackNamespaceHandles, handle, namespace);
+  // A facet accepts this handle where it accepts a specialized class.
+  __durableClassMeta.set(handle, __durableClassMeta.get(specialize));
+  return handle;
 };
 class DurableObjectFacets {
   constructor(state) {
@@ -7636,9 +7687,15 @@ const __entrypointStub = (name, props) => {
     return inst;
   };
   const session = __entrypointSession(name, true, null, makeInst);
-  const stub = new Proxy(function () {}, {
+  const bare = () => {};
+  // workerd's loopback handles carry no own `name`/`length`, and the service
+  // stub reports its own interface's tag (#259).
+  delete bare.name;
+  delete bare.length;
+  const stub = new Proxy(bare, {
     getPrototypeOf: () => __cf.ServiceStub.prototype,
     get: (_b, prop) => {
+      if (prop === Symbol.toStringTag) return "LoopbackServiceStub";
       if (prop === "then") return undefined;
       if (typeof prop !== "string") return undefined;
       if (prop === "getRpcMethodForTestOnly")
@@ -7863,12 +7920,25 @@ const __ctxExports = () => __ctxExportsCache ??= (() => {
   for (const name of Object.keys(__cell.objectEntrypoints))
     out[name] = __entrypointStub(name, undefined);
   // Loader 0 is the script's own isolate: a facet of such a class runs
-  // beside the object that holds it.
+  // beside the object that holds it. A class with a namespace is its loopback
+  // namespace handle; one without is a loopback class handle.
+  const actor = (name) => Object.hasOwn(__cell.namespaceKeys, name)
+    ? __makeLoopbackNamespace(name)
+    : __makeLoopbackDurableObjectClass(name);
   for (const name of Object.keys(__cell.doExports)) {
     if (__runtimeClasses.has(name)) continue;
-    out[name] = Object.hasOwn(__cell.namespaceKeys, name)
-      ? __cell.makeNamespace(name)
-      : __makeLoopbackDurableObjectClass(name);
+    out[name] = actor(name);
+  }
+  // Every other export is one too: workerd treats a class that inherits no
+  // entrypoint base as a Durable Object class (missingSuperclass), and a
+  // plain function export is a handler, both of which reach `ctx.exports`
+  // (#259).
+  for (const name of Object.keys(__cell.classes)) {
+    if (__runtimeClasses.has(name) || Object.hasOwn(out, name)) continue;
+    // A module export name cannot begin with a dot, so the reserved `.cron`
+    // cell is the runtime's, never a handle.
+    if (name.startsWith(".")) continue;
+    out[name] = actor(name);
   }
   return out;
 })();

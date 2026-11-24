@@ -340,6 +340,18 @@ the union of the main module's and every sibling's imports.
 - `passThroughOnException()` has no effect, because Cello has no CDN
   fallback.
 - `ctx.facets` is available only inside a Durable Object.
+- `ctx.exports` is the module's export map, in a Durable Object as in a
+  stateless entrypoint: each export is an own, enumerable, writable property
+  whose `typeof` is `"function"`, and the value is workerd's loopback handle
+  for it. A Durable Object class is a callable
+  `[object LoopbackDurableObjectNamespace]` (its `get`, `getByName`,
+  `idFromName`, `idFromString`, `newUniqueId` and `jurisdiction` reach the
+  same object the binding does, and calling it with `{ props }` specializes
+  the class for a facet); a class with no namespace is a callable
+  `[object LoopbackDurableObjectClass]`; and a plain handler is an
+  `[object LoopbackServiceStub]` whose `fetch` reaches that entrypoint. A
+  handle carries no own `name`, `length` or `prototype`. A non-function,
+  non-object export fails the deployment's load, as it does on workerd.
 
 ### [Handlers](https://developers.cloudflare.com/workers/runtime-apis/handlers/)
 

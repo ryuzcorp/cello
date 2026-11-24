@@ -56,6 +56,20 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
   instead of waiting 30 s. The differential gate gained three cases
   (`do/block-refusals`, `do/nested-block-order`, `do/nested-block-drain`)
   that fail before this change and every case agrees.
+- **A Durable Object's `ctx.exports` lists every module export (#259).** It
+  answered only `default`, because the class registries it was built from
+  hold just entrypoints; a class that inherits no entrypoint base (workerd's
+  `missingSuperclass` case) never reached it. Every export now appears as an
+  own, enumerable, writable handle whose `typeof` is `"function"`, matching
+  workerd's loopback handles: a Durable Object class is a callable loopback
+  namespace (`get`, `getByName`, `idFromName`, `idFromString`, `newUniqueId`,
+  `jurisdiction`, and calling it specializes the class for a facet), a class
+  with no namespace is a loopback class handle, and a plain handler is a
+  loopback service stub whose `fetch` reaches that entrypoint. The handles
+  carry workerd's tags (`[object LoopbackDurableObjectNamespace]`,
+  `[object LoopbackDurableObjectClass]`, `[object LoopbackServiceStub]`) and
+  no own `name`/`length`/`prototype`. The differential gate gained
+  `do/exports-surface` (233 total) and every case agrees.
 - **A compression stream settles a cancel racing an abort the way Workerd
   does (#252).** A `DecompressionStream`/`CompressionStream` with a write in
   flight, a pending `read()` and a synchronous `reader.cancel()` followed by
