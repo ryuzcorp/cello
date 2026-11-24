@@ -142,6 +142,9 @@ function make(format, decompress, name, missing) {
   // instead of erroring it (#223).
   const wst = __cello.$$writableStreamState(ts.writable);
   wst.closesOnError = true;
+  // ... and an invalid chunk rejects only that write, leaving both sides
+  // usable: the conversion throws before any native call (#276).
+  wst.validateChunk = bytes;
   // Last, so nothing after it can throw and strand the native stream.
   // Throws a RangeError when the isolate holds too many.
   id = __zlib_stream_new(format, decompress);

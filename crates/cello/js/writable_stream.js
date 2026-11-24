@@ -85,6 +85,12 @@ class WritableStreamState {
     // the cancel arrives that never started transforming; cleared when the
     // error settles.
     this.writeError = null;
+    // A byte transform validates the chunk when the sink accepts the
+    // write, not when the transform runs (#276): an invalid chunk rejects
+    // only that write, leaving both sides usable. Compression streams opt
+    // in through the private writable state, the same way `closesOnError`
+    // does; every other stream leaves this null.
+    this.validateChunk = null;
     // Workerd's compression streams are also internal on the read side: a
     // readable cancel does not error the writable. It records the cancel
     // error here instead, so a write the writable accepted afterwards
@@ -391,6 +397,14 @@ function __write(st, chunk) {
       __errorStream(st, e);
     }
   }
+  // A byte transform validates the chunk when the write is accepted, not
+  // when the transform runs (#276): an invalid chunk rejects only that
+  // write, leaving both sides usable. Only compression streams opt in.
+  if (st.validateChunk !== null && st.validateChunk !== undefined) {
+    try { st.validateChunk(chunk); }
+    catch (e) { return Promise.reject(e); }
+  }
+
   if (st.state === 'errored')
     return Promise.reject(st.storedError);
   // Workerd names each state separately here (#132), and its message
