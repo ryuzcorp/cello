@@ -204,7 +204,8 @@ class WritableStreamDefaultWriter {
         "WritableStream argument");
     const st = __wsState(stream);
     if (st.locked)
-      throw new TypeError("WritableStream is locked");
+      throw new TypeError(
+        "This WritableStream is currently locked to a writer.");
     const state = this.#s = new WriterState(stream);
     _writerStates.set(this, state);
     st.locked = true;
@@ -224,8 +225,10 @@ class WritableStreamDefaultWriter {
 
     __resetReady(state);
     if (st.state === 'writable') {
-      if (__closing(st) || !st.backpressure)
-        __resolveReady(state);
+      // Workerd resolves a fresh writer's ready from the stream's
+      // backpressure alone: a queued close does not resolve it while the
+      // stream is still over its high-water mark (#245).
+      if (!st.backpressure) __resolveReady(state);
     } else if (st.state === 'closed') {
       __resolveReady(state);
       __resolveClosed(state);
@@ -288,15 +291,20 @@ class WritableStreamDefaultWriter {
     state.readyReject = null;
     __rejectClosedWriter(state, err);
     // Workerd also rejects queued (not in-flight) writes
-    // with the same error; the chunks are dropped.
-    for (const entry of s.queue) entry.reject(err);
+    // with the same error; the chunks are dropped. The
+    // write already dispatched keeps its size in the queue
+    // total until it settles, so a new writer's desiredSize
+    // and ready still see that reservation (#245).
+    for (const entry of s.queue) {
+      entry.reject(err);
+      s.queueSize -= entry.size;
+    }
+    if (s.queueSize < 0) s.queueSize = 0;
     s.queue = [];
-    s.queueSize = 0;
-    // The queue is empty now, so the stream is no longer over its
-    // high-water mark. Recompute rather than leave the stale flag: a new
-    // writer's ready resolves on construction only when backpressure is
-    // clear, and nothing else would re-run the check while the start gate
-    // is still open (#232).
+    // Recompute rather than leave the stale flag: a new writer's ready
+    // resolves on construction only when backpressure is clear, and nothing
+    // else would re-run the check while the start gate is still open
+    // (#232, #245).
     s.backpressure = s.queueSize >= s.hwm;
     s.locked = false;
     s.writer = null;
@@ -617,7 +625,14 @@ function __finishClose(st) {
     }
   }
   st.state = 'closed';
-  if (st.writer) __resolveClosed(__wtrState(st.writer));
+  if (st.writer) {
+    const writerState = __wtrState(st.writer);
+    // A close queued while the stream was over its high-water mark left
+    // ready pending (the write-completion path skips backpressure while
+    // closing); workerd resolves it when the close lands (#245).
+    __resolveReady(writerState);
+    __resolveClosed(writerState);
+  }
 }
 
 function __finishCloseWithError(st, e) {

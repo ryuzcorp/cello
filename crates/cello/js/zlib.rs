@@ -28,8 +28,9 @@ pub(super) fn op_zlib(
     let result = (|| -> Result<Vec<u8>> {
         match mode.as_str() {
             "gzip" => {
-                let mut encoder =
-                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                let mut encoder = flate2::GzBuilder::new()
+                    .operating_system(3)
+                    .write(Vec::new(), ZlibStream::LEVEL);
                 encoder.write_all(&bytes)?;
                 Ok(encoder.finish()?)
             }
@@ -40,8 +41,7 @@ pub(super) fn op_zlib(
                 Ok(out)
             }
             "deflate" => {
-                let mut encoder =
-                    flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+                let mut encoder = ZlibFramed::new(ZlibStream::LEVEL);
                 encoder.write_all(&bytes)?;
                 Ok(encoder.finish()?)
             }
@@ -82,7 +82,7 @@ pub(super) fn op_zlib(
 enum ZlibStream {
     GzipEncode(flate2::write::GzEncoder<Vec<u8>>),
     GzipDecode(Box<GzipDecode>),
-    ZlibEncode(flate2::write::ZlibEncoder<Vec<u8>>),
+    ZlibEncode(ZlibFramed),
     ZlibDecode(flate2::write::ZlibDecoder<Vec<u8>>),
     RawEncode(flate2::write::DeflateEncoder<Vec<u8>>),
     RawDecode(flate2::write::DeflateDecoder<Vec<u8>>),
@@ -93,6 +93,73 @@ enum ZlibStream {
     // otherwise carry that size in every variant (clippy::large_enum_variant).
     BrotliEncode(Box<brotli::CompressorWriter<Vec<u8>>>),
     BrotliDecode(Box<brotli::DecompressorWriter<Vec<u8>>>),
+}
+
+/// A raw deflate encoder wrapped in the zlib framing workerd writes: the
+/// header is always `78 9c` (FLEVEL 2, what zlib emits for level 6) even
+/// though the body is compressed at workerd's level 7, and the trailer is
+/// the Adler-32 of the input in big-endian order. flate2's own
+/// `ZlibEncoder` derives FLEVEL from the level (`78 da`), which is the one
+/// observable difference left in the `deflate` stream's bytes (#245).
+struct ZlibFramed {
+    inner: flate2::write::DeflateEncoder<Vec<u8>>,
+    adler: adler2::Adler32,
+    header: bool,
+}
+
+impl ZlibFramed {
+    /// The zlib FCHECK-valid header workerd writes: CMF 0x78 (deflate, 32K
+    /// window), FLG 0x9c (FLEVEL 2, no dictionary, check bits).
+    const HEADER: [u8; 2] = [0x78, 0x9c];
+
+    fn new(level: flate2::Compression) -> Self {
+        ZlibFramed {
+            inner: flate2::write::DeflateEncoder::new(Vec::new(), level),
+            adler: adler2::Adler32::new(),
+            header: false,
+        }
+    }
+
+    fn write_header(&mut self) {
+        if self.header {
+            return;
+        }
+        self.header = true;
+        self.inner.get_mut().extend_from_slice(&Self::HEADER);
+    }
+
+    fn get_ref(&self) -> &Vec<u8> {
+        self.inner.get_ref()
+    }
+
+    fn get_mut(&mut self) -> &mut Vec<u8> {
+        self.inner.get_mut()
+    }
+
+    fn finish(mut self) -> std::io::Result<Vec<u8>> {
+        self.write_header();
+        let mut out = self.inner.finish()?;
+        out.extend_from_slice(&self.adler.checksum().to_be_bytes());
+        Ok(out)
+    }
+}
+
+impl std::io::Write for ZlibFramed {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.write_header();
+        // flate2's codec hands back a partial count when its output buffer
+        // fills; the caller re-writes the remainder, so only the consumed
+        // bytes may count towards the trailer (flate2's own `GzEncoder`
+        // does the same two lines away).
+        let n = self.inner.write(buf)?;
+        self.adler.write_slice(&buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.write_header();
+        self.inner.flush()
+    }
 }
 
 /// Workerd's gzip close() message for a member whose trailer never arrived,
@@ -165,7 +232,7 @@ enum GzipPhase {
 }
 
 const GZIP_FAILURE: &str = "Decompression failed.";
-const GZIP_TRAILING: &str = "Trailing bytes after end of compressed data";
+const TRAILING: &str = "Trailing bytes after end of compressed data";
 
 /// The bytes after a NUL-terminated header field, or `None` when this
 /// chunk ends inside it and the next push has to carry the terminator.
@@ -367,7 +434,7 @@ impl GzipDecode {
                 }
                 GzipPhase::Done => {
                     if !input.is_empty() {
-                        return Err(anyhow!(GZIP_TRAILING));
+                        return Err(anyhow!(TRAILING));
                     }
                     self.phase = GzipPhase::Done;
                     return Ok(out);
@@ -425,14 +492,24 @@ macro_rules! zlib_each_flate {
 }
 
 impl ZlibStream {
+    /// Workerd's encoder settings: zlib at level 7 (measured: its gzip bytes
+    /// equal zlib's level 7 for every probe payload, and differ from level 6
+    /// on inputs where the levels diverge), mtime 0, XFL 0 and the header's
+    /// OS byte 3 (Unix), with the zlib backend behind it (#245).
+    const LEVEL: flate2::Compression = flate2::Compression::new(7);
+
     fn new(format: &str, decompress: bool) -> Option<ZlibStream> {
         use flate2::write as z;
-        let level = flate2::Compression::default();
+        let level = Self::LEVEL;
         let sink = Vec::new;
         Some(match (format, decompress) {
-            ("gzip", false) => Self::GzipEncode(z::GzEncoder::new(sink(), level)),
+            ("gzip", false) => Self::GzipEncode(
+                flate2::GzBuilder::new()
+                    .operating_system(3)
+                    .write(sink(), level),
+            ),
             ("gzip", true) => Self::GzipDecode(Box::new(GzipDecode::new())),
-            ("deflate", false) => Self::ZlibEncode(z::ZlibEncoder::new(sink(), level)),
+            ("deflate", false) => Self::ZlibEncode(ZlibFramed::new(level)),
             ("deflate", true) => Self::ZlibDecode(z::ZlibDecoder::new(sink())),
             ("deflate-raw", false) => Self::RawEncode(z::DeflateEncoder::new(sink(), level)),
             ("deflate-raw", true) => Self::RawDecode(z::DeflateDecoder::new(sink())),
@@ -477,11 +554,15 @@ impl ZlibStream {
         }
         const ENCODER_CHUNK: usize = 32 * 1024;
         let failure = self.failure();
+        // A decoder that stops consuming has reached the end of its stream,
+        // so the rest of the push is trailing garbage; workerd names that
+        // case separately from a corrupt stream (#245).
+        let stop = if self.decompress() { TRAILING } else { failure };
         let held = if self.decompress() { 0 } else { ENCODER_CHUNK };
         zlib_each!(self, w => {
             while !input.is_empty() {
                 let n = w.write(input).map_err(|_| anyhow!(failure))?;
-                if n == 0 { return Err(anyhow!(failure)); }
+                if n == 0 { return Err(anyhow!(stop)); }
                 input = &input[n..];
             }
             if w.get_ref().len() < held { return Ok(Vec::new()); }
@@ -733,6 +814,71 @@ export default {
           trailing: await attempt(trailing),
         });
       }
+      case "/encoded-bytes": {
+        // Workerd's encoder settings: zlib level 7 with mtime 0, OS 3 and the
+        // deflate header 78 9c (#245). The expected hex is workerd's own
+        // output for "hello".
+        const hex = (bytes) =>
+          [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+        const payload = new TextEncoder().encode("hello");
+        const out = {};
+        for (const format of ["gzip", "deflate", "deflate-raw"]) {
+          out[format] = hex(await through(new CompressionStream(format), payload));
+        }
+        return Response.json(out);
+      }
+      case "/deflate-chunking": {
+        // The Adler-32 trailer must cover exactly the bytes the encoder
+        // consumed, so a write that flate2 splits at its 32 KiB output
+        // buffer still produces a decodable stream that equals the same
+        // input written in one piece (#245 review).
+        const size = 1024 * 1024;
+        const data = new Uint8Array(size);
+        let seed = 7;
+        for (let i = 0; i < size; i += 1) {
+          seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+          data[i] = (seed >>> 16) & 0xff;
+        }
+        const digest = async (bytes) => {
+          const hash = await crypto.subtle.digest("SHA-256", bytes);
+          return [...new Uint8Array(hash)]
+            .map((b) => b.toString(16).padStart(2, "0")).join("");
+        };
+        const encode = async (chunks) => {
+          const stream = new CompressionStream("deflate");
+          const writer = stream.writable.getWriter();
+          const read = drain(stream.readable);
+          for (const chunk of chunks) await writer.write(chunk);
+          await writer.close();
+          return await read;
+        };
+        const decode = async (bytes) => {
+          const stream = new DecompressionStream("deflate");
+          const writer = stream.writable.getWriter();
+          const read = drain(stream.readable);
+          await writer.write(bytes);
+          await writer.close();
+          return await read;
+        };
+        const pieces = (step) => {
+          const out = [];
+          for (let at = 0; at < size; at += step)
+            out.push(data.subarray(at, Math.min(size, at + step)));
+          return out;
+        };
+        const single = await encode([data]);
+        const chunked = await encode(pieces(65536));
+        const odd = await encode(pieces(70000));
+        const back = await decode(single);
+        return Response.json({
+          source: await digest(data),
+          single: await digest(single),
+          chunked: await digest(chunked),
+          odd: await digest(odd),
+          decoded: await digest(back),
+          decodedLength: back.byteLength,
+        });
+      }
       case "/release": {
         // Held, so only the stream's own ending can release its entry.
         const cancelled = new CompressionStream("gzip");
@@ -860,6 +1006,43 @@ export default {
             }
         }
         panic!("foreground tasks kept coming after 1024 runs");
+    }
+
+    /// A deflate write larger than flate2's 32 KiB output buffer is split
+    /// inside the encoder; the Adler-32 must cover only the bytes it
+    /// consumed, so chunked and single-shot output are identical and the
+    /// result decodes (through flate2's `ZlibDecoder`, which the
+    /// `DecompressionStream` path uses). Regression for #245's review.
+    #[test]
+    fn deflate_chunking_stays_lossless() {
+        on_engine_thread(|| {
+            let mut worker = load();
+            let report = fetch(&mut worker, "/deflate-chunking");
+            let source = report["source"].as_str().expect("digest").to_string();
+            assert_eq!(report["single"], report["chunked"], "{report}");
+            assert_eq!(report["single"], report["odd"], "{report}");
+            assert_eq!(report["decoded"], source, "{report}");
+            assert_eq!(report["decodedLength"], 1024 * 1024, "{report}");
+            assert_eq!(live(&worker), 0);
+        });
+    }
+
+    /// The encoders write workerd's bytes: zlib level 7, gzip mtime 0 with
+    /// OS 3, and the deflate header 78 9c. The expected hex is workerd
+    /// 1.20261121.1's own output for "hello" (#245).
+    #[test]
+    fn encoders_write_workerd_bytes() {
+        on_engine_thread(|| {
+            let mut worker = load();
+            let report = fetch(&mut worker, "/encoded-bytes");
+            assert_eq!(
+                report["gzip"], "1f8b0800000000000003cb48cdc9c9070086a6103605000000",
+                "{report}"
+            );
+            assert_eq!(report["deflate"], "789ccb48cdc9c90700062c0215", "{report}");
+            assert_eq!(report["deflate-raw"], "cb48cdc9c90700", "{report}");
+            assert_eq!(live(&worker), 0);
+        });
     }
 
     /// A gzip member is framed natively: an unfinished member is the

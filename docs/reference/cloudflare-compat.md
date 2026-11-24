@@ -384,11 +384,24 @@ The `tail` and `email` handlers are unavailable.
   gzip header CRC (FHCRC) is verified, and the trailer's CRC-32 and ISIZE
   are checked by the push that completes each field; a member whose trailer
   never arrived reports the incomplete-data error on `close()`, and bytes
-  after the member report the trailing-bytes error.
+  after the member report the trailing-bytes error; a `deflate` or
+  `deflate-raw` stream reports the same trailing-bytes error for input past
+  its end. The encoders write Workerd's bytes: zlib level 7, gzip with
+  mtime 0, XFL 0 and OS 3, and a `deflate` stream whose zlib header is
+  `78 9c` with an Adler-32 over exactly the bytes the encoder consumed, so
+  a byte comparison of compressed output agrees with Workerd, chunked or
+  not.
 - `releaseLock()` recomputes backpressure after dropping the released
-  writer's queued writes, so a new writer's `ready` settles exactly as on
-  Workerd, and `desiredSize` keeps reporting the queue formula while the
-  stream is erroring (it can go negative) instead of `null`.
+  writer's queued writes and keeps the dispatched write's size in the queue
+  total, so a new writer's `ready` and `desiredSize` settle exactly as on
+  Workerd; `ready` follows backpressure alone, staying pending behind a
+  queued close while the stream is over its high-water mark and resolving
+  when the close lands. `desiredSize` keeps reporting the queue formula
+  while the stream is erroring (it can go negative) instead of `null`. A
+  locked stream reports `This WritableStream is currently locked to a
+  writer.` or `This ReadableStream is currently locked to a reader.`, in
+  `pipeTo`/`pipeThrough` as well (Workerd's `pipeTo` writable message has
+  no trailing period; `pipeThrough`'s does).
 - Byte streams cross isolate boundaries on the same node as part of
   Durable Object RPC, in both directions: a `ReadableStream` your cell
   returns reads chunk by chunk, and a `WritableStream` it returns accepts

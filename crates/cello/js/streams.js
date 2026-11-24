@@ -424,7 +424,8 @@ class ReadableStreamDefaultReader {
         "ReadableStream argument");
     const st = __rsState(stream);
     if (st.locked)
-      throw new TypeError("ReadableStream is locked");
+      throw new TypeError(
+        "This ReadableStream is currently locked to a reader.");
     this.#stream = stream;
     st.locked = true;
     st.reader = this;
@@ -877,12 +878,14 @@ class ReadableStream {
       signal = options.signal;
     }
     const st = this.#s;
+    // Workerd's pipeTo texts, including its writable one without the
+    // trailing period that getWriter uses (#245).
     if (st.locked)
       return Promise.reject(new TypeError(
-        "ReadableStream is locked"));
+        "This ReadableStream is currently locked to a reader."));
     if (__cello.$$writableStreamState(destination).locked)
       return Promise.reject(new TypeError(
-        "WritableStream is locked"));
+        "This WritableStream is currently locked to a writer"));
     if (signal && signal.aborted) {
       const err = signal.reason || new DOMException(
         "The operation was aborted", "AbortError");
@@ -998,10 +1001,10 @@ class ReadableStream {
         "transform.writable must be WritableStream");
     if (this.#s.locked)
       throw new TypeError(
-        "ReadableStream is locked");
+        "This ReadableStream is currently locked to a reader.");
     if (__cello.$$writableStreamState(transform.writable).locked)
       throw new TypeError(
-        "WritableStream is locked");
+        "This WritableStream is currently locked to a writer.");
     // Spec: mark the pipeTo promise as handled --
     // pipeTo already mirrors errors between the two
     // streams via the readable's error state, so a
