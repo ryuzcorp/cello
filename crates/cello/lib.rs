@@ -341,6 +341,12 @@ pub fn worker_compat(metadata: &serde_json::Value) -> js::Compat {
         // default, this type is data already in the database, so an
         // unversioned deployment must not start rewriting it.
         sql_boolean_text: switch("sql_boolean_text", "no_sql_boolean_text", "2026-11-24"),
+        // The same date and reasoning as `sql_boolean_text`: workerd's D1
+        // binding stores a JavaScript number as REAL at every compatibility
+        // date, so Cello starts matching it at the release that can store the
+        // new type. A deployment with no date keeps INTEGER, because a stored
+        // type is data already in the database.
+        d1_number_real: switch("d1_number_real", "no_d1_number_real", "2026-11-24"),
         // The opt-out wins over both the implicit `nodejs_compat`
         // population and the explicit populate flag, matching Cloudflare's
         // `nodejs_compat_do_not_populate_process_env` (denoland/celld#296).
@@ -404,5 +410,22 @@ mod compat_tests {
         assert!(boolean_text(Some("2026-11-01"), &["sql_boolean_text"]));
         assert!(!boolean_text(Some("2027-01-01"), &["no_sql_boolean_text"]));
         assert!(!boolean_text(None, &["no_sql_boolean_text"]));
+    }
+
+    #[test]
+    fn d1_number_real_follows_date_flags_and_absence() {
+        let number_real = |date: Option<&str>, flags: &[&str]| {
+            worker_compat(&metadata(date, flags)).d1_number_real
+        };
+        // The gate's date is inclusive: the day before keeps INTEGER.
+        assert!(!number_real(Some("2026-11-23"), &[]));
+        assert!(number_real(Some("2026-11-24"), &[]));
+        assert!(number_real(Some("2027-01-01"), &[]));
+        // No compatibility_date keeps INTEGER, as for `sql_boolean_text`.
+        assert!(!number_real(None, &[]));
+        // Either explicit flag wins over the date, in both directions.
+        assert!(number_real(Some("2026-11-01"), &["d1_number_real"]));
+        assert!(!number_real(Some("2027-01-01"), &["no_d1_number_real"]));
+        assert!(!number_real(None, &["no_d1_number_real"]));
     }
 }

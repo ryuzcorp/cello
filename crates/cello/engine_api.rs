@@ -276,6 +276,12 @@ pub struct Compat {
     /// Without it — a compatibility date before 2026-11-24, or none — the
     /// bind stays INTEGER `1`/`0`, the type Cello wrote before that date.
     pub sql_boolean_text: bool,
+    /// `d1_number_real`: a JavaScript number bound through a D1 statement is
+    /// stored as SQLite REAL, which is what workerd's binding stores, so
+    /// `typeof(?)` is `'real'` and an untyped column keeps a REAL. Without
+    /// it — a compatibility date before 2026-11-24, or none — a whole number
+    /// binds as INTEGER, the type Cello wrote before that date.
+    pub d1_number_real: bool,
     /// Queue bodies default to JSON on compatibility dates after 2024-03-18;
     /// older deployments retain the V8 structured-clone default.
     pub queue_json_messages: bool,
@@ -327,6 +333,11 @@ impl Compat {
     ///   binds through its own adapter, and the queue, workflow and wake
     ///   tables bind typed values in Rust — so the union never changes
     ///   the type a script's own rows were written with.
+    /// - `d1_number_real` is read only by the D1 client in the calling
+    ///   isolate, which stamps each statement with its own switch; the D1
+    ///   cell converts that request's binds by the stamp it receives. The
+    ///   shared cell therefore never consults the union, and two scripts
+    ///   binding one database each keep their own script's type.
     ///
     /// No tenant code runs in the runtime isolate, so the reflected
     /// `Cloudflare.compatibilityFlags` there is unread too. A future
@@ -343,6 +354,7 @@ impl Compat {
             websocket_standard_binary_type: self.websocket_standard_binary_type
                 || other.websocket_standard_binary_type,
             sql_boolean_text: self.sql_boolean_text || other.sql_boolean_text,
+            d1_number_real: self.d1_number_real || other.d1_number_real,
             queue_json_messages: self.queue_json_messages || other.queue_json_messages,
             nodejs_process_env: self.nodejs_process_env || other.nodejs_process_env,
         }

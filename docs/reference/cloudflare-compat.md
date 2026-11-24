@@ -257,6 +257,19 @@ service; the [KV](../services/kv.md), [R2](../services/r2.md) and
   where the string `'false'` is truthy; the [Durable
   Objects](../services/durable-objects.md#boolean-binds) page has the
   migration.
+- **A D1 number bind is REAL from compatibility date 2026-11-24.**
+  Workerd's D1 binding stores every JavaScript number as SQLite `REAL`
+  (`typeof(?)` is `'real'`), while Cloudflare's published type-conversion
+  table lists a whole `Number` as `INTEGER` beside a `Number` as `REAL`. The
+  pinned workerd is what the differential gate compares against, so Cello
+  matches it from the gate's date; the compatibility date and the opt-out flag
+  keep the documented `INTEGER` available. Cello bound a whole number as
+  `INTEGER` before that date and keeps doing so at an older date or with none.
+  `d1_number_real` and `no_d1_number_real` force either type. An affinity
+  still converts: `INTEGER`/`NUMERIC` take an integral `REAL` back to
+  `INTEGER`, and a `TEXT` column renders `'1.0'` where it rendered `'1'`. The
+  [D1](../services/d1.md#number-binds-and-the-compatibility-date) page has
+  the migration.
 - **R2 cursors are opaque tokens.** A string outside the token format that
   names no object gets the empty page R2 answers instead of a listing
   restarted from the top. A plain key is still read as the cursor 0.2.9
@@ -698,6 +711,8 @@ Cello honors these compatibility flags:
   after 2026-03-17; `no_websocket_standard_binary_type` opts out
 - `sql_boolean_text`, implied for compatibility dates on or after
   2026-11-24; `no_sql_boolean_text` opts out. Setting both refuses startup.
+- `d1_number_real`, implied for compatibility dates on or after 2026-11-24;
+  `no_d1_number_real` opts out. Setting both refuses startup.
 - The static-assets navigation flags
 
 Cello accepts every other flag without effect.

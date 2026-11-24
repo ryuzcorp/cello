@@ -10905,6 +10905,7 @@ class __D1DatabaseCell {
         sql: String(statement.sql),
         params: statement.params || [],
         first: !!statement.first,
+        number_real: !!statement.numberReal,
       })
     );
   }
@@ -10914,6 +10915,7 @@ class __D1DatabaseCell {
       statements: statements.map((statement) => ({
         sql: String(statement.sql),
         params: statement.params || [],
+        number_real: !!statement.numberReal,
       })),
     });
   }
@@ -11088,7 +11090,12 @@ class D1PreparedStatement {
   }
   async #run(first) {
     const results = await __d1Query(this.#database, [
-      { sql: this.#sql, params: this.#params, first },
+      {
+        sql: this.#sql,
+        params: this.#params,
+        first,
+        numberReal: __cell.compat.d1NumberReal,
+      },
     ]);
     return results[0];
   }
@@ -11242,6 +11249,7 @@ class D1Database {
       const encoded = statements.map((statement) => ({
         sql: __d1Statement(statement).sql,
         params: __d1Statement(statement).params,
+        numberReal: __cell.compat.d1NumberReal,
       }));
       const results = await this.#stub.__d1Batch(encoded);
       return results.map(__d1PublicResult);

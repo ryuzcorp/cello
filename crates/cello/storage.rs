@@ -2869,6 +2869,11 @@ pub enum D1Request {
         /// over a large table neither clones the table nor trips a cap.
         #[serde(default)]
         first: bool,
+        /// The calling script's `d1_number_real` switch, stamped by the D1
+        /// client in its isolate. Absent from an older caller or the CLI,
+        /// which keep INTEGER.
+        #[serde(default)]
+        number_real: bool,
     },
     /// `batch(statements)`: prepared statements in one transaction.
     Batch { statements: Vec<D1PreparedRequest> },
@@ -2910,6 +2915,10 @@ pub struct D1PreparedRequest {
     sql: String,
     #[serde(default)]
     params: Vec<serde_json::Value>,
+    /// The calling script's `d1_number_real` switch; see
+    /// [`D1Request::Prepared`].
+    #[serde(default)]
+    number_real: bool,
 }
 
 /// D1 `meta`, snapshotted inside the same execution that produced the rows.
@@ -3039,11 +3048,25 @@ const D1_INCOMPLETE: &str =
 /// route reaches this function without that client. The previous adapter
 /// mapped anything unrecognized to SQL NULL, so a `Uint8Array` bind stored
 /// NULL and nothing said so.
-fn d1_bind_value(value: &serde_json::Value) -> Result<rusqlite::types::Value, D1Failure> {
+fn d1_bind_value(
+    value: &serde_json::Value,
+    number_real: bool,
+) -> Result<rusqlite::types::Value, D1Failure> {
     use rusqlite::types::Value;
     match value {
         serde_json::Value::Null => Ok(Value::Null),
+        // `d1_number_real` reproduces workerd's binding, which stores every
+        // JavaScript number -- and so a boolean, which its own client turns
+        // into 0/1 -- as REAL. Before the gate these bound as INTEGER, the
+        // type Cello wrote since its first D1 release; see
+        // docs/services/d1.md.
+        serde_json::Value::Bool(flag) if number_real => {
+            Ok(Value::Real(if *flag { 1.0 } else { 0.0 }))
+        }
         serde_json::Value::Bool(flag) => Ok(Value::Integer(*flag as i64)),
+        serde_json::Value::Number(number) if number_real => {
+            Ok(Value::Real(number.as_f64().unwrap_or(0.0)))
+        }
         serde_json::Value::Number(number) if number.is_i64() => {
             Ok(Value::Integer(number.as_i64().expect("checked i64")))
         }
@@ -3539,18 +3562,30 @@ unsafe fn d1_run_statements(
     }
 }
 
+/// One statement's bind values and the switch that decides their SQLite
+/// type. They always travel together: a statement's numbers are REAL or
+/// INTEGER as one, never per value.
+struct D1Binds<'a> {
+    params: &'a [serde_json::Value],
+    number_real: bool,
+}
+
 unsafe fn d1_run_prepared(
     scope: &str,
     connection: &Connection,
     sql: &str,
-    params: &[serde_json::Value],
+    binds: D1Binds<'_>,
     keep: usize,
     budget: &mut usize,
     started: std::time::Instant,
 ) -> Result<D1PreparedResult, D1Failure> {
-    let mut binds = Vec::with_capacity(params.len());
+    let D1Binds {
+        params,
+        number_real,
+    } = binds;
+    let mut values = Vec::with_capacity(params.len());
     for value in params {
-        binds.push(d1_bind_value(value)?);
+        values.push(d1_bind_value(value, number_real)?);
     }
     let source =
         CString::new(sql).map_err(|error| d1_error(format!("invalid SQL text: {error}")))?;
@@ -3584,13 +3619,13 @@ unsafe fn d1_run_prepared(
         ));
     }
     let expected = rusqlite::ffi::sqlite3_bind_parameter_count(statement) as usize;
-    if expected != binds.len() {
+    if expected != values.len() {
         rusqlite::ffi::sqlite3_finalize(statement);
         return Err(d1_error(
             "Wrong number of parameter bindings for SQL query.",
         ));
     }
-    for (offset, value) in binds.iter().enumerate() {
+    for (offset, value) in values.iter().enumerate() {
         if let Err(code) = bind_cursor_value(statement, offset as i32 + 1, value) {
             let failure = d1_sqlite_failure(
                 scope,
@@ -4640,7 +4675,12 @@ pub fn d1_run(scope: &str, request: &D1Request) -> Result<D1Response, D1Failure>
     require_sql_healthy(scope).map_err(d1_error)?;
     let started = std::time::Instant::now();
     match request {
-        D1Request::Prepared { sql, params, first } => {
+        D1Request::Prepared {
+            sql,
+            params,
+            first,
+            number_real,
+        } => {
             let keep = if *first { 1 } else { D1_MAX_ROWS };
             with(scope, |connection| {
                 as_user_sql(|| {
@@ -4648,7 +4688,18 @@ pub fn d1_run(scope: &str, request: &D1Request) -> Result<D1Response, D1Failure>
                     // SAFETY: the connection lives in DBS until close(), and
                     // the helper finalizes its statement on every path.
                     unsafe {
-                        d1_run_prepared(scope, connection, sql, params, keep, &mut budget, started)
+                        d1_run_prepared(
+                            scope,
+                            connection,
+                            sql,
+                            D1Binds {
+                                params,
+                                number_real: *number_real,
+                            },
+                            keep,
+                            &mut budget,
+                            started,
+                        )
                     }
                     .map(D1Response::Prepared)
                 })
@@ -4672,7 +4723,10 @@ pub fn d1_run(scope: &str, request: &D1Request) -> Result<D1Response, D1Failure>
                             scope,
                             connection,
                             &statement.sql,
-                            &statement.params,
+                            D1Binds {
+                                params: &statement.params,
+                                number_real: statement.number_real,
+                            },
                             D1_MAX_ROWS,
                             &mut budget,
                             statement_started,
@@ -6349,6 +6403,52 @@ mod sqlite_cache_tests {
 }
 
 #[cfg(test)]
+mod d1_bind_tests {
+    use super::*;
+
+    fn bind(value: serde_json::Value, number_real: bool) -> rusqlite::types::Value {
+        d1_bind_value(&value, number_real)
+            .ok()
+            .expect("the value is bindable")
+    }
+
+    #[test]
+    fn numbers_bind_integer_before_the_gate_and_real_after() {
+        use rusqlite::types::Value;
+        // Before `d1_number_real`: a whole number stays INTEGER and only a
+        // fraction is REAL, the type Cello wrote since its first D1 release.
+        assert_eq!(bind(serde_json::json!(0), false), Value::Integer(0));
+        assert_eq!(bind(serde_json::json!(1), false), Value::Integer(1));
+        assert_eq!(bind(serde_json::json!(-1), false), Value::Integer(-1));
+        assert_eq!(bind(serde_json::json!(1.5), false), Value::Real(1.5));
+        // After it every number is REAL, which is what workerd's binding
+        // stores, including one too large for i64.
+        assert_eq!(bind(serde_json::json!(0), true), Value::Real(0.0));
+        assert_eq!(bind(serde_json::json!(1), true), Value::Real(1.0));
+        assert_eq!(bind(serde_json::json!(-1), true), Value::Real(-1.0));
+        assert_eq!(bind(serde_json::json!(1.5), true), Value::Real(1.5));
+        let two53 = 9_007_199_254_740_992_i64;
+        assert_eq!(
+            bind(serde_json::json!(two53), true),
+            Value::Real(9_007_199_254_740_992.0)
+        );
+        // The JS client turns a boolean into 0/1 before the engine sees it;
+        // the CLI can still send one, and the gate makes it REAL too.
+        assert_eq!(bind(serde_json::json!(true), false), Value::Integer(1));
+        assert_eq!(bind(serde_json::json!(true), true), Value::Real(1.0));
+        assert_eq!(bind(serde_json::json!(false), true), Value::Real(0.0));
+        // Nothing else changes with the switch.
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!("x"),
+            serde_json::json!([1, 2, 255]),
+        ] {
+            assert_eq!(bind(value.clone(), false), bind(value, true));
+        }
+    }
+}
+
+#[cfg(test)]
 mod d1_export_tests {
     use super::d1_test_db::TestDb;
     use super::*;
@@ -7246,6 +7346,7 @@ mod d1_batch_tests {
         D1PreparedRequest {
             sql: sql.to_string(),
             params,
+            number_real: false,
         }
     }
 
@@ -8174,6 +8275,7 @@ mod d1_exec_error_tests {
                 sql: "SELEC 1".to_string(),
                 params: Vec::new(),
                 first: false,
+                number_real: false,
             },
         ) {
             Err(failure) => {
@@ -8198,6 +8300,7 @@ mod d1_exec_error_tests {
                 sql: "INSERT INTO t (id) VALUES (1)".to_string(),
                 params: Vec::new(),
                 first: false,
+                number_real: false,
             },
         ) {
             Ok(D1Response::Prepared(result)) => assert_eq!(result.meta.total_attempts, 1),

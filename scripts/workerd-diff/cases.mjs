@@ -126,6 +126,7 @@ export const cases = [
   { name: "r2-multipart", fixture: "r2", path: "/multipart" },
   { name: "d1-shape", fixture: "d1", path: "/shape" },
   { name: "d1-bind-types", fixture: "d1", path: "/bind-types" },
+  { name: "d1-number-types", fixture: "d1", path: "/number-types" },
   { name: "d1-exec-errors", fixture: "d1", path: "/exec-errors" },
   { name: "d1-batch", fixture: "d1", path: "/batch" },
   { name: "d1-meta", fixture: "d1", path: "/meta" },

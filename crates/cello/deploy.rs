@@ -3774,6 +3774,12 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
                  sql_boolean_text vs no_sql_boolean_text"
             );
         }
+        if has("d1_number_real") && has("no_d1_number_real") {
+            bail!(
+                "Compatibility flags are mutually contradictory: \
+                 d1_number_real vs no_d1_number_real"
+            );
+        }
     }
     metadata.insert("bindings".into(), Value::Array(bindings));
     if !queue_consumers.is_empty() {

@@ -22,6 +22,29 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
   [Durable Objects](../services/durable-objects.md#boolean-binds) page has the
   details, and `tests/do_sql_boolean_compat.rs` runs the whole migration
   against a real cell.
+- **A D1 number bind is stored as workerd's SQLite REAL from compatibility
+  date 2026-11-24 (#250) — Breaking for new compatibility dates.** Workerd's
+  D1 binding stores every JavaScript number as `REAL`, so `typeof(?)` is
+  `'real'` and an untyped column keeps a `REAL`; Cello bound a whole number as
+  `INTEGER` (a fraction was always `REAL`). A deployment at date 2026-11-24 or
+  later now writes what workerd writes, a boolean included (`1.0`/`0.0`). An
+  older date, or none, keeps `INTEGER`, and `cello d1` keeps `INTEGER` because
+  a command has no compatibility date. `d1_number_real` and
+  `no_d1_number_real` force either type, and setting both refuses startup;
+  the switch belongs to the calling Worker, so scripts sharing one database
+  keep their own type. A column's affinity still converts: `INTEGER`/`NUMERIC`
+  take an integral `REAL` back to `INTEGER`, while a `TEXT` column renders
+  `'1.0'` where it rendered `'1'`, and `WHERE id = ?` on an `INTEGER PRIMARY
+  KEY` still finds its row. A deployment that bumps its date over existing
+  rows mixes the two types in an untyped column; pin `no_d1_number_real`, or
+  normalize with `UPDATE t SET n = CAST(n AS REAL) WHERE typeof(n) =
+  'integer'` before bumping, and once more after every node of a rolling
+  upgrade runs the bumped version, because a node still on the old version
+  ignores the caller's stamp, binds INTEGER, and keeps doing so until it is
+  replaced. The [D1](../services/d1.md#number-binds-and-the-compatibility-date)
+  page has the details, and `tests/d1_number_real_compat.rs` runs the whole
+  migration against a real database. The differential gate gained a
+  `d1-number-types` case (219 total), and every case agrees.
 - **A Durable Object handler failure keeps its shape across nodes (#226).** A
   `stub.fetch()` whose handler throws on another node now rejects with the
   value the handler threw, exactly as a local owner does: an `Error` subclass

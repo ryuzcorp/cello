@@ -108,6 +108,37 @@ const routes = {
     return report(out);
   },
 
+  // Number binds: workerd's binding stores every JavaScript number as REAL,
+  // and this fixture runs at 2026-11-24, the date Cello matches it; an older
+  // date keeps Cello's historical INTEGER (cloudflare-compat.md).
+  async "/number-types"() {
+    await DB.exec("DROP TABLE IF EXISTS nt");
+    await DB.exec("CREATE TABLE nt (plain, i INTEGER, r REAL, t TEXT, n NUMERIC)");
+    await DB.prepare(
+      "INSERT INTO nt (plain, i, r, t, n) VALUES (?, ?, ?, ?, ?)",
+    ).bind(1, 1, 1, 1, 1).run();
+    const out = {};
+    out.whole = await DB.prepare("SELECT ? AS v, typeof(?) AS ty").bind(1, 1).first();
+    out.zero = await DB.prepare("SELECT ? AS v, typeof(?) AS ty").bind(0, 0).first();
+    out.fraction = await DB.prepare("SELECT ? AS v, typeof(?) AS ty").bind(1.5, 1.5).first();
+    out.boolean = await DB.prepare("SELECT ? AS v, typeof(?) AS ty").bind(true, true).first();
+    out.rendered = await DB.prepare("SELECT ? || '' AS v").bind(1).first();
+    out.affinity = await DB.prepare(
+      "SELECT plain, typeof(plain) AS pty, i, typeof(i) AS ity, r, " +
+      "typeof(r) AS rty, t, typeof(t) AS tty, n, typeof(n) AS nty FROM nt",
+    ).first();
+    // A whole number binds REAL but still finds an INTEGER PRIMARY KEY row,
+    // and a non-integral LIMIT is SQLite's datatype mismatch.
+    await DB.exec("DROP TABLE IF EXISTS nid");
+    await DB.exec("CREATE TABLE nid (id INTEGER PRIMARY KEY, name TEXT)");
+    await DB.prepare("INSERT INTO nid (name) VALUES ('a')").run();
+    out.lookup = (await DB.prepare("SELECT id, name FROM nid WHERE id = ?").bind(1).all()).results;
+    out.limit = (await DB.prepare("SELECT id FROM nid LIMIT ?").bind(1).all()).results;
+    out.limitFraction = await attempt(async () =>
+      (await DB.prepare("SELECT id FROM nid LIMIT ?").bind(1.5).all()).results);
+    return report(out);
+  },
+
   // exec: an empty statement set is an error, a syntax error is SQLite's
   // own (with the offset and the code), and success reports the count.
   async "/exec-errors"() {
