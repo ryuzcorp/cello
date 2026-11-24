@@ -240,6 +240,14 @@ export const cases = [
   // bindings in `ctx.exports`, in a plain Worker and inside a Durable Object.
   { name: "workflow-exports", fixture: "workflow", path: "/exports" },
   { name: "workflow-exports-do", fixture: "workflow", path: "/do" },
+  // #275: `status()` answers exactly `{status, error, output}` in every
+  // state, and `sendEvent` to a terminal instance is accepted and dropped.
+  { name: "workflow-status/shape-terminal", fixture: "workflow-status", path: "/shape-terminal" },
+  { name: "workflow-status/shape-live", fixture: "workflow-status", path: "/shape-live" },
+  { name: "workflow-status/send-terminal", fixture: "workflow-status", path: "/send-terminal" },
+  { name: "workflow-status/lifecycle-a", fixture: "workflow-status", path: "/lifecycle-a" },
+  { name: "workflow-status/lifecycle-b", fixture: "workflow-status", path: "/lifecycle-b" },
+  { name: "workflow-status/binding", fixture: "workflow-status", path: "/binding" },
   { name: "ws-pair", fixture: "ws", path: "/pair" },
   { name: "ws-upgrade", fixture: "ws", websocket: "/ws" },
   { name: "ws-hibernation", fixture: "ws-hib", websocket: { path: "/ws", close: false } },

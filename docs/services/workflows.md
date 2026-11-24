@@ -49,9 +49,9 @@ const status = await env.REPORTS.get(instance.id).status();
 - `step.do(name, callback)` runs a durable step, and it retries the callback on failure.
 - `step.sleep(name, duration)` and `step.sleepUntil(name, timestamp)` stop the instance until a deadline.
 - `step.waitForEvent(name, options)` stops the instance until a matching event arrives. It times out after 24 hours by default. An event that arrives before the instance reaches its wait step is buffered.
-- `env.MY_WORKFLOW.create()`, `createBatch()`, and `get(id)` return an instance. `deleteBatch()` deletes several instances.
+- `env.MY_WORKFLOW.create()`, `createBatch()`, and `get(id)` return an instance. `deleteBatch()` deletes several instances and answers `{deleted: [{id}], errors: [{id, code, message}]}`: an absent or malformed id is a per-item `10400` `workflows.api.error.instance.not_found` error, with duplicates preserved.
 - The class is also in `ctx.exports` under its own name, as the same binding over the same instances: `ctx.exports.ReportBuilder.get(instance.id)` reaches the instance `env.REPORTS` created, and vice versa. Workerd keys it by class name, so two workflows cannot name one class.
-- An instance has `status()`, `sendEvent()`, `pause()`, `resume()`, `restart()`, `terminate()`, and `delete()`.
+- An instance has `status()`, `sendEvent()`, `pause()`, `resume()`, `restart()`, `terminate()`, and `delete()`. `status()` answers `{status, error, output}` in every state: `error` is `{name, message}` only after a failure, and `output` is `null` until `run()` returns a value. Sending an event to a `complete`, `errored`, or `terminated` instance succeeds and drops the event, leaving the status untouched; sending to a `paused` instance, or before the instance reaches its wait step, buffers the event for `resume()` or the wait.
 
 Each time an instance makes progress, Cello calls `run()` again from the first line. A finished step returns its stored result and does not run its callback again. Put each subrequest, each side effect, and each value that must stay stable inside a `step.do()` callback, as the [rules of Workflows](https://developers.cloudflare.com/workflows/build/rules-of-workflows/) require. A step whose result did not commit before a node failure runs again, so a step callback must tolerate a second attempt.
 
@@ -70,6 +70,7 @@ A sleep, a wait, and a pending retry each store their deadline, so a crash or a 
 | Retention | Cello retains a successful or failed instance for 30 days by default. Each duration in the `retention` option can be at most 30 days. |
 | Placement | `locationHint` accepts the Cloudflare values, but fleet ownership selects the cell location. |
 | Step budget | Non-step work cannot remain pending for more than 60 seconds. A step result, an event payload, and the workflow parameters each have a 1 MiB limit. |
+| Events | `sendEvent()` needs an event object with a valid type, a `createBatch()` item needs an object, and `restart()` rejects unknown options; workerd is laxer about all three. |
 | Unavailable | Rollback, a sensitive step result, and a `ReadableStream` step result are unavailable. A `workflows` entry cannot carry `schedules`, `limits`, or a `script_name` that names another script. The Workflows REST API and the `wrangler workflows` commands are unavailable; drive an instance through the binding. |
 
 The [Cloudflare compatibility](../reference/cloudflare-compat.md#services) page lists the runtime APIs and the unsupported services.

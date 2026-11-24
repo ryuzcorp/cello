@@ -13058,9 +13058,9 @@ const __WorkflowCell = (() => {
       }
       if (meta !== undefined && skipExisting) return { id: instanceId, created: false };
       if (meta !== undefined) {
-        throw __wfError(
-          `instance ${JSON.stringify(instanceId)} already exists with status ` +
-            JSON.stringify(meta.status),
+        throw new Error(
+          "WorkflowError: (instance.already_exists) Workflow instance with id " +
+            `${JSON.stringify(instanceId)} already exists`,
         );
       }
       const generation = crypto.randomUUID();
@@ -13091,11 +13091,11 @@ const __WorkflowCell = (() => {
     // A cell exists on first address like any cell, so an absent ledger is
     // the only honest "no such instance" signal. Inventing an instance here
     // would turn every typo into an empty workflow.
-    if (meta === undefined) throw __wfError("instance does not exist");
-    const status = { status: meta.status, rollback: null };
-    if (meta.error !== undefined) status.error = meta.error;
-    if (meta.output !== undefined) status.output = meta.output;
-    return status;
+    if (meta === undefined) throw new Error("instance.not_found");
+    // Workerd answers exactly `{status, error, output}`: `error` stays an
+    // own key holding `undefined` until the instance fails, and `output`
+    // is `null` until run() returns a value. There is no `rollback` member.
+    return { status: meta.status, error: meta.error, output: meta.output ?? null };
   }
   async __wfDelete() {
     const storage = this._state.storage;
@@ -13108,7 +13108,7 @@ const __WorkflowCell = (() => {
     });
     // Throw after the transaction commits. An expiry discovered here must
     // keep its cleanup even though delete() reports that the instance is gone.
-    if (!deleted) throw __wfError("instance does not exist");
+    if (!deleted) throw new Error("instance.not_found");
     // A callback can still be awaiting application I/O when deletion lands.
     // Reset the object after the deletion commit so that callback cannot
     // recreate an old-generation ledger entry after delete() reports success.
@@ -13118,7 +13118,7 @@ const __WorkflowCell = (() => {
     const storage = this._state.storage;
     transactionSync(storage, (transaction) => {
       const meta = transaction.kv.get("__wf.meta");
-      if (meta === undefined) throw __wfError("instance does not exist");
+      if (meta === undefined) throw new Error("instance.not_found");
       if (__wfTerminal(meta.status) || meta.status === "paused" ||
           meta.status === "waitingForPause") return;
       if (meta.status === "running") {
@@ -13137,7 +13137,7 @@ const __WorkflowCell = (() => {
     const storage = this._state.storage;
     transactionSync(storage, (transaction) => {
       const meta = transaction.kv.get("__wf.meta");
-      if (meta === undefined) throw __wfError("instance does not exist");
+      if (meta === undefined) throw new Error("instance.not_found");
       if (meta.status === "waitingForPause") {
         meta.status = "running";
         transaction.kv.put("__wf.meta", meta);
@@ -13145,8 +13145,9 @@ const __WorkflowCell = (() => {
         return;
       }
       if (meta.status !== "paused") {
-        throw __wfError(
-          `cannot resume an instance with status ${JSON.stringify(meta.status)}`,
+        throw new Error(
+          "WorkflowError: (instance.cannot_resume) Cannot resume instance " +
+            `with status ${JSON.stringify(meta.status)}`,
         );
       }
       const offset = Math.max(0, Date.now() - (meta.pausedMs ?? Date.now()));
@@ -13170,7 +13171,7 @@ const __WorkflowCell = (() => {
     const storage = this._state.storage;
     transactionSync(storage, (transaction) => {
       const meta = transaction.kv.get("__wf.meta");
-      if (meta === undefined) throw __wfError("instance does not exist");
+      if (meta === undefined) throw new Error("instance.not_found");
       const oldPrefix = __wfLedgerPrefix(meta.generation);
       let targetOrdinal;
       if (checked.from !== undefined) {
@@ -13227,10 +13228,11 @@ const __WorkflowCell = (() => {
     const storage = this._state.storage;
     transactionSync(storage, (transaction) => {
       const meta = transaction.kv.get("__wf.meta");
-      if (meta === undefined) throw __wfError("instance does not exist");
+      if (meta === undefined) throw new Error("instance.not_found");
       if (__wfTerminal(meta.status)) {
-        throw __wfError(
-          `cannot terminate an instance with status ${JSON.stringify(meta.status)}`,
+        throw new Error(
+          "WorkflowError: (instance.cannot_terminate) Cannot terminate " +
+            "instance since its on a finite state",
         );
       }
       meta.status = "terminated";
@@ -13247,12 +13249,11 @@ const __WorkflowCell = (() => {
     const { type, payload } = __wfEventOptions(options);
     transactionSync(storage, (transaction) => {
       const meta = transaction.kv.get("__wf.meta");
-      if (meta === undefined) throw __wfError("instance does not exist");
-      if (__wfTerminal(meta.status)) {
-        throw __wfError(
-          `cannot send an event to an instance with status ${JSON.stringify(meta.status)}`,
-        );
-      }
+      if (meta === undefined) throw new Error("instance.not_found");
+      // A terminal instance keeps no waiter: the event is acknowledged and
+      // dropped, as workerd acknowledges it, with no ledger write and no
+      // wake. The terminal alarm still owns retention expiry from here.
+      if (__wfTerminal(meta.status)) return;
       const sequenceKey = __wfLedgerPrefix(meta.generation) + "eventSeq";
       const sequence = transaction.kv.get(sequenceKey) ?? 0;
       transaction.kv.put(sequenceKey, sequence + 1);
@@ -13625,10 +13626,7 @@ const __wfCreateOptions = (options, what, validateParams = true) => {
   const locationHint = __wfLocationHint(options.locationHint, what);
   const id = options.id === undefined ? crypto.randomUUID() : options.id;
   if (!__wfValidInstanceId(id)) {
-    throw __wfError(
-      `invalid instance id ${JSON.stringify(id)}: use letters, digits, ` +
-        "\"-\" and \"_\" (not starting with \"-\"), at most 100 characters",
-    );
+    throw new Error("WorkflowError: Workflow instance has invalid id");
   }
   if (validateParams && options.params !== undefined) {
     // The cell repeats this serialization check because it owns the durable
@@ -13723,12 +13721,14 @@ class WorkflowImpl extends WrappedBinding {
       throw __wfError("createBatch() needs an array of create options");
     }
     if (batch.length > 100) {
-      throw __wfError(
-        `createBatch() accepts at most 100 instances, got ${batch.length}`,
+      throw new Error(
+        "WorkflowError: batchCreate only supports 100 instances at a time",
       );
     }
     if (batch.length === 0) {
-      throw __wfError("createBatch() needs at least one instance");
+      throw new Error(
+        "WorkflowError: batchCreate should have at least 1 instance",
+      );
     }
     // Cloudflare rejects a structural error in any item before it creates the
     // first instance, but it filters a params clone failure per item. Keep
@@ -13760,7 +13760,7 @@ class WorkflowImpl extends WrappedBinding {
   }
   async get(id) {
     if (!__wfValidInstanceId(id)) {
-      throw __wfError(`invalid instance id ${JSON.stringify(id)}`);
+      throw new Error("instance.not_found");
     }
     const instance = new WorkflowInstance(this.#workflowName, id);
     // The cell exists on first address like any cell, but get() must not
@@ -13770,20 +13770,26 @@ class WorkflowImpl extends WrappedBinding {
   }
   async deleteBatch(instanceIds) {
     if (!Array.isArray(instanceIds)) {
-      throw __wfError("deleteBatch() needs an array of instance ids");
+      throw new Error("WorkflowError: (body) Provided argument is invalid");
     }
-    if (instanceIds.length < 1 || instanceIds.length > 100) {
-      throw __wfError(
-        `deleteBatch() accepts 1 to 100 instance ids, got ${instanceIds.length}`,
+    if (instanceIds.length > 100) {
+      throw new Error(
+        "WorkflowError: (body) batchDeleteInstances only supports 100 " +
+          "instances at a time",
       );
     }
-    for (const id of instanceIds) {
-      if (!__wfValidInstanceId(id)) {
-        throw __wfError(`invalid instance id ${JSON.stringify(id)}`);
-      }
+    if (instanceIds.length < 1) {
+      throw new Error(
+        "WorkflowError: (body) batchDeleteInstances should have at least " +
+          "1 instance",
+      );
     }
     const uniqueIds = [...new Set(instanceIds)];
     const settled = await Promise.allSettled(uniqueIds.map(async (id) => {
+      // Workerd reports a malformed id as a per-item not_found error, not
+      // a batch refusal: an id that can never name an instance is missing
+      // like any other absent id, echoed back with the 10400 code below.
+      if (!__wfValidInstanceId(id)) throw new Error("instance.not_found");
       const instance = new WorkflowInstance(this.#workflowName, id);
       await instance.delete();
     }));
@@ -13796,7 +13802,7 @@ class WorkflowImpl extends WrappedBinding {
         continue;
       }
       const notFound = String(result.reason && result.reason.message || result.reason)
-        .includes("instance does not exist");
+        .includes("instance.not_found");
       output.errors.push({
         id,
         code: notFound ? 10400 : 10001,
