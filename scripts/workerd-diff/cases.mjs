@@ -173,6 +173,8 @@ export const cases = [
     // internals private, the prototype members workerd's, the bookmark
     // methods and the hibernatable WebSocket event timeout.
     "/storage-surface", "/stub-surface",
+    // #256: the state's prototype carries only workerd's members.
+    "/state-surface",
   ].map((path) => ({
     name: `do${path}`,
     fixture: "do",

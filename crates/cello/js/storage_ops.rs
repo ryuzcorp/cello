@@ -430,7 +430,7 @@ pub(super) fn op_storage_drop_pending_puts(
 }
 
 /// `__storage_drop_pending_puts_own()`: the abort/reset paths' cancel
-/// (`_resetAfterConcurrencyFailure`, `abort`). The scope is derived from
+/// (`#resetAfterConcurrencyFailure`, `abort`). The scope is derived from
 /// the executing cell host-side and no argument is trusted, so a mutated
 /// `ctx._scope` cannot drop another cell's buffered writes (H6). Only the
 /// harness calls this. Stateless events have no queue to drop.

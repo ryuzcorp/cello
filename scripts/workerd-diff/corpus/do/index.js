@@ -740,6 +740,41 @@ export class Probe {
       async "/storage-sync"() {
         return report(await attempt(async () => typeof await this.state.storage.sync()));
       },
+      async "/state-surface"() {
+        // #256: workerd's `DurableObjectState` publishes only its documented
+        // members, all enumerable, and no host-internal name at all. Cello
+        // used to carry `_ready`, `_socket`, `_blockConcurrencyWhile`,
+        // `_runConcurrencyBlock` and `_resetAfterConcurrencyFailure` on the
+        // prototype, where guest code could call them.
+        const state = this.state;
+        const prototype = Object.getPrototypeOf(state);
+        const out = {
+          tag: Object.prototype.toString.call(state),
+          keys: Object.keys(state),
+          own: surfaceKeys(state),
+          chain: surfaceChain(state),
+          internals: Object.getOwnPropertyNames(prototype)
+            .filter((name) => name.startsWith("_")),
+          internalCalls: [
+            "_ready", "_socket", "_blockConcurrencyWhile",
+            "_runConcurrencyBlock", "_resetAfterConcurrencyFailure",
+          ].map((name) => [name, typeof state[name]]),
+          // A native prototype's definition order is not a contract, so the
+          // member set is sorted; the chain above sorts too.
+          prototypeEnumerable: Object.keys(prototype).sort(),
+        };
+        // The documented block path still works, from the same object and
+        // through a nested block, which is the path the internals served.
+        out.block = await attempt(async () => {
+          const log = [];
+          await this.state.blockConcurrencyWhile(async () => {
+            log.push("outer");
+            await this.state.blockConcurrencyWhile(() => log.push("inner"));
+          });
+          return log;
+        });
+        return report(out);
+      },
       async "/transaction"() {
         const s = this.state.storage;
         await s.deleteAll();

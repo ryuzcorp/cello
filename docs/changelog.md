@@ -17,6 +17,17 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
   drain, so a same-turn cancel wins over the chunk the write just produced.
   The `compression-cancel-then-abort` gate case now pins the reasons and the
   pending-read outcome, not just their presence.
+- **`DurableObjectState` publishes only workerd's members (#256).** The block
+  path (`#blockConcurrencyWhile`, `#runConcurrencyBlock`,
+  `#resetAfterConcurrencyFailure`), the readiness wait (`#ready`) and the
+  hibernatable socket lookup (`#socket`) are private methods now, reached from
+  the runtime through a static block, so guest code can no longer call them
+  and `Object.getOwnPropertyNames(Object.getPrototypeOf(ctx))` answers
+  workerd's list. The state's prototype members are enumerable as workerd's
+  are. `blockConcurrencyWhile` keeps its semantics: nesting, the 30-second
+  limit, drain of nested blocks before release, the failure reset, and the
+  hibernatable WebSocket dispatch are unchanged. The differential gate gained
+  a case (233 total) that fails before this change and every case agrees.
 - **A Durable Object's storage, state, SQL, id, namespace and stub surfaces
   keep their internals private and match workerd (#251).**
   `ctx.storage` reports `kv` and `sql` as its only own, enumerable
