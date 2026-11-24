@@ -3626,11 +3626,17 @@ const __makeDurableObjectClass = (loadPromise, name, propsSc) => {
   });
   return value;
 };
-// Loopback classes are callable; a specialized class is only a handle. The
+// Loopback classes are callable, and `new` on one specializes exactly as a
+// call does: workerd's handle is constructible with no own properties, which
+// an arrow (never a constructor) and a plain function (always carrying a
+// non-configurable own `prototype`) cannot both be. A bound function forwards
+// `new` to its target -- returning the specialized object or throwing the
+// call path's refusal -- while carrying no `prototype` of its own. The
 // refusals are workerd's own (`callImpl`'s required `Options` dictionary, then
 // the `props` field's conversion): `null` and `undefined` are the empty
 // dictionary as WebIDL converts them, and `props` is read once. Capture props
 // now, so later mutation of the caller's options cannot change startup.
+// A specialized class is only a handle: `new` on it stays "not a constructor".
 const __loopbackOptionsRefusal = (kind) => new TypeError(
   "Failed to execute '(called as function)' on '" + kind +
   "': parameter 1 is not of type 'Options'.");
@@ -3639,10 +3645,11 @@ const __loopbackPropsRefusal = () => new TypeError(
   "is not of type 'Object'.");
 const __makeLoopbackDurableObjectClass = (name, kind) => {
   const loadPromise = Promise.resolve({ id: 0 });
-  const specialize = (...args) => {
+  const specialize = (function (...args) {
     // A missing argument is refused before the dictionary converts, and
     // calling a loopback handle is the only way it is ever invoked: `new`
-    // reports the same refusal, as workerd's non-constructor function does.
+    // runs this same body through the bound function's construct trap, so it
+    // reports the same refusal or answers the same specialized object.
     if (args.length === 0) throw __loopbackOptionsRefusal(kind);
     const options = args[0];
     if (options !== undefined && options !== null &&
@@ -3655,7 +3662,7 @@ const __makeLoopbackDurableObjectClass = (name, kind) => {
       throw __loopbackPropsRefusal();
     return __makeDurableObjectClass(
       loadPromise, name, __rpcOut(props === undefined ? {} : props, false));
-  };
+  }).bind(null);
   // workerd's loopback handles carry no own `name`/`length`/`prototype`, and
   // the interface's tag comes from the prototype level there (#259). The
   // namespace's callable keeps `Function.prototype`: the handle above it
@@ -3690,7 +3697,10 @@ const __makeLoopbackNamespace = (name) => {
   const namespace = __cell.makeNamespace(name);
   const specialize = __makeLoopbackDurableObjectClass(
     name, "LoopbackDurableObjectNamespace");
-  const handle = (...args) => specialize(...args);
+  // A bound function, so `new` on the handle specializes through the same
+  // call path: a plain function would carry an own `prototype` workerd's
+  // handle does not have.
+  const handle = (function (...args) { return specialize(...args); }).bind(null);
   delete handle.name;
   delete handle.length;
   Object.setPrototypeOf(handle, __handleProto("namespace"));
@@ -8459,8 +8469,14 @@ class DurableObjectNamespace {
       this.#className, __do_id(this.#namespaceKey, "unique", ""),
     );
   }
+  // workerd answers a fresh `[object DurableObjectNamespace]` object on every
+  // call -- never the handle, never the binding -- scoped to the requested
+  // jurisdiction over the same instance store, so an id minted either side
+  // reads from the other. With no jurisdiction the scope is the namespace's
+  // own. A named jurisdiction stays refused, as workerd refuses it locally.
   jurisdiction(value) {
-    if (value == null) return this;
+    if (value == null)
+      return new DurableObjectNamespace(this.#className, this.#namespaceKey);
     throw new Error("Jurisdiction restrictions are not implemented");
   }
   getByName(name, options) {
@@ -8635,8 +8651,9 @@ for (const name of ["idFromName", "idFromString", "newUniqueId",
   const wrapper = { [name]: function () {
     const namespace = __loopbackNamespace(this);
     const result = __primReflectApply(impl, namespace, arguments);
-    // `jurisdiction()` answers its own receiver, so a loopback handle gets
-    // the handle back rather than the namespace behind it.
+    // A method answering its own receiver (none does today; `jurisdiction()`
+    // used to) hands a loopback handle's caller the handle back rather than
+    // the namespace behind it.
     return result === namespace ? this : result;
   } }[name];
   Object.defineProperty(DurableObjectNamespace.prototype, name, {

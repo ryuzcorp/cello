@@ -79,11 +79,17 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
   non-object one reports `Failed to execute '(called as function)' on
   '<interface>': parameter 1 is not of type 'Options'.`, with the `props`
   field's own message. A handle carries no own `name`, `length` or
-  `prototype`.
+  `prototype`. `jurisdiction()` answers a fresh `[object
+  DurableObjectNamespace]` object on every call -- never the handle, never
+  the binding -- over the same instance store, on the handle and the binding
+  paths alike. `new` on a handle specializes exactly as calling it does
+  (bad arguments are refused through the construct path), while a specialized
+  class refuses `new`, as workerd's does. `idFromString` on another class's
+  id carries workerd's sentence, trailing period included, on both paths.
   `ctx.exports` also no longer exposes the runtime's own classes or the
   script-scoped workflow alias (`__Workflow.<script>`), which the workflow
   cell registered in the same class registry. The differential gate gained
-  `do/exports-surface` and `do-workflow/exports-surface` (235 total) and
+  `do/exports-surface` and `do-workflow/exports-surface` (240 total) and
   every case agrees.
 - **A compression stream settles a cancel racing an abort the way Workerd
   does (#252).** A `DecompressionStream`/`CompressionStream` with a write in

@@ -350,7 +350,11 @@ the union of the main module's and every sibling's imports.
   the class for a facet); a class with no namespace is a callable
   `[object LoopbackDurableObjectClass]`; and a plain handler is an
   `[object LoopbackServiceStub]` whose `fetch` reaches that entrypoint. A
-  handle carries no own `name`, `length` or `prototype`.
+  handle carries no own `name`, `length` or `prototype`. `jurisdiction()`
+  answers a fresh `[object DurableObjectNamespace]` object on every call --
+  never the handle, never the binding -- over the same instance store, on
+  the handle and the binding paths alike. `new` on a handle specializes
+  exactly as calling it does, while a specialized class refuses `new`.
 - Each handle keeps workerd's prototype levels: one holding only an own
   non-enumerable `constructor` and the interface's tag, over the level that
   carries the members -- `DurableObjectNamespace.prototype` for a namespace
