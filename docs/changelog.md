@@ -70,7 +70,6 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
   differential gate gained two cases -- taken or closed destinations, and
   `pipeThrough` onto taken sides -- pinning that every shape settles with
   Workerd's outcome instead of hanging, and every case agrees.
-
 - **`writer.close()` across a same-turn readable cancel resolves on a
   compression stream, as Workerd does (#262).** With no `await` between a
   write, `close()` and `reader.cancel()`, both `close()` and `writer.closed`
