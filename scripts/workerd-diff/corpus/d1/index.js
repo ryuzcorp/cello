@@ -174,6 +174,29 @@ const routes = {
     return report(out);
   },
 
+  // exec() trims its input the way `String.prototype.trim` does -- NBSP and
+  // the byte-order mark included -- so neither is part of the line it names
+  // nor of the text SQLite runs (#249 review).
+  async "/exec-unicode"() {
+    const out = {};
+    for (const [name, sql] of [
+      ["nbspOnly", "\u00a0;"],
+      ["nbspSpaces", "\u00a0\u00a0"],
+      ["bomOnly", "\ufeff"],
+      ["bomSemicolon", "\ufeff;"],
+      ["bomStatement", "\ufeffSELECT 1"],
+      ["nbspStatement", "\u00a0SELECT 1\u00a0"],
+      ["nbspTwoStatements", "\u00a0SELECT 1; SELECT 2\u00a0"],
+      ["bomTwoLines", "\ufeffSELECT 1;\nSELECT 2"],
+      ["nbspTypo", "\u00a0SELEC 1"],
+      ["bomTypo", "\ufeffSELEC 1"],
+      ["nbspPaddedCreate", "\u00a0\u00a0CREATE TABLE IF NOT EXISTS u1 (x)\u00a0"],
+    ]) {
+      out[name] = await attempt(async () => (await DB.exec(sql)).count);
+    }
+    return report(out);
+  },
+
   // An empty batch and an empty prepared statement are refused the same
   // way; a batch result keeps its per-statement shape and rolls back whole.
   async "/batch"() {

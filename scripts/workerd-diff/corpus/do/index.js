@@ -284,6 +284,14 @@ export class Probe {
           ["batchWithUnknownOption", () => s.put({ u: 1 }, { bogus: true })],
           ["batchWithNullOption", () => s.put({ n: 1 }, null)],
           ["batchWithBadOption", () => s.put({ x: 1 }, "nope")],
+          // An array in the options slot is a dictionary too: workerd reads
+          // it positionally as PutOptions, so every shape leaves the fields
+          // at their defaults and the entries land (#249 review).
+          ["batchWithArrayOption", () => s.put({ a: 1 }, [])],
+          ["batchWithArrayElement", () => s.put({ a: 1 }, [1])],
+          ["batchWithArrayBooleans", () => s.put({ a: 1 }, [true, false, true])],
+          ["batchWithArrayObject", () => s.put({ a: 1 }, [{ allowUnconfirmed: true }])],
+          ["batchWithArrayHole", () => s.put({ a: 1 }, [,])],
         ];
         const out = {};
         for (const [name, run] of probes) {
