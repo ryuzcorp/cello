@@ -248,6 +248,15 @@ service; the [KV](../services/kv.md), [R2](../services/r2.md) and
   here. A statement whose row counts follow from its result (a `SELECT`
   returns the rows it read; an `INSERT`/`UPDATE`/`DELETE` reports the rows it
   wrote) agrees with workerd.
+- **Durable Object SQL boolean binds are TEXT from compatibility date
+  2026-11-24.** Workerd stores a `true`/`false` bind as `'true'`/`'false'`;
+  Cello wrote INTEGER `1`/`0` before that date and keeps doing so at an older
+  date or with none, so the rows a deployment already holds keep their
+  meaning. `sql_boolean_text` and `no_sql_boolean_text` force either type.
+  Bumping an existing deployment's date mixes the two types in one column,
+  where the string `'false'` is truthy; the [Durable
+  Objects](../services/durable-objects.md#boolean-binds) page has the
+  migration.
 - **R2 cursors are opaque tokens.** A string outside the token format that
   names no object gets the empty page R2 answers instead of a listing
   restarted from the top. A plain key is still read as the cursor 0.2.9
@@ -687,6 +696,8 @@ Cello honors these compatibility flags:
 - `sqlite_vec`
 - `websocket_standard_binary_type`, implied for compatibility dates on or
   after 2026-03-17; `no_websocket_standard_binary_type` opts out
+- `sql_boolean_text`, implied for compatibility dates on or after
+  2026-11-24; `no_sql_boolean_text` opts out. Setting both refuses startup.
 - The static-assets navigation flags
 
 Cello accepts every other flag without effect.

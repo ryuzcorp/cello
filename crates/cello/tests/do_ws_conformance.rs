@@ -10,8 +10,10 @@
 //! Durable Object and WebSocket behaviour that diverged from workerd and is
 //! fixed for 0.2.9: alarm validation, send-before-accept, stub error
 //! propagation, storage put/DataCloneError, acceptWebSocket and
-//! auto-response validation, queue settle enumerability, SQL boolean binds
-//! and cursor internals, and the standard `binaryType` default.
+//! auto-response validation, queue settle enumerability, SQL cursor
+//! internals, and the standard `binaryType` default. This fixture runs at
+//! 2026-11-01, so it also pins the pre-gate side of SQL boolean binds
+//! (INTEGER); `do_sql_boolean_compat.rs` owns the gate.
 //!
 //! One fixture route answers per behaviour with the exact text workerd
 //! 1.20261121.1 produces. Every mismatch is collected so a pre-fix run
@@ -665,9 +667,9 @@ fn durable_object_and_websocket_match_workerd() {
         "true",
     );
 
-    // #154 is a deliberate deviation: a boolean bind stays INTEGER 1/0 so
-    // existing rows keep their type (see cloudflare-compat.md). #191: a
-    // cursor keeps no own fields.
+    // #154: this fixture's 2026-11-01 date predates the gate, so a boolean
+    // bind stays INTEGER 1/0 and existing rows keep their type (see
+    // docs/services/durable-objects.md). #191: a cursor keeps no own fields.
     let sql = answer!("/sql");
     expect(
         &mut failures,

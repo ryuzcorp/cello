@@ -265,8 +265,9 @@ export class Probe {
         sql.exec("DROP TABLE IF EXISTS t2");
         sql.exec("CREATE TABLE t2 (i INTEGER, r REAL, t TEXT, b BLOB, n TEXT)");
         const out = {};
-        // A boolean bind is a deliberate Cello deviation (INTEGER 1/0, see
-        // cloudflare-compat.md), so it is not compared with workerd here.
+        // Booleans bind as workerd's TEXT 'true'/'false' from compatibility
+        // date 2026-11-24, which this fixture runs at; an older date keeps
+        // Cello's historical INTEGER 1/0 (cloudflare-compat.md).
         out.bindNull = await attempt(() => {
           sql.exec("INSERT INTO t2 (t) VALUES (?)", null);
           return [...sql.exec("SELECT t FROM t2 ORDER BY rowid DESC LIMIT 1")];
@@ -285,6 +286,16 @@ export class Probe {
           return row.map((r) => r.type === undefined ? r : { type: r.type, bytes: r.b ? [...new Uint8Array(r.b)] : null });
         });
         out.bindDate = await attempt(() => sql.exec("INSERT INTO t2 (t) VALUES (?)", new Date(0)));
+        out.bindTrue = await attempt(() => sql.exec("SELECT ? AS v, typeof(?) AS ty", true, true).one());
+        out.bindFalse = await attempt(() => sql.exec("SELECT ? AS v, typeof(?) AS ty", false, false).one());
+        out.bindBoolColumn = await attempt(() => {
+          sql.exec("DELETE FROM t2");
+          sql.exec("INSERT INTO t2 (t) VALUES (?)", true);
+          sql.exec("INSERT INTO t2 (t) VALUES (?)", false);
+          const rows = [...sql.exec("SELECT t, typeof(t) AS ty FROM t2 ORDER BY rowid")];
+          const where = sql.exec("SELECT count(*) AS n FROM t2 WHERE t = ?", true).one();
+          return { rows, whereTrue: where.n };
+        });
         out.execMulti = await attempt(() => [...sql.exec("INSERT INTO t2 (i) VALUES (1); INSERT INTO t2 (i) VALUES (2);")]);
         // An empty statement's message diverges (`SQL error:` prefix), a
         // separate issue; it stays out of the gate until it matches.

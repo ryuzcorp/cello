@@ -4,6 +4,23 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
 ---
 ## Unreleased
 
+- **A boolean SQL bind is stored as workerd's TEXT `'true'`/`'false'` from
+  compatibility date 2026-11-24 (#154) — Breaking for new compatibility
+  dates.** Workerd stores a `true`/`false` bind as TEXT; Cello stored INTEGER
+  `1`/`0`. A deployment at date 2026-11-24 or later now writes the same type
+  workerd does, so `typeof(flag)` is `'text'`, `flag = 'true'` matches, and a
+  boolean `WHERE flag = ?` finds its rows. An older date, or none, keeps
+  INTEGER, so existing deployments and their rows are unchanged until they
+  move their date. `sql_boolean_text` and `no_sql_boolean_text` force either
+  type, and setting both refuses startup. A deployment that bumps its date
+  over an existing column mixes the two types: the string `'false'` is truthy
+  while an old `0` is not, and integer and text predicates each see only their
+  own rows. Pin `no_sql_boolean_text`, or rewrite the column with
+  `UPDATE t SET flag = CASE flag WHEN 1 THEN 'true' WHEN 0 THEN 'false' ELSE
+  flag END` before bumping; the [Durable
+  Objects](../services/durable-objects.md#boolean-binds) page has the details,
+  and `tests/do_sql_boolean_compat.rs` runs the whole migration against a real
+  cell.
 - **A Durable Object handler failure keeps its shape across nodes (#226).** A
   `stub.fetch()` whose handler throws on another node now rejects with the
   value the handler threw, exactly as a local owner does: an `Error` subclass
@@ -709,7 +726,9 @@ Object SQL is still stored as INTEGER `1`/`0`, not workerd's TEXT
 `'true'`/`'false'`. Existing rows already hold integers, and mixing the two
 types would make `if (row.flag)` truthy for a new `'false'` while an old `0`
 stayed falsy, with no migration able to rewrite a stored value's type. See
-[Durable Objects](../services/durable-objects.md).
+[Durable Objects](../services/durable-objects.md). 0.2.10 gates the type on
+the compatibility date and documents the migration; see [Boolean
+binds](../services/durable-objects.md#boolean-binds).
 The Fetch API object model now answers what workerd 1.20261121.1 answers. A
 differential sweep filed 23 divergences (#159-#190); this release fixes the
 High and Medium ones and the cheap Low ones. A string body carries its default

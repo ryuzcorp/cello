@@ -91,6 +91,10 @@ struct OpenCell {
     connection: Connection,
     epoch: u64,
     replicated_wake: bool,
+    /// The deployment's `sql_boolean_text` switch, fixed when the cell opens
+    /// (so for the life of this isolate's residency). It decides the type a
+    /// `true`/`false` SQL bind is stored as.
+    sql_boolean_text: bool,
     backing: StorageBacking,
     /// The committed-write position the first event of this activation
     /// started at. cello's own activation writes sit at or below it, so a
@@ -916,7 +920,17 @@ pub fn open(scope: &str, path: &str) -> anyhow::Result<()> {
 }
 
 pub fn open_with_compat(scope: &str, path: &str, sqlite_vec: bool) -> anyhow::Result<()> {
-    open_at_epoch(scope, path, 1, false, None, sqlite_vec)
+    open_at_epoch(
+        scope,
+        path,
+        1,
+        false,
+        None,
+        crate::engine_api::Compat {
+            sqlite_vec,
+            ..crate::engine_api::Compat::default()
+        },
+    )
 }
 
 /// Open a production cell database with the epoch that authorized the
@@ -929,7 +943,7 @@ pub(crate) fn open_at_epoch(
     epoch: u64,
     replicated_wake: bool,
     vfs: Option<&str>,
-    sqlite_vec: bool,
+    compat: crate::engine_api::Compat,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(epoch > 0, "a cell activation epoch must be positive");
     let connection = match vfs {
@@ -943,7 +957,7 @@ pub(crate) fn open_at_epoch(
         connection,
         epoch,
         replicated_wake,
-        sqlite_vec,
+        compat,
         StorageBacking::File {
             path: path.to_string(),
             root_scope: scope.to_string(),
@@ -959,7 +973,7 @@ pub fn open_with_fault_vfs_for_test(scope: &str, path: &str) -> anyhow::Result<(
         crate::fault::open_database(path)?,
         1,
         true,
-        false,
+        crate::engine_api::Compat::default(),
         StorageBacking::File {
             path: path.to_string(),
             root_scope: scope.to_string(),
@@ -973,7 +987,7 @@ fn finish_open(
     c: Connection,
     epoch: u64,
     replicated_wake: bool,
-    sqlite_vec: bool,
+    compat: crate::engine_api::Compat,
     backing: StorageBacking,
 ) -> anyhow::Result<()> {
     // SQLite's default lookaside arena reserves 48 KiB for every connection.
@@ -997,7 +1011,7 @@ fn finish_open(
         result == rusqlite::ffi::SQLITE_OK,
         "failed to disable SQLite lookaside"
     );
-    if sqlite_vec {
+    if compat.sqlite_vec {
         register_vec0_extension(&c)?;
     }
     schema(&c)?;
@@ -1049,6 +1063,7 @@ fn finish_open(
                 connection: c,
                 epoch,
                 replicated_wake,
+                sql_boolean_text: compat.sql_boolean_text,
                 backing,
                 published_position: None,
             },
@@ -1504,7 +1519,7 @@ pub(crate) fn open_embedded(
     parent: &StorageIdentity,
     name: &str,
     path: &std::path::Path,
-    sqlite_vec: bool,
+    compat: crate::engine_api::Compat,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(parent.facet_path.len() < 3, "Facet nesting depth limit exceeded. The maximum depth including the root Durable Object is 4.");
     let mut facet_path = parent.facet_path.clone();
@@ -1547,7 +1562,7 @@ pub(crate) fn open_embedded(
         connection,
         parent.epoch,
         false,
-        sqlite_vec,
+        compat,
         StorageBacking::Embedded {
             stream,
             opening: NEXT_FACET_OPENING.fetch_add(1, Ordering::Relaxed),
@@ -1616,15 +1631,29 @@ fn with_batch_savepoint<T>(
 const BYTES_KEY: &str = "__cello_bytes";
 const LEGACY_BYTES_KEY: &str = "__celld_bytes";
 
-pub(crate) fn json_to_sql(v: &serde_json::Value) -> rusqlite::types::Value {
+/// The deployment's `sql_boolean_text` switch for an open cell. A cell that
+/// is not open has no binds to convert, so `false` is the only answer the
+/// callers can act on.
+pub(crate) fn sql_boolean_text(scope: &str) -> bool {
+    dbs(|dbs| {
+        dbs.borrow()
+            .get(scope)
+            .is_some_and(|cell| cell.sql_boolean_text)
+    })
+}
+
+pub(crate) fn json_to_sql(v: &serde_json::Value, boolean_text: bool) -> rusqlite::types::Value {
     use rusqlite::types::Value;
     match v {
         serde_json::Value::Null => Value::Null,
-        // Deliberately not workerd's text 'true'/'false': Cello has stored
-        // a boolean bind as INTEGER 1/0 since its first DO SQL release, and
-        // changing it would silently rewrite the type of every new row
-        // beside old INTEGER rows (`if (row.flag)` would treat 'false' as
-        // truthy). Documented in docs/reference/cloudflare-compat.md.
+        // workerd stores a boolean bind as TEXT 'true'/'false'. Cello wrote
+        // INTEGER 1/0 before the 2026-11-24 compatibility date, and a
+        // deployment at an older date (or none) keeps writing INTEGER so the
+        // rows it already stores keep their meaning; see
+        // docs/services/durable-objects.md.
+        serde_json::Value::Bool(b) if boolean_text => {
+            Value::Text(if *b { "true" } else { "false" }.to_string())
+        }
         serde_json::Value::Bool(b) => Value::Integer(*b as i64),
         serde_json::Value::Number(n) if n.is_i64() => Value::Integer(n.as_i64().unwrap()),
         serde_json::Value::Number(n) => Value::Real(n.as_f64().unwrap_or(0.0)),
@@ -1876,6 +1905,7 @@ type SqlExec = (Vec<String>, Vec<Vec<serde_json::Value>>, u64);
 /// use a prepared statement so their cursor rows are returned.
 pub fn sql_exec(scope: &str, query: &str, binds: &[serde_json::Value]) -> Result<SqlExec, String> {
     require_sql_healthy(scope)?;
+    let boolean_text = sql_boolean_text(scope);
     // The armed budget, read once: the rewrite below must name what this run
     // was bounded by, not whatever the knob reads when the run reports.
     let timeout = statement_timeout();
@@ -1896,7 +1926,8 @@ pub fn sql_exec(scope: &str, query: &str, binds: &[serde_json::Value]) -> Result
             let mut stmt = c.prepare(query).map_err(|e| e.to_string())?;
             let cols: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
             let n = cols.len();
-            let params = rusqlite::params_from_iter(binds.iter().map(json_to_sql));
+            let params =
+                rusqlite::params_from_iter(binds.iter().map(|v| json_to_sql(v, boolean_text)));
             let mut rows = stmt.query(params).map_err(|e| e.to_string())?;
             let mut out = Vec::new();
             while let Some(row) = rows.next().map_err(|e| e.to_string())? {
@@ -2341,7 +2372,11 @@ pub fn sql_cursor_start(
     query: &str,
     binds: &[serde_json::Value],
 ) -> Result<SqlCursorStart, String> {
-    let binds: Vec<rusqlite::types::Value> = binds.iter().map(json_to_sql).collect();
+    let boolean_text = sql_boolean_text(scope);
+    let binds: Vec<rusqlite::types::Value> = binds
+        .iter()
+        .map(|bind| json_to_sql(bind, boolean_text))
+        .collect();
     sql_cursor_start_values(scope, query, &binds)
 }
 
@@ -7993,7 +8028,7 @@ mod statement_timeout_tests {
 }
 
 #[cfg(test)]
-mod bytes_key_tests {
+mod json_to_sql_tests {
     use super::*;
 
     #[test]
@@ -8001,7 +8036,33 @@ mod bytes_key_tests {
         use rusqlite::types::Value;
         for key in [BYTES_KEY, LEGACY_BYTES_KEY] {
             let v = serde_json::json!({ key: [1, 2, 255] });
-            assert_eq!(json_to_sql(&v), Value::Blob(vec![1, 2, 255]), "{key}");
+            assert_eq!(
+                json_to_sql(&v, false),
+                Value::Blob(vec![1, 2, 255]),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn boolean_binds_follow_the_compat_switch() {
+        use rusqlite::types::Value;
+        let truthy = serde_json::Value::Bool(true);
+        let falsy = serde_json::Value::Bool(false);
+        // Before the gate Cello writes the historical INTEGER type.
+        assert_eq!(json_to_sql(&truthy, false), Value::Integer(1));
+        assert_eq!(json_to_sql(&falsy, false), Value::Integer(0));
+        // On or after it, workerd's TEXT type.
+        assert_eq!(json_to_sql(&truthy, true), Value::Text("true".into()));
+        assert_eq!(json_to_sql(&falsy, true), Value::Text("false".into()));
+        // Nothing else changes with the switch.
+        for value in [
+            serde_json::json!(3),
+            serde_json::json!(1.5),
+            serde_json::json!("x"),
+            serde_json::Value::Null,
+        ] {
+            assert_eq!(json_to_sql(&value, false), json_to_sql(&value, true));
         }
     }
 }

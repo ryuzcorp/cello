@@ -333,6 +333,14 @@ pub fn worker_compat(metadata: &serde_json::Value) -> js::Compat {
             date.is_none_or(|date| date >= "2026-03-17")
         },
         queue_json_messages: switch("queue_json_messages", "queue_v8_messages", "2024-03-18"),
+        // The release date of 0.2.10, the first version that can store the
+        // text type. Workerd has no flag or date for this — it always binds
+        // text — so Cello picks the date it starts matching workerd rather
+        // than inventing an upstream one. A deployment with no
+        // `compatibility_date` keeps INTEGER: unlike `binaryType`'s WHATWG
+        // default, this type is data already in the database, so an
+        // unversioned deployment must not start rewriting it.
+        sql_boolean_text: switch("sql_boolean_text", "no_sql_boolean_text", "2026-11-24"),
         // The opt-out wins over both the implicit `nodejs_compat`
         // population and the explicit populate flag, matching Cloudflare's
         // `nodejs_compat_do_not_populate_process_env` (denoland/celld#296).
@@ -378,5 +386,23 @@ mod compat_tests {
             &["no_websocket_standard_binary_type"]
         ));
         assert!(!binary_type(None, &["no_websocket_standard_binary_type"]));
+    }
+
+    #[test]
+    fn sql_boolean_text_follows_date_flags_and_absence() {
+        let boolean_text = |date: Option<&str>, flags: &[&str]| {
+            worker_compat(&metadata(date, flags)).sql_boolean_text
+        };
+        // The gate's date is inclusive: the day before keeps INTEGER.
+        assert!(!boolean_text(Some("2026-11-23"), &[]));
+        assert!(boolean_text(Some("2026-11-24"), &[]));
+        assert!(boolean_text(Some("2027-01-01"), &[]));
+        // No compatibility_date keeps INTEGER: existing rows hold 1/0, so an
+        // unversioned deployment must not change the type it writes.
+        assert!(!boolean_text(None, &[]));
+        // Either explicit flag wins over the date, in both directions.
+        assert!(boolean_text(Some("2026-11-01"), &["sql_boolean_text"]));
+        assert!(!boolean_text(Some("2027-01-01"), &["no_sql_boolean_text"]));
+        assert!(!boolean_text(None, &["no_sql_boolean_text"]));
     }
 }

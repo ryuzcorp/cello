@@ -1,7 +1,7 @@
 {
   "name": "do",
   "main": "index.js",
-  "compatibility_date": "2026-11-01",
+  "compatibility_date": "2026-11-24",
   "no_bundle": true,
   "durable_objects": {
     "bindings": [

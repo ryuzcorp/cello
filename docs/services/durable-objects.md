@@ -88,6 +88,23 @@ A cell keeps no in-memory state across an eviction, so the constructor runs agai
 
 A class that a `new_sqlite_classes` migration declares can use the key-value methods and `ctx.storage.sql.exec()`. The `transactionSync()` callback receives no argument, as in workerd, and a throw rolls it back. A transaction can start a nested transaction; a failed nested transaction discards only its own writes, and the enclosing transaction can still commit.
 
+### Boolean binds
+
+Workerd stores a `true`/`false` bind as the TEXT `'true'`/`'false'`. Cello wrote INTEGER `1`/`0` up to 0.2.9. From compatibility date `2026-11-24` Cello matches workerd, so `typeof(flag)` is `'text'`, `flag = 'true'` is true, and a `WHERE flag = ?` with a boolean finds the rows a boolean wrote. A compatibility date before that, or none at all, keeps INTEGER, so the rows a deployment already stores keep their meaning. `sql_boolean_text` forces the TEXT type and `no_sql_boolean_text` forces INTEGER, at any date; setting both stops the deployment at startup. The switch is fixed when a script's isolate loads, so one deployment never changes the type under a running instance.
+
+**Bumping an existing deployment's date changes the type of the rows it writes from then on.** Old rows stay INTEGER `0`/`1`, new rows are TEXT `'false'`/`'true'`, and the two representations disagree in both languages: `'false'` is truthy, so `if (row.flag)` runs for it while an old `0` does not, and `flag = 1` and `flag = ?` (with a boolean) each match only their own rows. Before you bump the date, either:
+
+- pin `no_sql_boolean_text` and keep reading INTEGER, or
+- rewrite the column while the deployment still writes INTEGER:
+
+  ```sql
+  UPDATE flags SET flag = CASE flag WHEN 1 THEN 'true' WHEN 0 THEN 'false' ELSE flag END;
+  ```
+
+  Every `1`/`0` becomes `'true'`/`'false'`; a `NULL`, a text value or another number keeps its value. A `CHECK` constraint that allows only `0`/`1` makes the `UPDATE` fail instead of leaving a half-typed column: drop or replace the constraint first, or rebuild the table. Bump the date after the rewrite, so the binds that follow write TEXT too.
+
+`tests/do_sql_boolean_compat.rs` runs that sequence against a real cell: INTEGER rows written at an old date, the rewrite, then the bumped date, ending with every row TEXT and a boolean predicate finding all of them.
+
 Cello captures each write as an LTX segment and replicates it to `cells/<cell>/ltx/e<epoch>/` in the fleet bucket. In a fleet of two or more nodes, the owner answers when each of its one or two followers holds the write on disk, and the bucket upload follows. On a single node, every write waits for the object store.
 
 Cello does not answer a successful `setAlarm()` until a durable wake entry in the bucket covers the alarm. A hibernated cell fires its alarm on its owner node. One node holds the waker role, and it wakes only a cell whose owner stopped.
@@ -112,7 +129,6 @@ A value whose state lives in a host object is refused rather than stored as `{}`
 | Failed handlers | Still wait for the durability of any exposed value or write. A Cello-generated failure that exposes no object value returns immediately. |
 | SQL cursors | Outside a transaction, a SQL write cursor must finish before a response, an outbound effect, or `storage.sync()`. An unfinished `RETURNING` cursor holds uncommitted writes, so Cello rejects that output. A read cursor can stay open. |
 | SQL cursor counters | `rowsRead`/`rowsWritten` count Cello's rows read by the cursor and rows changed by DML. Workerd counts libsql's b-tree rows, so a DDL statement reports 1 read and 2 writes there and 0/0 here. A cursor exposes no own enumerable fields. |
-| SQL boolean binds | A `true`/`false` bind is stored as INTEGER `1`/`0`, not workerd's TEXT `'true'`/`'false'`. Existing rows already hold integers, and a stored value's type cannot be migrated: mixing the two would make `if (row.flag)` truthy for a new `'false'` while an old `0` stayed falsy. Query old and new rows with `flag = 1` and `flag = 'true'` separately. |
 
 The [Cloudflare compatibility](../reference/cloudflare-compat.md#services) page lists the runtime APIs and the unsupported services.
 

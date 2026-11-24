@@ -557,8 +557,11 @@ pub(super) fn op_sql_cursor_start(
                 )
             }
         };
-    let mut binds: Vec<rusqlite::types::Value> =
-        json_binds.iter().map(storage::json_to_sql).collect();
+    let boolean_text = storage::sql_boolean_text(&cell);
+    let mut binds: Vec<rusqlite::types::Value> = json_binds
+        .iter()
+        .map(|bind| storage::json_to_sql(bind, boolean_text))
+        .collect();
     if !args.get(3).is_undefined() {
         let Ok(entries) = v8::Local::<v8::Array>::try_from(args.get(3)) else {
             return loader_throw(scope, "sql: byte bindings must be an array");
