@@ -306,8 +306,11 @@ service; the [KV](../services/kv.md), [R2](../services/r2.md) and
   and refuses with `Specified address is missing hostname.`/`missing port.`/
   `could not be parsed.`. The joined address must then be a valid host
   (`Specified address is empty string, contains unsupported characters or is
-  too long.`). Its `SocketOptions` argument converts too, including the three
-  `secureTransport` names. A fully converted address then rejects: Cello has
+  too long.`). Address members are read once each. Its `SocketOptions`
+  argument converts too: `secureTransport`, `allowHalfOpen` and the `uint64`
+  `highWaterMark` are read once each, in that order, and the three
+  `secureTransport` names are checked afterwards. A fully converted address
+  then rejects: Cello has
   no Fetcher TCP transport for a stub, so no socket is opened.
 - **R2 cursors are opaque tokens.** A string outside the token format that
   names no object gets the empty page R2 answers instead of a listing
