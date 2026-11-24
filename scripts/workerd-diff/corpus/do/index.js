@@ -982,6 +982,35 @@ export class Probe {
           return report({ caught: errorInfo(error) });
         }
       },
+      // #271 P1: a block failure over an open transaction breaks the event
+      // and rolls the savepoint back: the uncommitted write stays invisible
+      // and the next transaction starts clean. The `catch` below runs on
+      // the old code only.
+      async "/block-fail-open-tx"() {
+        try {
+          await this.state.blockConcurrencyWhile(async () => {
+            await this.state.storage.transaction(async (tx) => {
+              tx.put("txkey", "held");
+              await this.state.blockConcurrencyWhile(() => { throw new Error("tx-boom"); });
+              tx.put("txkey", "unreached");
+            });
+          });
+          return report({ settled: "resolved" });
+        } catch (error) {
+          return report({ caught: errorInfo(error) });
+        }
+      },
+      async "/block-tx-state"() {
+        const txkey = await this.state.storage.get("txkey");
+        let txOk = false;
+        try {
+          await this.state.storage.transaction(async (tx) => { tx.put("txkey2", "v"); });
+          txOk = true;
+        } catch {
+          txOk = false;
+        }
+        return report({ txkey: txkey ?? null, txOk });
+      },
       async "/block-instance"() {
         return report({ instance: this.instance });
       },
@@ -1441,6 +1470,15 @@ const routes = {
       const response = await brokenStr.fetch("https://do.test/block-instance");
       return { status: response.status, body: await response.text() };
     }, rpcFailure);
+    const brokenType = OBJ.getByName("block-fail-broken-type");
+    out.typeFirst = await attempt(async () => {
+      const response = await brokenType.fetch("https://do.test/block-fail-kind-type");
+      return { status: response.status, body: await response.text() };
+    }, rpcFailure);
+    out.typeSecond = await attempt(async () => {
+      const response = await brokenType.fetch("https://do.test/block-instance");
+      return { status: response.status, body: await response.text() };
+    }, rpcFailure);
     return report(out);
   },
   async "/block-fail-limit"() {
@@ -1483,6 +1521,24 @@ const routes = {
     out.stringSecond = await attempt(() => stringStub.rpcBoom("string"), rpcFailure);
     const caller = RPCDO.getByName("block-fail-rpc-caller");
     out.cell = await caller.viaRpc("block-fail-rpc-target");
+    return report(out);
+  },
+  // #271 P1: the failing event rolls an open transaction back, and the stub
+  // that saw the abort stays broken while a later event on the reset object
+  // sees no uncommitted write and starts a fresh transaction cleanly.
+  async "/block-fail-open-tx"() {
+    const out = {};
+    const tx = OBJ.getByName("block-fail-open-tx");
+    out.first = await attempt(async () => {
+      const response = await tx.fetch("https://do.test/block-fail-open-tx");
+      return { status: response.status, body: await response.text() };
+    }, rpcFailure);
+    out.second = await attempt(async () => {
+      const response = await tx.fetch("https://do.test/block-instance");
+      return { status: response.status, body: await response.text() };
+    }, rpcFailure);
+    const state = OBJ.getByName("block-fail-open-tx");
+    out.state = await (await state.fetch("https://do.test/block-tx-state")).json();
     return report(out);
   },
   async "/ids"() {

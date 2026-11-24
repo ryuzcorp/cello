@@ -202,6 +202,14 @@ export const cases = [
     fixture: "do",
     path,
   })),
+  // #271: P2/RPC and P3/replay keep the thrown value's class with no
+  // `remote` marker on repeats (and never on RPC); P1 rolls an open
+  // transaction back across the reset.
+  ...["/block-fail-rpc", "/block-fail-open-tx"].map((path) => ({
+    name: `do${path}`,
+    fixture: "do",
+    path,
+  })),
   // #261: the section outlives the guest's promise, so the nested block that
   // a response left running still writes, and a second event's block waits
   // behind it before it reads.
