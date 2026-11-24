@@ -450,7 +450,11 @@ The `tail` and `email` handlers are unavailable.
   writable is an ordinary abort: it resolves, `writer.closed` rejects with
   the abort reason, and the writable ends in the closed shape
   (`desiredSize` 0, later `write()` and `close()` report the closed stream)
-  instead of the errored one a JS sink gets. An encoder enqueues what it
+  instead of the errored one a JS sink gets. A `close()` already queued or
+  in flight when the readable is cancelled resolves too: its flush drops the
+  output rather than enqueueing it into the cancelled readable and does not
+  close that side a second time, and the compressor is released by that
+  flush instead of ahead of it, so `writer.closed` resolves as on Workerd. An encoder enqueues what it
   emitted for each push -- the gzip or zlib header on the first write, and
   nothing more until deflate has a block or the stream ends, while
   `deflate-raw` and `brotli` stay silent until `close()` -- as Workerd does,

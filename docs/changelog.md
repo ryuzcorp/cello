@@ -4,6 +4,23 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
 ---
 ## Unreleased
 
+- **`writer.close()` across a same-turn readable cancel resolves on a
+  compression stream, as Workerd does (#262).** With no `await` between a
+  write, `close()` and `reader.cancel()`, both `close()` and `writer.closed`
+  rejected with an internal `zlib stream already closed` because the cancel
+  released the compressor after the close had already started its flush;
+  with `close()` and the cancel and no write they rejected with
+  `Cannot enqueue a closed/errored stream`, because the cancel returned
+  before recording itself and the flush enqueued into the cancelled
+  readable. Both now resolve: a queued or in-flight close ends the
+  compressor with its own flush, that flush skips the enqueue and does not
+  close the readable a second time, and the cancel's release waits for the
+  close to settle. `desiredSize` is 0 and a later write reports the closed
+  stream, as on Workerd, for `gzip` and `deflate` in both orderings. Every
+  round releases its native stream, pinned by a 300-round probe that keeps
+  each wrapper held and still stays under the 128-stream cap. The
+  differential gate gained three cases that fail before this change and
+  every case agrees.
 - **Compression streams deliver output per push and keep an accepted write
   across a cancel, as Workerd does (#257).** A `CompressionStream` now
   enqueues whatever the encoder emitted for each write instead of holding

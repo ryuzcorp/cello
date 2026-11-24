@@ -849,6 +849,72 @@ const routes = {
     return report({ valid: await shape(valid), invalid: await shape(new Uint8Array([1, 2, 3, 4])) });
   },
 
+  async "/compression-close-cancel"(request) {
+    // Issue #262: writer.close() around a same-turn readable cancel. Workerd
+    // resolves both `close()` and `closed`; the flush that close starts must
+    // not enqueue into the cancelled readable, and the compressor it uses
+    // must not be released ahead of it. Probed for both orderings and for
+    // gzip and deflate, with the pending read the cancel settles, the
+    // `desiredSize` left behind, and a write and a close attempted after.
+    const only = new URL(request.url).searchParams.get("only");
+    const shape = async (format, mode) => {
+      const stream = new CompressionStream(format);
+      const writer = stream.writable.getWriter();
+      const reader = stream.readable.getReader();
+      const pull = reader.read().then(
+        ({ value, done }) => ({ ok: true, done, length: value?.byteLength }),
+        errorInfo);
+      if (mode !== "queued") await null;
+      const write = mode === "no-write"
+        ? "skipped"
+        : writer.write(new Uint8Array(64).fill(0x61)).then(() => "ok", errorInfo);
+      if (mode === "cancel-first") {
+        // The cancel drains before any close: the compressor is gone by the
+        // time close() starts its flush.
+        const cancelled = reader.cancel("cancel-reason").then(() => "ok", errorInfo);
+        const early = { write: await write, cancel: await cancelled };
+        const close = writer.close().then(() => "ok", errorInfo);
+        const closed = writer.closed.then(() => "ok", (error) => (error === undefined ? "undefined" : errorInfo(error)));
+        const out = {
+          ...early,
+          close: await close,
+          closed: await closed,
+          pull: await pull,
+        };
+        out.desiredSize = attempt(() => writer.desiredSize);
+        out.locked = stream.writable.locked;
+        out.writeAfter = await writer.write(new Uint8Array(1)).then(() => "ok", errorInfo);
+        out.closeAfter = await writer.close().then(() => "ok", errorInfo);
+        out.closedAfter = await writer.closed.then(() => "ok", (error) => (error === undefined ? "undefined" : errorInfo(error)));
+        return out;
+      }
+      const close = writer.close().then(() => "ok", errorInfo);
+      const closed = writer.closed.then(() => "ok", (error) => (error === undefined ? "undefined" : errorInfo(error)));
+      const cancel = reader.cancel("cancel-reason").then(() => "ok", errorInfo);
+      const out = {
+        write: await write,
+        close: await close,
+        closed: await closed,
+        cancel: await cancel,
+        pull: await pull,
+      };
+      out.desiredSize = attempt(() => writer.desiredSize);
+      out.locked = stream.writable.locked;
+      out.writeAfter = await writer.write(new Uint8Array(1)).then(() => "ok", errorInfo);
+      out.closeAfter = await writer.close().then(() => "ok", errorInfo);
+      out.closedAfter = await writer.closed.then(() => "ok", (error) => (error === undefined ? "undefined" : errorInfo(error)));
+      return out;
+    };
+    const out = {};
+    for (const format of ["gzip", "deflate"]) {
+      for (const mode of ["queued", "inflight", "no-write", "cancel-first"]) {
+        if (only !== null && only !== mode) continue;
+        out[`${format}:${mode}`] = await shape(format, mode);
+      }
+    }
+    return report(out);
+  },
+
   async "/compression-encoder-chunks"() {
     // Issue #257: workerd enqueues one chunk per push with whatever the
     // compressor emitted -- the gzip/zlib header on the first push, nothing
