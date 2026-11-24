@@ -1043,6 +1043,10 @@ struct Cell {
     fleet_credit_receipts: Mutex<Vec<LtxFleetCreditReceiptForWorldV1>>,
     #[cfg(all(test, cello_internal_tests))]
     fleet_capture_receipts: Mutex<Vec<LtxFleetCaptureReceiptForWorld>>,
+    /// Test seam: bundle-round captures still to refuse before they read the
+    /// WAL, so a failed capture is deterministic. One per unit taken.
+    #[cfg(test)]
+    fail_bundle_capture: AtomicU64,
 }
 type CellHandle = Arc<Cell>;
 
@@ -1164,6 +1168,25 @@ fn bundle_owns_tiering(registration: &Arc<Mutex<RegistrationState>>, paced: bool
             targets.manager.bucket_bundling(),
         )
     })
+}
+
+/// Consume one injected bundle-capture failure, so a test can make a round's
+/// capture refuse deterministically (see [`LtxRepl::fail_bundle_capture_for_test`]).
+#[cfg(test)]
+fn take_capture_failure(cell: &Cell) -> bool {
+    let mut remaining = cell.fail_bundle_capture.load(Ordering::SeqCst);
+    while remaining > 0 {
+        match cell.fail_bundle_capture.compare_exchange_weak(
+            remaining,
+            remaining - 1,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => remaining = actual,
+        }
+    }
+    false
 }
 
 /// Cells with uncredited tickets, for the bucket linger gate: the linger is a
@@ -3072,6 +3095,8 @@ impl LtxRepl {
             fleet_credit_receipts: Mutex::new(Vec::new()),
             #[cfg(all(test, cello_internal_tests))]
             fleet_capture_receipts: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            fail_bundle_capture: AtomicU64::new(0),
             compaction: self.compaction_queue.as_ref().map(|queue| {
                 let fetcher = Arc::new(SinkFetcher {
                     registration: self.registration.clone(),
@@ -4135,6 +4160,72 @@ impl LtxRepl {
             handle.durable_txid.fetch_max(position, Ordering::SeqCst);
             handle.ready.notify_waiters();
         }
+    }
+
+    /// Test-only: take one durability ticket for each cell without waiting for
+    /// a proof, so a test can arm a round and then sequence on the round's
+    /// effect instead of racing the await. The tickets are bumped under the
+    /// cell map's lock, which the loop's dirty snapshot also takes, so the loop
+    /// can never observe half the round's tickets: a multi-cell round is
+    /// deterministic. Returns the tickets in `cells` order.
+    #[cfg(test)]
+    pub(crate) fn bump_durability_tickets_for_test(
+        &self,
+        cells_to_bump: &[(&str, u64)],
+    ) -> Option<Vec<u64>> {
+        let cells = self.cells.lock().unwrap();
+        let mut handles = Vec::with_capacity(cells_to_bump.len());
+        for (cell, epoch) in cells_to_bump {
+            handles.push(cells.get(&(cell.to_string(), *epoch)).cloned()?);
+        }
+        let tickets = handles
+            .iter()
+            .map(|handle| handle.req_seq.fetch_add(1, Ordering::SeqCst) + 1)
+            .collect();
+        drop(cells);
+        self.dirty.notify_one();
+        self.dirty_ship.notify_one();
+        self.dirty_bundle.notify_one();
+        Some(tickets)
+    }
+
+    /// Test-only: wait for one already-taken ticket's proof, so a test can hold
+    /// a ticket from `bump_durability_tickets_for_test` without taking a second
+    /// one (a fresh ticket would change what the round sees).
+    #[cfg(test)]
+    pub(crate) async fn await_durability_ticket_for_test(
+        &self,
+        cell: &str,
+        epoch: u64,
+        ticket: u64,
+    ) -> anyhow::Result<cello_logic::ProofSource> {
+        let Some(handle) = self
+            .cells
+            .lock()
+            .unwrap()
+            .get(&(cell.to_string(), epoch))
+            .cloned()
+        else {
+            anyhow::bail!("ltx cell not resident: {cell} epoch {epoch}");
+        };
+        self.wait_for_durability_ticket(&handle, cell, epoch, ticket)
+            .await
+    }
+
+    /// Test-only: make the next `count` bundle-round captures of this cell
+    /// refuse before they read the WAL, as a capture error does, so the
+    /// fallback has a deterministic trigger. Returns whether the cell is
+    /// resident.
+    #[cfg(test)]
+    pub(crate) fn fail_bundle_capture_for_test(&self, cell: &str, epoch: u64, count: u64) -> bool {
+        self.cells
+            .lock()
+            .unwrap()
+            .get(&(cell.to_string(), epoch))
+            .is_some_and(|handle| {
+                handle.fail_bundle_capture.store(count, Ordering::SeqCst);
+                true
+            })
     }
 
     /// Test-only: hold (or release) one cell's sync claim, as a sync worker
@@ -5881,48 +5972,80 @@ async fn bundle_loop(
             }
         }
         type Credits = Vec<(CellHandle, u64, u64)>;
-        let (entries, credits): (Vec<cello_ltx::bundle::BundleEntry>, Credits) =
-            asyncrt::blocking(move || {
-                let mut entries = Vec::new();
-                let mut credits = Vec::new();
-                for ((cell, epoch), handle) in work {
-                    let tickets = handle.req_seq.load(Ordering::SeqCst);
-                    note_capture(&handle, tickets);
-                    let mut replica = handle.replica.lock().unwrap();
-                    let Some(db) = managed_db_mut(&mut replica) else {
-                        continue;
-                    };
-                    if db.sync().is_err() {
-                        continue;
-                    }
-                    let Ok(pos) = db.pos() else { continue };
-                    let from = handle.durable_txid.load(Ordering::SeqCst) + 1;
-                    let mut complete = true;
-                    for txid in from..=pos.txid.0 {
-                        match db.read_ltx_file(0, TXID(txid), TXID(txid)) {
-                            Ok(bytes) => entries.push(cello_ltx::bundle::BundleEntry {
-                                cell: cell.clone(),
-                                cell_epoch: epoch,
-                                txid,
-                                bytes,
-                            }),
-                            Err(error) => {
-                                warn!(%error, txid, "read staged l0 for bundle failed");
-                                complete = false;
-                                break;
-                            }
+        type Capture = (
+            Vec<cello_ltx::bundle::BundleEntry>,
+            Credits,
+            /* capture_failed */ bool,
+        );
+        let (entries, credits, capture_failed): Capture = asyncrt::blocking(move || {
+            let mut entries = Vec::new();
+            let mut credits = Vec::new();
+            // A capture that refused leaves its cell's tickets uncredited
+            // while bundling stays armed, so the round must hand them back
+            // to the per-cell path instead of parking them (#243).
+            let mut capture_failed = false;
+            for ((cell, epoch), handle) in work {
+                let tickets = handle.req_seq.load(Ordering::SeqCst);
+                note_capture(&handle, tickets);
+                #[cfg(test)]
+                if take_capture_failure(&handle) {
+                    capture_failed = true;
+                    continue;
+                }
+                let mut replica = handle.replica.lock().unwrap();
+                let Some(db) = managed_db_mut(&mut replica) else {
+                    // A closed replica has no credit path at all (the cell
+                    // is leaving), so it is not a failed capture.
+                    continue;
+                };
+                if db.sync().is_err() {
+                    capture_failed = true;
+                    continue;
+                }
+                let Ok(pos) = db.pos() else {
+                    capture_failed = true;
+                    continue;
+                };
+                let from = handle.durable_txid.load(Ordering::SeqCst) + 1;
+                // Stage this cell's rows aside. An incomplete capture leaves
+                // them for the per-cell retry to upload, so the bundle never
+                // carries rows that a retry would upload again: the failed
+                // cell stays out of the bundle entirely, and a restore sees
+                // each row once (per-cell objects, or bundle rows).
+                let mut staged = Vec::new();
+                let mut complete = true;
+                for txid in from..=pos.txid.0 {
+                    match db.read_ltx_file(0, TXID(txid), TXID(txid)) {
+                        Ok(bytes) => staged.push(cello_ltx::bundle::BundleEntry {
+                            cell: cell.clone(),
+                            cell_epoch: epoch,
+                            txid,
+                            bytes,
+                        }),
+                        Err(error) => {
+                            warn!(%error, txid, "read staged l0 for bundle failed");
+                            complete = false;
+                            capture_failed = true;
+                            break;
                         }
                     }
-                    drop(replica);
-                    if complete {
-                        credits.push((handle, tickets, pos.txid.0));
-                    }
                 }
-                (entries, credits)
-            })
-            .await
-            .unwrap_or_default();
+                drop(replica);
+                if complete {
+                    entries.extend(staged);
+                    credits.push((handle, tickets, pos.txid.0));
+                }
+            }
+            (entries, credits, capture_failed)
+        })
+        .await
+        .unwrap_or_default();
         if credits.is_empty() {
+            // Nothing was captured, so there is no flush to protect: hand the
+            // whole round back before parking (#243).
+            if capture_failed && active.bucket_bundling() {
+                active.note_bucket_bundle_stalled();
+            }
             continue;
         }
         let count = entries.len();
@@ -5964,6 +6087,16 @@ async fn bundle_loop(
                 note_proof(&handle);
                 handle.ready.notify_waiters();
             }
+        }
+        if capture_failed && active.bucket_bundling() {
+            // Flush first, fall back second: this round's PUT is already done,
+            // so the cells it did capture are credited. Noting the stall before
+            // the flush would clear the epoch, and `put_bundle` refuses a
+            // bucket flush without a live epoch — the healthy cells' rows would
+            // be discarded and nobody credited (#243 review). The failed cell
+            // left no rows in the bundle (its capture staged none), so its
+            // per-cell retry uploads each row exactly once.
+            active.note_bucket_bundle_stalled();
         }
     }
 }

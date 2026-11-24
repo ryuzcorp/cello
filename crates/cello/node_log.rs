@@ -4229,6 +4229,12 @@ pub struct NodeLogManager {
     /// suppress per-cell uploads again and repeat the refused PUT; the latch
     /// keeps this session on per-cell uploads for the rest of its life.
     bucket_fenced: std::sync::atomic::AtomicBool,
+    /// Test seam: bundling drops so far, so a test can sequence on the
+    /// per-cell fallback instead of polling the epoch.
+    #[cfg(test)]
+    bundle_stalls: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    bundle_stall_changed: tokio::sync::Notify,
     #[cfg(all(test, cello_internal_tests))]
     close_transition_pause: Mutex<Option<Arc<NodeLogTransitionPause>>>,
     #[cfg(all(test, cello_internal_tests))]
@@ -5373,6 +5379,10 @@ impl NodeLogManager {
             flush_in_flight: std::sync::atomic::AtomicBool::new(false),
             bucket_epoch: std::sync::atomic::AtomicU64::new(0),
             bucket_fenced: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            bundle_stalls: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            bundle_stall_changed: tokio::sync::Notify::new(),
             #[cfg(all(test, cello_internal_tests))]
             close_transition_pause: Mutex::new(None),
             #[cfg(all(test, cello_internal_tests))]
@@ -8186,6 +8196,31 @@ impl NodeLogManager {
             self.bucket_fenced.store(true, Ordering::SeqCst);
         }
         self.bucket_epoch.store(0, Ordering::SeqCst);
+        #[cfg(test)]
+        {
+            self.bundle_stalls.fetch_add(1, Ordering::SeqCst);
+            self.bundle_stall_changed.notify_one();
+        }
+    }
+
+    /// Wait until bundling has been dropped `count` times. Deterministic: the
+    /// counter moves before the notice is checked, so a caller never waits on a
+    /// drop that already happened.
+    #[cfg(test)]
+    pub(crate) async fn wait_for_bundle_stalls(&self, count: u64) {
+        loop {
+            let changed = self.bundle_stall_changed.notified();
+            if self.bundle_stalls.load(Ordering::SeqCst) >= count {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    /// Bundling drops so far.
+    #[cfg(test)]
+    pub(crate) fn bundle_stalls(&self) -> u64 {
+        self.bundle_stalls.load(Ordering::SeqCst)
     }
 
     /// A failed lone-cell upload must fall back like a failed bundle PUT:
@@ -10122,6 +10157,78 @@ mod bucket_executor_tests {
                 cello_logic::ProofSource::Bucket,
                 "the healed write still acks on the per-cell proof"
             );
+        });
+    }
+
+    /// A failed capture inside a bundle round must flush what it did capture
+    /// before it hands the failed cell back. Fail-before (#243, and the #244
+    /// review): noting the stall before the flush clears the bundle epoch, so
+    /// `put_bundle` refuses the round — the healthy cell's rows are discarded,
+    /// nobody is credited, and no bundle appears. With the fix the healthy cell
+    /// rides exactly one bundle and the failed cell is credited later through
+    /// the per-cell path, each row uploaded once.
+    #[test]
+    fn a_failed_bundle_capture_flushes_its_healthy_cells_first() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("test dir");
+            let store = Arc::new(ListCountingStore::new());
+            let bucket = Arc::new(Bucket::with_store_for_test(
+                store.clone() as Arc<dyn cello_ltx::object_store::ObjectStore>
+            ));
+            let manager = test_manager_with_store(dir.path(), bucket.clone(), store.clone());
+            let manager = Arc::new(manager);
+            let _registration = manager
+                .ltx
+                .register_durability(manager.clone())
+                .expect("registration installs");
+            open_gate(&manager);
+            publish_bucket_open(&manager, &bucket).await;
+            activate_cell(&manager, "c0", 1, true).await;
+            activate_cell(&manager, "c1", 1, true).await;
+            sql_write(&cell_db(&dir.path().join("watch"), "c0", 1));
+            sql_write(&cell_db(&dir.path().join("watch"), "c1", 1));
+            assert!(manager.ltx.fail_bundle_capture_for_test("c0", 1, 1));
+            let stalls = manager.bundle_stalls();
+            // Both tickets land under the cell map's lock, so the round always
+            // sees two dirty cells and takes the shared bundle path.
+            let tickets = manager
+                .ltx
+                .bump_durability_tickets_for_test(&[("c0", 1), ("c1", 1)])
+                .expect("both cells are resident");
+            // c0's own ticket, not a fresh one: the retry then sees a single
+            // pending write and takes the per-cell path.
+            let source = crate::asyncrt::timeout(
+                std::time::Duration::from_secs(10),
+                manager
+                    .ltx
+                    .await_durability_ticket_for_test("c0", 1, tickets[0]),
+            )
+            .await
+            .expect("no timeout")
+            .expect("the handed-back cell credits per cell");
+            assert_eq!(source, cello_logic::ProofSource::Bucket);
+            assert_eq!(
+                bundle_keys(&bucket, "log/n0/gen1/bundle/").await.len(),
+                1,
+                "the healthy cell's rows ride one bundle: the flush precedes the stall"
+            );
+            let per_cell = bundle_keys(&bucket, "cells/").await;
+            assert!(
+                !per_cell.is_empty(),
+                "the failed cell uploads through the per-cell path"
+            );
+            assert!(
+                per_cell.iter().all(|key| key.contains("c0")),
+                "only the failed cell reaches the per-cell prefix; the healthy one \
+                 was credited by the bundle: {per_cell:?}"
+            );
+            crate::asyncrt::timeout(
+                std::time::Duration::from_secs(2),
+                manager.wait_for_bundle_stalls(stalls + 1),
+            )
+            .await
+            .expect("the failed capture hands the cell back after the flush");
         });
     }
 

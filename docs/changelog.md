@@ -90,6 +90,19 @@ or API-shape break.
   while a round that cannot progress still re-parks instead of spinning. A
   loaded `--lib` run reached the old park at about one in three attempts; 24
   loaded runs after the fix reached it zero times.
+- **A bundle round that cannot capture a cell flushes the rest, then hands it
+  back to the per-cell path (#243).** A capture that refuses (`db.sync()`,
+  `pos()` or a staged-row read) left that cell uncredited while bundling stayed
+  armed, and `sync_loop` uploads nothing per cell while bundling is armed, so
+  its durability ticket waited out the whole
+  `CELLO_LTX_DURABILITY_TIMEOUT_SECS` budget with zero PUTs until another write
+  arrived. The round now flushes and credits what it did capture first, and only
+  then drops bundling so the scan's worker retries the failed cell per cell with
+  backoff — dropping it earlier would clear the epoch and `put_bundle` refuses a
+  bucket flush without one, discarding the healthy cells' rows. The failed
+  cell's rows never enter the bundle (its capture stages them aside), so no row
+  is uploaded twice. A closed replica is not a failure: that cell has no credit
+  path at all.
 
 Three binding divergences the 0.2.9 sweep filed are fixed, and the
 differential gate gained three cases (204 in all, every one agreeing with
