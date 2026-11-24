@@ -513,6 +513,12 @@ fn assert_rpc_shapes(failures: &mut Vec<String>, label_prefix: &str, answer: &Va
         text(answer, &["oversize", "payloadLength"]),
         "70000",
     );
+    expect(
+        failures,
+        &format!("{label_prefix}.oversize.payloadAllX"),
+        text(answer, &["oversize", "payloadAllX"]),
+        "true",
+    );
 }
 
 /// The `(local, cross-node)` answers of one test route, from an instance
@@ -647,6 +653,12 @@ fn a_handler_failure_keeps_its_shape_across_nodes() {
     );
     expect(
         &mut failures,
+        "local.oversize.payloadAllX",
+        text(&local, &["oversize", "payloadAllX"]),
+        "true",
+    );
+    expect(
+        &mut failures,
         "remote.oversize.payloadLength",
         text(&cross_node, &["oversize", "payloadLength"]),
         "null",
@@ -672,6 +684,7 @@ fn a_handler_failure_keeps_its_shape_across_nodes() {
             "remote",
             "stack",
             "payloadLength",
+            "payloadAllX",
         ] {
             let from_local = text(&rpc_local, &[label, field]);
             let from_cross = text(&rpc_cross, &[label, field]);
