@@ -333,7 +333,7 @@ pub fn worker_compat(metadata: &serde_json::Value) -> js::Compat {
             date.is_none_or(|date| date >= "2026-03-17")
         },
         queue_json_messages: switch("queue_json_messages", "queue_v8_messages", "2024-03-18"),
-        // The release date of 0.2.10, the first version that can store the
+        // The release date of 0.3.0, the first version that can store the
         // text type. Workerd has no flag or date for this — it always binds
         // text — so Cello picks the date it starts matching workerd rather
         // than inventing an upstream one. A deployment with no

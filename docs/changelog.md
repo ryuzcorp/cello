@@ -1,62 +1,82 @@
 ---
 title: Changelog
-description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.9.
+description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.3.0.
 ---
-## Unreleased
- - **An event suspended across another event's block failure is refused
-   instead of hanging (#284).** A dispatched event that arms a sleep and is
-   still suspended when a second event's `blockConcurrencyWhile` body throws
-   hung forever: the reset resolved its held wait, but the termination
-   discarded the continuation before any checkpoint could run it, and no op
-   of its own ever completes afterward. The host now fails every other begun
-   drive of the aborted cell with the abort's value -- what the block threw,
-  or the reason passed to `state.abort()` -- the way workerd answers them.
-  `state.abort()`'s reason now reads as workerd's does: the whole reason
-  stringified (`Error: msg` for an `Error`), or `Application called abort()
-  to reset Durable Object.` when none is given, where Cello answered the
-  bare message and `undefined`. The differential gate gained four cases
-  (`do/nested-hold-crossfail` and `do/nested-hold-crossabort` with a string,
-  no and an `Error` reason, each with a sequential leg proving the gate is
-  not stuck shut) and every case agrees.
- - **Several timers held past their deadlines release innermost scope first,
-   the way workerd releases them (#282).** Cello fired every held timer in
-   global deadline order; on workerd each scope drains before the one around
-   it, deadline order only within a scope, with scopeless handler timers
-   last. A section now releases only after the timers it held have fired,
-   and the root section is recorded synchronously at block entry and stays
-   open in the map, so a completion that lands in the microtasks before the
-   gate ticket arrives still sees it open. A held timer whose callback
-   throws no longer wedges the section: the throw stays an unhandled
-   rejection while the release bookkeeping runs regardless. Resetting after
-   a failure force-resolves the open sections' `settled` (carrying the
-   failure) and `release` promises, so waits held on them are released and
-   fail fast instead of pending forever, and a block refused at acquisition
-   forgets its synchronously opened root. The differential gate gained two
-   cases (`do/nested-hold-order`, with scope, depth-2 and interval shapes,
-   and `do/nested-hold-throwstuck`) that fail on `origin/main` and every
-   case agrees.
-- **Sibling nested `blockConcurrencyWhile` sections run one at a time, in
-   schedule order, the way workerd runs them (#278).** Two nested sections
-   the same body starts used to run concurrently; on workerd the second
-   waits until the first has fully settled, body and descendants alike.
-   Cello now parents every nested section under the section whose body
-   scheduled it -- a section scheduled from inside a sibling's body is that
-   sibling's child, not a sibling -- and each child starts only after the
-   sibling ahead of it has fully settled. A body that failed resets the
-   object, so the sibling behind it never runs and carries that failure
-   instead; a sibling awaiting another breaks the event through the running
-   sibling's limit rather than wedging, exactly as workerd's 30-second limit
-   does. The #268 hold follows the same tree: a section's own timers and
-   subrequests wait only for the sections nested inside it, so the first
-   sibling's timer fires while the second still waits. The differential gate
-   gained eight cases (`do/nested-siblings`,
-   `do/nested-siblings-await`, `do/nested-siblings-await-second`,
-   `do/nested-siblings-child`, `do/nested-siblings-inner-timer`,
-   `do/nested-siblings-inner-fetch`, `do/nested-siblings-storage`,
-   `do/nested-siblings-fail`) that fail on `origin/main` and every case
-   agrees.
+## v0.3.0
 
-  - **Transform pipe-cancel and internal-stream writes match Workerd in the
+0.3.0 is a minor version bump because of the breaking changes listed below. Cello now answers like workerd 1.20261121.1 across the rest of the sweep: nested `blockConcurrencyWhile` ordering and failure propagation, the round-2 stream pipe/cancel/abort races, Workflow instance shapes and errors, binding option validation, and the Low-severity tail (`reportError`'s message, the `process` identity, the `Buffer` shape, the iterator helpers V8 still gates behind flags, and `storage.put()` of a `URL` or `URLSearchParams`). This release closes every open workerd-1.20261121.1 differential issue found since 0.2.9 except the two edge races tracked in #283 (a same-turn write+cancel on a plain `TransformStream`, and a write landing between `abort()` and its settlement on identity/fixed streams). Durability gets two fixes for loop parks that starved cells of uploads (#200, #243), compression output now matches workerd byte for byte through the zlib-rs backend, and R2 cursors become opaque versioned tokens. The `scripts/workerd-diff` gate now runs 297 cases and every one agrees.
+
+Configuration changes: Durable Object SQL boolean binds are stored as TEXT from compatibility date 2026-11-24 (with the `sql_boolean_text` / `no_sql_boolean_text` flags), and R2 cursors are opaque `cello-r2-cursor-v1.` tokens, with 0.2.9 plain-key cursors accepted only through 0.3.0. There are no bucket-format changes. The moving container tag is now `0.3`; the `0.2` tag stays at 0.2.9, so deployments following the `0.2` tag must opt in to upgrade.
+
+**Breaking changes.** Check each one before upgrading:
+
+- **Durable Object SQL booleans are stored as TEXT from compatibility date 2026-11-24 (#154).** A deployment at that date or later writes `true`/`false` binds as TEXT, as workerd does; an older date, or none, keeps INTEGER. The flags `sql_boolean_text` and `no_sql_boolean_text` force either type. Bumping the date over an existing column mixes the two types, so pin `no_sql_boolean_text` or rewrite the column first, as the entry below describes.
+- **R2 cursors are opaque tokens (#158, #164, #187).** Every cursor Cello answers is a versioned `cello-r2-cursor-v1.` token, and a string outside that format that names no object answers the empty page. Plain-key cursors from 0.2.9 and earlier are still read as cursors through 0.3.0; the plain-key path is removed in 0.3.1.
+- **A throw, the nesting limit or the 30 s limit in `blockConcurrencyWhile` breaks the event with a 500 instead of a catchable rejection (#267).** A `catch` around the block no longer runs; the stub call rejects with the value the block threw, the object resets, and a stub that observed the abort stays broken while a fresh stub works.
+- **`storage.rollback()` is removed; stub `name`/`id` are read-only; `ctx.props` is `{}` (#251).** A stub is a `DurableObject` over `Fetcher` whose `fetch`/`connect` have arity 0, and `ctx.storage` reports only `kv` and `sql`.
+- **`pipeTo` settles differently on races (#272).** Cancelling the readable while a pipe feeds the writable now fulfills the pipe once the destination's writes drain, and `controller.error()` on an otherwise idle pipe fulfills the same way, as workerd does.
+- **Workflow `status()` answers `{status, error, output}` in every state, error texts lose the `WORKFLOW_ERROR` prefix, and `sendEvent` to a terminal instance is accepted and dropped (#275).** `deleteBatch()` reports a malformed id as a per-item `10400` error instead of refusing the whole batch.
+- **Binding options are type-checked (#187).** An options argument of the wrong type now throws workerd's `parameter N is not of type 'XOptions'` message, so a typo no longer reads as "no options"; unknown response types and no-overload `storage.put` argument lists are refused with workerd's messages.
+- **`storage.put(entries)` takes a plain object and `storage.list()` / `kv.list()` convert `ListOptions` as workerd's JSG does (#239).** A `Map`, `Set` or `Date` writes nothing, an array falls to the single-pair form, `limit` is an `int` with the int32 range check, and `start` with `startAfter` is refused.
+- **R2 `list()` validates `limit` and answers the empty page for an invalid cursor (#164).** A `limit` outside 1..1000 (other than the `-1` default-page sentinel) fails with `(10022)`, and a made-up cursor string answers `{ objects: [], truncated: false, delimitedPrefixes: [] }` instead of restarting the listing.
+- **`storage.put()` refuses a `URL` or `URLSearchParams` with `DataCloneError` (#233).**
+- **`DurableObjectState` publishes only workerd's members (#256).** The block path helpers, the readiness wait and the hibernatable socket lookup are private now and can no longer be called by guest code.
+- **`state.abort()` reasons read as workerd's (#284).** A stub caller sees the whole reason stringified (`Error: msg` for an `Error`) or `Application called abort() to reset Durable Object.` when none is given, and other events suspended on the aborted object are failed with that value instead of hanging.
+
+- **An event suspended across another event's block failure is refused
+  instead of hanging (#284).** A dispatched event that arms a sleep and is
+  still suspended when a second event's `blockConcurrencyWhile` body throws
+  or calls `state.abort()` hung forever: the reset resolved its held wait,
+  but the termination discarded the continuation before any checkpoint
+  could run it, and no op of its own ever completes afterward. The host now
+  fails every other begun drive of the aborted cell with the abort's value
+  -- what the block threw, or the reason passed to `state.abort()` -- the
+  way workerd answers them. `state.abort()`'s reason now reads as
+  workerd's does: the whole reason stringified (`Error: msg` for an
+  `Error`), or `Application called abort() to reset Durable Object.` when
+  none is given, where Cello answered the bare message and `undefined`.
+  The differential gate gained four cases (`do/nested-hold-crossfail` and
+  `do/nested-hold-crossabort` with a string, no and an `Error` reason, each
+  with a sequential leg proving the gate is not stuck shut) that fail on
+  v0.2.9, and every case agrees.
+- **Several timers held past their deadlines release innermost scope first,
+  the way workerd releases them (#282).** Cello fired every held timer in
+  global deadline order; on workerd each scope drains before the one around
+  it, deadline order only within a scope, with scopeless handler timers
+  last. A section now releases only after the timers it held have fired,
+  and the root section is recorded synchronously at block entry and stays
+  open in the map, so a completion that lands in the microtasks before the
+  gate ticket arrives still sees it open. A held timer whose callback
+  throws no longer wedges the section: the throw stays an unhandled
+  rejection while the release bookkeeping runs regardless. Resetting after
+  a failure force-resolves the open sections' `settled` (carrying the
+  failure) and `release` promises, so waits held on them are released and
+  fail fast instead of pending forever, and a block refused at acquisition
+  forgets its synchronously opened root. The differential gate gained two
+  cases (`do/nested-hold-order`, with scope, depth-2 and interval shapes,
+  and `do/nested-hold-throwstuck`) that fail on v0.2.9, and every case
+  agrees.
+- **Sibling nested `blockConcurrencyWhile` sections run one at a time, in
+  schedule order, the way workerd runs them (#278).** Two nested sections
+  the same body starts used to run concurrently; on workerd the second
+  waits until the first has fully settled, body and descendants alike.
+  Cello now parents every nested section under the section whose body
+  scheduled it -- a section scheduled from inside a sibling's body is that
+  sibling's child, not a sibling -- and each child starts only after the
+  sibling ahead of it has fully settled. A body that failed resets the
+  object, so the sibling behind it never runs and carries that failure
+  instead; a sibling awaiting another breaks the event through the running
+  sibling's limit rather than wedging, exactly as workerd's 30-second limit
+  does. The #268 hold follows the same tree: a section's own timers and
+  subrequests wait only for the sections nested inside it, so the first
+  sibling's timer fires while the second still waits. The differential gate
+  gained eight cases (`do/nested-siblings`,
+  `do/nested-siblings-await`, `do/nested-siblings-await-second`,
+  `do/nested-siblings-child`, `do/nested-siblings-inner-timer`,
+  `do/nested-siblings-inner-fetch`, `do/nested-siblings-storage`,
+  `do/nested-siblings-fail`) that fail on v0.2.9 and every case
+  agrees.
+- **Transform pipe-cancel and internal-stream writes match Workerd in the
   round-2 shapes (#272, #276, #280).** A `pipeTo` whose source is done and
   whose destination `close()` fails rejects with the close error instead of
   hanging on the closed promise, and never cancels the source with it. An
@@ -80,8 +100,7 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
   `byte-transform-invalid-on-dead`, `transform-parked-cancel-ready`,
   `internal-stream-write-while-closing`, `fixed-length-overflow-write-close`,
   `identity-string-chunks`, `identity-fixed-abort-shape`), all failing
-  before this change and agreeing after.
-
+  on v0.2.9 and agreeing after.
 - **An invalid chunk rejects only its own write on internal byte streams, as
   Workerd does (#280).** The accept-time validation from #276 now also covers
   `IdentityTransformStream` and `FixedLengthStream`: a non-`BufferSource`
@@ -89,8 +108,7 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
   valid write still runs, and the invalid write does not count toward a
   `FixedLengthStream`'s expected length. The differential gate gained
   `identity-invalid-chunk` and `fixed-length-invalid-chunk`, each in both
-  read/write orderings, all failing before this change.
-
+  read/write orderings, all failing on v0.2.9.
 - **An invalid chunk rejects only its own write on compression streams, as
   Workerd does (#276).** Writing a chunk that is neither a `BufferSource`, a
   string nor `undefined` used to park the write until a read pulled it through
@@ -99,8 +117,7 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
   that write rejects with the `TypeError` while the stream stays usable: a
   valid write after it still runs and the close resolves. The differential
   gate gained `compression-invalid-chunk` and `decompression-invalid-chunk`,
-  each in both read/write orderings, all failing before this change.
-
+  each in both read/write orderings, all failing on v0.2.9.
 - **An open nested `blockConcurrencyWhile` section holds the enclosing
   body's timers and subrequests the way workerd holds them (#268).** While
   a nested section is open, a timer the enclosing body scheduled -- before
@@ -113,9 +130,9 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
   waits only for the sections nested inside the scheduler's own section --
   never the section itself, and never a sibling or nephew -- and the frame
   record rides the body's continuations so a schedule after an `await` still
-   (`do/nested-hold-timers`, `do/nested-hold-fetch` and
-   `do/nested-hold-prearmed-after-fail`) that fail on `origin/main` and
-   every case agrees.
+  (`do/nested-hold-timers`, `do/nested-hold-fetch` and
+  `do/nested-hold-prearmed-after-fail`) that fail on v0.2.9 and
+  every case agrees.
 - **A throw, the 64-level limit or the 30 s limit in
   `blockConcurrencyWhile` breaks the event the way workerd breaks it
   (#267).** A body that throws or rejects -- top-level or nested -- used to
@@ -133,7 +150,7 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
   gives its reserved depth back when the turn is cancelled instead of
   leaving it elevated. The differential gate gained three cases
   (`do/block-fail-top`, `do/block-fail-nested`, `do/block-fail-limit`) that
-  fail before this change and every case agrees, and the block-limit
+  fail on v0.2.9 and every case agrees, and the block-limit
   conformance test now asserts the 500 and the reset behind its
   `CELLO_TEST_BLOCK_LIMIT_MS` seam. A block failure over an open
   transaction rolls the savepoint back host-side, so the uncommitted writes
@@ -144,7 +161,7 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
   another cell. Repeats on a broken stub replay the same class and message
   with no marker, for Error and non-Error throws alike. The gate gained
   `do/block-fail-rpc` and `do/block-fail-open-tx` plus a TypeError repeat
-  pair, all failing before this change and agreeing after.
+  pair, all failing on v0.2.9 and agreeing after.
 - **`close()` racing `writer.abort()` settles as Workerd does, and an empty
   `DecompressionStream` close rejects, on compression streams (#270).** With
   no readable cancel involved, an `abort()` that lands while a `close()` is
@@ -210,7 +227,7 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
   `workflows.api.error.instance.not_found` error, echoed back like any
   other absent id with duplicates preserved, so Cello does the same. The
   differential gate gained `workflow-status/shape-terminal`, `shape-live`,
-  `send-terminal`, `lifecycle-a`, `lifecycle-b` and `binding` (252 total)
+  `send-terminal`, `lifecycle-a`, `lifecycle-b` and `binding`,
   and every case agrees.
 - **A plain `TransformStream` readable cancel racing a `pipeTo` matches
   Workerd (#272).** Cancelling the readable while a pipe is feeding the
@@ -226,8 +243,7 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
   was already running still completes, as does one queued behind it. The
   differential gate gained four cases -- the idle pipe, the running
   transform, the completing destination error, and a flush-time cancel
-  that already agreed -- and the first three fail before this change.
-
+  that already agreed -- and the first three fail on v0.2.9.
 - **`writer.close()` across a same-turn readable cancel resolves on a
   compression stream, as Workerd does (#262).** With no `await` between a
   write, `close()` and `reader.cancel()`, both `close()` and `writer.closed`
@@ -244,7 +260,7 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
   round releases its native stream, pinned by a 300-round probe that keeps
   each wrapper held and still stays under the 128-stream cap. The
   differential gate gained four cases -- the three orderings that failed
-  before this change plus a cancel-then-close control that already agreed --
+  on v0.2.9 plus a cancel-then-close control that already agreed --
   and every case agrees.
 - **A module's Workflows are in `ctx.exports` as their workflow bindings
   (#266).** A `WorkflowEntrypoint` class export is its Workflow's binding,
@@ -257,8 +273,8 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
   `env.<binding>` now reflects workerd's binding shape too. A config that
   names one class for two workflows, or that names `default`, is refused at
   deploy, as workerd refuses it. The differential gate gained
-  `workflow-exports` and `workflow-exports-do` (246 total) and every case
-  agrees.
+  `workflow-exports` and `workflow-exports-do`,
+  and every case agrees.
 - **Compression streams deliver output per push and keep an accepted write
   across a cancel, as Workerd does (#257).** A `CompressionStream` now
   enqueues whatever the encoder emitted for each write instead of holding
@@ -292,7 +308,7 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
   a conformance test, which shortens it through a `CELLO_TEST_WAIT=1` seam
   instead of waiting 30 s. The differential gate gained three cases
   (`do/block-refusals`, `do/nested-block-order`, `do/nested-block-drain`)
-  that fail before this change and every case agrees.
+  that fail on v0.2.9 and every case agrees.
 - **A Durable Object's `ctx.exports` lists every module export (#259).** It
   answered only `default`, because the class registries it was built from
   hold just entrypoints; a class that inherits no entrypoint base (workerd's
@@ -326,8 +342,8 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
   `ctx.exports` also no longer exposes the runtime's own classes or the
   script-scoped workflow alias (`__Workflow.<script>`), which the workflow
   cell registered in the same class registry. The differential gate gained
-  `do/exports-surface` and `do-workflow/exports-surface` (240 total) and
-  every case agrees.
+  `do/exports-surface` and `do-workflow/exports-surface`,
+  and every case agrees.
 - **A compression stream settles a cancel racing an abort the way Workerd
   does (#252).** A `DecompressionStream`/`CompressionStream` with a write in
   flight, a pending `read()` and a synchronous `reader.cancel()` followed by
@@ -351,7 +367,7 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
   are. `blockConcurrencyWhile` keeps its semantics: nesting, the 30-second
   limit, drain of nested blocks before release, the failure reset, and the
   hibernatable WebSocket dispatch are unchanged. The differential gate gained
-  a case (233 total) that fails before this change and every case agrees.
+  a case that fails on v0.2.9 and every case agrees.
 - **A Durable Object's storage, state, SQL, id, namespace and stub surfaces
   keep their internals private and match workerd (#251).**
   `ctx.storage` reports `kv` and `sql` as its only own, enumerable
@@ -382,7 +398,7 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
   value; Cello does not cut a hibernatable event short on it. `ctx.props` is
   `{}` for a class declared without props, as workerd's is, and the unused
   `storage.rollback()` method is gone. The differential gate gained three
-  cases (232 total) and every case agrees.
+  cases and every case agrees.
 - **A boolean SQL bind is stored as workerd's TEXT `'true'`/`'false'` from
   compatibility date 2026-11-24 (#154) — Breaking for new compatibility
   dates.** Workerd stores a `true`/`false` bind as TEXT; Cello stored INTEGER
@@ -417,7 +433,7 @@ The last workerd 1.20261121.1 divergences from the Low-severity tail of the
 sweep are closed: `reportError`'s message, the `process` identity, the
 `Buffer` shape, the iterator helpers V8 still gates behind flags, and
 `storage.put()` of a `URL` or `URLSearchParams`. The differential gate gained
-five cases (206 total) and every one agrees. No configuration, bucket-format
+five cases and every one agrees. No configuration, bucket-format
 or API-shape break.
 
 - **`reportError` describes its value the way workerd does** (#228). The
@@ -502,8 +518,8 @@ or API-shape break.
   path at all.
 
 Three binding divergences the 0.2.9 sweep filed are fixed, and the
-differential gate gained three cases (204 in all, every one agreeing with
-workerd 1.20261121.1).
+differential gate gained three cases, every one agreeing with
+workerd 1.20261121.1.
 
 - **`D1Result.meta` carries `timings`** (#158). Every result answers
   `timings: { sql_duration_ms }`, the same measurement as `duration`, so a
@@ -540,10 +556,10 @@ workerd 1.20261121.1).
   does. `cello r2 list --page` and `--cursor` refuse such a cursor with an
   error rather than printing an empty page. **Rolling upgrades:** 0.2.9 and
   earlier answered a page with the plain key it consumed, so a plain key is
-  still read as a cursor through 0.2.10 -- and only while the bucket holds an
+  still read as a cursor through 0.3.0 -- and only while the bucket holds an
   object at that key, so a legitimate 0.2.9 cursor keeps paging while a
   made-up string gets the empty page. The plain-key path is removed in
-  0.2.11. The token is unsigned, so a client can mint one, and it is honoured
+  0.3.1. The token is unsigned, so a client can mint one, and it is honoured
   as a listing position inside the binding's own bucket and prefix and
   nothing more (no other bucket, no escape from the prefix's directory, no
   wider page bound).
@@ -631,7 +647,7 @@ workerd 1.20261121.1).
   where it reported 0; `size_after` counts only the application's pages, so a
   fresh database is 4096 bytes as in workerd instead of 49152. Binding
   methods report `length` 0 like the native functions they emulate. The
-  differential gate gained five cases (223 total). One deliberate deviation
+  differential gate gained five cases. One deliberate deviation
   remains: workerd's `exec()` sends each input line as its own query, so a
   statement may not span lines there; Cello still runs the input as one
   statement stream, and counts the lines. An array passed where `ListOptions`
@@ -1158,7 +1174,7 @@ Object SQL is still stored as INTEGER `1`/`0`, not workerd's TEXT
 `'true'`/`'false'`. Existing rows already hold integers, and mixing the two
 types would make `if (row.flag)` truthy for a new `'false'` while an old `0`
 stayed falsy, with no migration able to rewrite a stored value's type. See
-[Durable Objects](../services/durable-objects.md). 0.2.10 gates the type on
+[Durable Objects](../services/durable-objects.md). 0.3.0 gates the type on
 the compatibility date and documents the migration; see [Boolean
 binds](../services/durable-objects.md#boolean-binds).
 The Fetch API object model now answers what workerd 1.20261121.1 answers. A

@@ -509,7 +509,7 @@ enum Cursor {
     Token { pos: String, bound: Option<String> },
     /// The plain key a page consumed, which is what 0.2.9 and earlier
     /// answered a cursor with. A client can be mid-pagination across a
-    /// rolling upgrade, so a plain string is honoured through 0.2.10 and
+    /// rolling upgrade, so a plain string is honoured through 0.3.0 and
     /// dropped after -- and only as a key the bucket still has. A string no
     /// object answers for is not a listing position: R2 answers the empty
     /// page for a cursor it did not issue, and so does this.
@@ -582,7 +582,7 @@ impl ScopedList {
         }
         if let Cursor::Legacy(key) = &self.cursor {
             // One head per legacy cursor, and only while the plain-key
-            // spelling is read (0.2.10): a legitimate 0.2.9 cursor names the
+            // spelling is read (0.3.0): a legitimate 0.2.9 cursor names the
             // last key its page consumed, so a bucket that still has that
             // object answers the continuation. A token pays no head, because
             // a token is its own position.
@@ -1379,7 +1379,7 @@ mod tests {
 
     /// A 0.2.9 cursor was the plain key its page consumed, and a client can
     /// be mid-pagination across a rolling upgrade, so the plain spelling is
-    /// read through 0.2.10: it resumes when the bucket still holds that
+    /// read through 0.3.0: it resumes when the bucket still holds that
     /// object, and answers the empty page when it does not (as it does for
     /// any string no object answers for). Both branches are pinned here; the
     /// token path pays no head.
