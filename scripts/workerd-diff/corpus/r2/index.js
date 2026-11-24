@@ -173,9 +173,11 @@ const routes = {
       })),
       limitZero: await attempt(() => B.list({ prefix: "l/", limit: 0 })),
       limitTooBig: await attempt(() => B.list({ prefix: "l/", limit: 1001 })),
-      // A negative bound is R2's "use the default"; a fractional one
-      // truncates; a finite value outside int32 is the conversion refusal.
+      // `-1` is R2's "use the default page" sentinel; every other negative,
+      // a fractional bound and a finite value outside int32 are refused.
       limitNegative: await attempt(() => pageShape({ prefix: "l/", limit: -1 })),
+      limitBelowSentinel: await attempt(() => pageShape({ prefix: "l/", limit: -2 })),
+      limitFarBelow: await attempt(() => pageShape({ prefix: "l/", limit: -5000 })),
       limitFraction: await attempt(() => pageShape({ prefix: "l/", limit: 1.5 })),
       limitString: await attempt(() => pageShape({ prefix: "l/", limit: "2" })),
       limitNull: await attempt(() => pageShape({ prefix: "l/", limit: null })),
@@ -335,6 +337,10 @@ const routes = {
       out[`delete:${name}`] = await attempt(async () => {
         await B.delete("o/absent", value);
         return "ok";
+      });
+      out[`multipart:${name}`] = await attempt(async () => {
+        const upload = await B.createMultipartUpload("o/multipart", value);
+        return typeof upload.uploadId;
       });
     }
     return report(out);

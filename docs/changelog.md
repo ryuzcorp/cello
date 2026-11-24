@@ -95,43 +95,45 @@ workerd 1.20261121.1).
   write's rows written -- the two agree. The deviation is documented in
   [Cloudflare compatibility](reference/cloudflare-compat.md#bindings).
 - **R2 `list()` validates `limit` and its cursor** (#164). `limit` follows
-  R2's `MaxKeys` rule: 1 to 1000 bounds the page, a negative value is the
-  default page, and `0`, `NaN`, a value above 1000, or a value that converts
-  to one of those (including `null`) fails with `list: MaxKeys params must be
-  positive integer <= 1000. (10022)`, while a finite value outside the 32-bit
-  range fails with `Value out of range. Must be between -2147483648 and
+  R2's `MaxKeys` rule: 1 to 1000 bounds the page, `-1` is R2's "use the
+  default page" sentinel and answers 1000 keys, and `0`, any other negative,
+  `NaN`, a value above 1000, or a value that converts to one of those
+  (including `null`) fails with `list: MaxKeys params must be positive
+  integer <= 1000. (10022)`, while a finite value outside the 32-bit range
+  fails with `Value out of range. Must be between -2147483648 and
   2147483647 (inclusive).`. Every field is converted as R2 converts it: a
   `prefix`, `cursor`, `startAfter` or `delimiter` that is not a string, or an
   `include` that is not an array, fails with `Incorrect type for the
   '<field>' field on 'ListOptions'`.
 - **An invalid R2 cursor answers the empty page** (#164). Every cursor is now
-  an opaque, versioned base64url token (`cello-r2-cursor-v1.…`), and a
-  string Cello did not issue answers `{ objects: [], truncated: false,
-  delimitedPrefixes: [] }` instead of restarting the listing from the first
-  page -- a restart loops a paginating client forever, and R2 answers the
-  empty page. A complete page carries `cursor: undefined` as its own member,
-  as workerd's `R2Objects` does. `cello r2 list --page` and `--cursor`
-  refuse such a cursor with an error rather than printing an empty page. A
-  page's cursor used to be the plain key it consumed, so for one release a
-  plain key is still accepted as a cursor, and only while the bucket still
-  holds an object at that key; cursors issued by 0.2.9 keep paging, and a
-  key the bucket does not have is the empty page. Remove that path in the
-  next release.
-- **Binding option arguments are type-checked** (#187). R2 `get`, `put` and
-  `list`; KV `put` and `list`; and Durable Object storage `get`, `put`,
-  `delete` and `list` convert their options dictionary as workerd's JSG
-  does: an absent or `null` argument means no options, an object (including
-  an array or a `Date`, which carry none of the fields) is the dictionary its
-  properties spell, and any other argument throws `Failed to execute
-  '<method>' on '<interface>': parameter N is not of type 'XOptions'.` A typo
-  in an options object no longer reads as "no options". The entries form of
-  `storage.put` refuses an argument list that matches no overload with
-  workerd's own `put() may only be called with …` message, KV
-  `get`/`getWithMetadata` refuse a response type outside the four names with
-  workerd's `Unknown response type.` message instead of falling back to text,
-  and `storage.list(null)` lists where it used to fail deserializing the
-  options. `head` and `delete` take no options on R2, so a stray argument is
-  still ignored there, as in workerd.
+  an opaque, versioned base64url token (`cello-r2-cursor-v1.…`), and a string
+  outside that format -- a plain key, a made-up word, or a token that does
+  not parse -- answers `{ objects: [], truncated: false, delimitedPrefixes:
+  [] }` instead of restarting the listing from the first page: a restart
+  loops a paginating client forever, and R2 answers the empty page. A
+  complete page carries `cursor: undefined` as its own member, as workerd's
+  `R2Objects` does. `cello r2 list --page` and `--cursor` refuse such a
+  cursor with an error rather than printing an empty page. This drops the
+  plain-key cursor 0.2.9 answered a page with; a client holding one gets the
+  empty page and restarts its walk from a fresh first page. The token is
+  unsigned, so a client can mint one, and it is honoured as a listing
+  position inside the binding's own bucket and prefix and nothing more (no
+  other bucket, no escape from the prefix's directory, no wider page bound).
+- **Binding option arguments are type-checked** (#187). R2 `get`, `put`,
+  `list` and `createMultipartUpload`; KV `put` and `list`; and Durable Object
+  storage `get`, `put`, `delete`, `list`, `setAlarm` and `deleteAlarm`
+  convert their options dictionary as workerd's JSG does: an absent or `null`
+  argument means no options, an object (including an array or a `Date`, which
+  carry none of the fields) is the dictionary its properties spell, and any
+  other argument throws `Failed to execute '<method>' on '<interface>':
+  parameter N is not of type 'XOptions'.` A typo in an options object no
+  longer reads as "no options". The entries form of `storage.put` refuses an
+  argument list that matches no overload with workerd's own `put() may only be
+  called with …` message, KV `get`/`getWithMetadata` refuse a response type
+  outside the four names with workerd's `Unknown response type.` message
+  instead of falling back to text, and `storage.list(null)` lists where it
+  used to fail deserializing the options. `head` and `delete` take no options
+  on R2, so a stray argument is still ignored there, as in workerd.
 
 ## v0.2.9
 

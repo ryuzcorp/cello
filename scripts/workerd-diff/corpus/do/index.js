@@ -212,6 +212,25 @@ export class Probe {
             return "ok";
           });
         }
+        // Alarm options convert the same way; `null` and `{}` pass the
+        // conversion and fail (or not) on the alarm itself.
+        for (const [name, value] of [
+          ["string", "nope"],
+          ["number", 1],
+          ["null", null],
+          ["object", {}],
+          ["undefined", undefined],
+        ]) {
+          out[`setAlarm:${name}`] = await attempt(async () => {
+            await s.setAlarm(Date.now() + 60000, value);
+            return "ok";
+          });
+          out[`deleteAlarm:${name}`] = await attempt(async () => {
+            await s.deleteAlarm(value);
+            return "ok";
+          });
+        }
+        await s.deleteAlarm();
         await s.deleteAll();
         return report(out);
       },
