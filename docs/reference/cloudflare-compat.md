@@ -432,19 +432,29 @@ The `tail` and `email` handlers are unavailable.
   shutdown) reads the same value on both runtimes.
 - `CompressionStream` and `DecompressionStream` are capped at 128 live
   streams per isolate; Workerd has no such cap. The 129th constructor call
-  throws a `RangeError`. Finish, cancel, or abort streams you no longer use.
+  throws a `RangeError`. Finish or abort streams you no longer use: a
+  readable `cancel()` releases the native stream at once when no write is
+  pending, and otherwise as soon as the writes it arrived behind have
+  settled, so a bare cancel never holds a slot -- but a stream whose
+  writable is left open and never ended is only released by the collector
+  once neither side is reachable.
   Their writable side is an internal stream: once it has closed,
   `releaseLock()` is a no-op and the stream stays locked, as on Workerd. A
   readable `cancel()` records its error on the writable instead of erroring
-  it, so a write already in flight still completes and a later one fails
-  with the closed-stream error; a pending `read()` rejects with an `Error`
-  built from the cancel reason, and it settles after the isolate's microtask
-  drain, so a `cancel()` or `abort()` in the same turn as the producing
-  write wins over the chunk. `abort()` on that writable is an ordinary
-  abort: it resolves, `writer.closed` rejects with the abort reason, and the
-  writable ends in the closed shape (`desiredSize` 0, later `write()` and
-  `close()` report the closed stream) instead of the errored one a JS sink
-  gets. A
+  it, so every write it already accepted still runs -- a queued one
+  included, and a failed push is the error the stream keeps -- and a write
+  accepted afterwards fails with the closed-stream error. A pending `read()`
+  rejects with an `Error` built from the cancel reason, and it settles after
+  the isolate's microtask drain, so a `cancel()` or `abort()` in the same
+  turn as the producing write wins over the chunk. `abort()` on that
+  writable is an ordinary abort: it resolves, `writer.closed` rejects with
+  the abort reason, and the writable ends in the closed shape
+  (`desiredSize` 0, later `write()` and `close()` report the closed stream)
+  instead of the errored one a JS sink gets. An encoder enqueues what it
+  emitted for each push -- the gzip or zlib header on the first write, and
+  nothing more until deflate has a block or the stream ends, while
+  `deflate-raw` and `brotli` stay silent until `close()` -- as Workerd does,
+  so chunk boundaries match too, not only the bytes. A
   string chunk is UTF-8 encoded and `undefined` is an empty chunk; any
   other non-`ArrayBuffer`/`ArrayBufferView` chunk fails the same way. A
   gzip header CRC (FHCRC) is verified, and the trailer's CRC-32 and ISIZE
