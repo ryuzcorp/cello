@@ -591,6 +591,24 @@ const __webidlLength = (ctor) =>
   Object.defineProperty(ctor, "length", {
     value: 0, configurable: true, writable: false,
   });
+// A binding's methods are native functions in workerd, and V8 publishes a
+// native function's `length` as the zero parameters its template carries --
+// 0 for every JSG interface, whatever its C++ signature reads out of the
+// arguments (#239). A JS class body would publish its declared parameters
+// instead, so each binding whose interface workerd defines in C++ restates
+// the native descriptor. Not applied to an interface workerd defines in
+// TypeScript: the D1 binding keeps its declared arities there.
+const __nativeMethodArities = (ctor) => {
+  for (const key of Object.getOwnPropertyNames(ctor.prototype)) {
+    if (key === "constructor") continue;
+    const descriptor = Object.getOwnPropertyDescriptor(ctor.prototype, key);
+    if (descriptor === undefined || typeof descriptor.value !== "function")
+      continue;
+    Object.defineProperty(descriptor.value, "length", {
+      value: 0, configurable: true, writable: false,
+    });
+  }
+};
 
 // ---- request/response state ------------------------------------------------
 // Every field of a Request or Response lives in a private slot; the runtime's
@@ -1659,6 +1677,9 @@ const __boundFieldType = (field, type) =>
 // `int`: a non-finite value becomes 0 (a JS bitwise conversion would), a
 // finite value outside int32 is refused, and a fractional one truncates.
 const __boundInt32 = (value) => {
+  // WebIDL's number conversion refuses a BigInt; `Number(5n)` would answer 5.
+  if (typeof value === "bigint")
+    throw new TypeError("Cannot convert a BigInt value to a number");
   const number = Number(value);
   if (!Number.isFinite(number)) return 0;
   if (number < -2147483648 || number > 2147483647) {
@@ -1668,6 +1689,42 @@ const __boundInt32 = (value) => {
     );
   }
   return Math.trunc(number);
+};
+// A value as JSG's `kj::String` conversion reads it: V8's ToString, which
+// takes any value but refuses a symbol, because a symbol has no string form.
+// `String(symbol)` would instead answer "Symbol(...)" and let a typo through.
+const __jsString = (value) => {
+  if (typeof value === "symbol")
+    throw new TypeError("Cannot convert a Symbol value to a string");
+  return `${value}`;
+};
+// One listing's request, converted as workerd's JSG converts the ListOptions
+// struct (#239): the four string fields read any value (an absent or
+// `undefined` field is absent), `reverse` is the boolean coercion, `limit` is
+// an `int` whose positivity is checked when the listing compiles, and the two
+// start fields are mutually exclusive. Reading the raw JSON into the store
+// reported serde's own text for a mistyped field, which no Worker matches on.
+const __storageListRequest = (options, method, target) => {
+  const o = __bindingOptions(options, method, target, 1, "ListOptions");
+  const request = {};
+  const start = o.start === undefined ? undefined : __jsString(o.start);
+  const startAfter = o.startAfter === undefined
+    ? undefined : __jsString(o.startAfter);
+  if (start !== undefined && startAfter !== undefined)
+    throw new TypeError(
+      "list() cannot be called with both start and startAfter values.",
+    );
+  if (start !== undefined) request.start = start;
+  if (startAfter !== undefined) request.startAfter = startAfter;
+  if (o.end !== undefined) request.end = __jsString(o.end);
+  if (o.prefix !== undefined) request.prefix = __jsString(o.prefix);
+  if (o.reverse !== undefined) request.reverse = !!o.reverse;
+  if (o.limit !== undefined) {
+    const limit = __boundInt32(o.limit);
+    if (limit <= 0) throw new TypeError("List limit must be positive.");
+    request.limit = limit;
+  }
+  return request;
 };
 // R2's key rules, checked here so a key the real thing refuses is refused
 // here too rather than quietly written.
@@ -2193,6 +2250,7 @@ class R2Bucket {
 }
 __webidlTag(R2Bucket, "R2Bucket");
 __webidlPrototype(R2Bucket);
+__nativeMethodArities(R2Bucket);
 globalThis.R2Bucket = R2Bucket;
 // Brand for the clone codec: a bucket minted by the host, never a forged one.
 __cello.$$isR2Bucket = (value) => __weakGet(__r2BucketStates, value) !== undefined;
@@ -2527,6 +2585,7 @@ class SqlStorage {
     __sql_register_nomem_function_for_test(this._scope);
   }
 }
+__nativeMethodArities(SqlStorage);
 function __readStoredValue(scope, key, read) {
   try {
     return read();
@@ -2591,11 +2650,12 @@ class SyncKvStorage {
     this._storage._assertTransactionActive("kv.delete");
     return __storage_delete(this._storage._scope, String(key));
   }
-  list(options = {}) {
+  list(options) {
     this._storage._assertTransactionActive("kv.list");
+    const request = __storageListRequest(options, "list", "SyncKvStorage");
     const generation = ++this._root._syncKvListGeneration;
     const cursor = __storage_sync_list_start(
-      this._storage._scope, JSON.stringify(options),
+      this._storage._scope, JSON.stringify(request),
     );
     return new SyncKvListIterator(
       this._root, generation, cursor,
@@ -2695,49 +2755,74 @@ class DurableObjectStorage {
   }
   async put(k, val, options) {
     this._assertTransactionActive("put");
-    if (typeof k === "string") {
-      __bindingOptions(options, "put", "DurableObjectStorage", 3, "PutOptions");
-      // Workerd (actor-state.c++ putOne) refuses an undefined value on a
-      // single put: it would store nothing and leave any earlier value in
-      // place. A batch put may carry undefined values, as workerd's does.
-      if (val === undefined)
-        throw new TypeError("put() called with undefined value.");
-      try {
-        __storage_queue_put(this._scope, k, val);
-      } catch (error) {
-        __storage_queue_put_serialized(this._scope, k,
-                                       __storedBytes(val, error));
+    // Workerd's put has one signature, `put(key: string or object, value,
+    // options)`, and its WebIDL union decides the form: a non-array object is
+    // the batch dictionary (the second argument is then its options), and
+    // everything else -- including an array, which the dictionary conversion
+    // refuses -- is the single-pair form with a ToString key. The refusal for
+    // a call with no argument names that union, not the entries form.
+    if (arguments.length === 0)
+      throw new TypeError(
+        "Failed to execute 'put' on 'DurableObjectStorage': parameter 1 is " +
+          "not of type 'string or object'.",
+      );
+    const kind = typeof k;
+    if (kind === "object" || kind === "function") {
+      if (k !== null && !Array.isArray(k)) {
+        this._putEntries(k, val);
+        await Promise.resolve();
+        this._flushPendingPuts();
+        return;
       }
-      await Promise.resolve();
-      this._flushPendingPuts();
-      return;
     }
-    // The batch form is `put(entries, options)`: its options are the second
-    // argument, and workerd refuses an overload it cannot match with this
-    // message rather than the dictionary conversion -- `put(entries, "nope")`
-    // names no signature.
-    const kind = typeof val;
-    if (val !== undefined && val !== null && kind !== "object" &&
-        kind !== "function") {
+    // A symbol has no string form: V8's ToString throws, where String(symbol)
+    // would answer "Symbol(...)" and store a key the caller never wrote.
+    const key = __jsString(k);
+    __bindingOptions(options, "put", "DurableObjectStorage", 3, "PutOptions");
+    // Workerd (actor-state.c++ putOne) refuses an undefined value on a
+    // single put: it would store nothing and leave any earlier value in
+    // place.
+    if (val === undefined)
+      throw new TypeError("put() called with undefined value.");
+    try {
+      __storage_queue_put(this._scope, key, val);
+    } catch (error) {
+      __storage_queue_put_serialized(this._scope, key,
+                                     __storedBytes(val, error));
+    }
+    await Promise.resolve();
+    this._flushPendingPuts();
+  }
+  // The batch form's writes: the dictionary conversion reads every own
+  // enumerable string key, in property order, and drops a pair whose value is
+  // undefined (`putMultiple` skips it rather than deleting the key). A Map, a
+  // Set or a Date has no such key, so it writes nothing at all.
+  _putEntries(entries, options) {
+    const kind = typeof options;
+    if (options !== undefined && options !== null && kind !== "object" &&
+        kind !== "function" || Array.isArray(options)) {
       throw new TypeError(
         "put() may only be called with a single key-value pair and optional " +
           "options as put(key, value, options) or with multiple key-value " +
           "pairs and optional options as put(entries, options)",
       );
     }
-    const source = k instanceof Map ? Array.from(k) : Object.entries(k);
-    if (source.length === 0) return;
-    const entries =
-      source.map(([key, value]) => [String(key), value]);
+    const pairs = [];
+    for (const key of Object.keys(entries)) {
+      const value = entries[key];
+      if (value === undefined) continue;
+      pairs.push([key, value]);
+    }
+    if (pairs.length === 0) return;
     try {
-      __storage_queue_put_many(this._scope, entries);
+      __storage_queue_put_many(this._scope, pairs);
     } catch (error) {
       // A batch with a stub entry: encode every entry first (plain
       // entries keep their native clone bytes, stub entries take
       // the stored-stub envelope), then queue -- so a genuinely
       // uncloneable entry still queues nothing, like the batch op,
       // which serializes fully before queueing.
-      const encoded = entries.map(([key, value]) => {
+      const encoded = pairs.map(([key, value]) => {
         try {
           return [key, __scEncodeStrict(value)];
         } catch (error_) {
@@ -2747,8 +2832,6 @@ class DurableObjectStorage {
       for (const [key, bytes] of encoded)
         __storage_queue_put_serialized(this._scope, key, bytes);
     }
-    await Promise.resolve();
-    this._flushPendingPuts();
   }
   async delete(k, options) {
     this._assertTransactionActive("delete");
@@ -2765,14 +2848,7 @@ class DurableObjectStorage {
   }
   async list(options) {
     this._assertTransactionActive("list");
-    const o = __bindingOptions(options, "list", "DurableObjectStorage", 1, "ListOptions");
-    // The request carries the fields the store knows, and only those: an
-    // array or a Date is an object with none of them, which is the empty
-    // listing options workerd reads off it.
-    const request = {};
-    for (const name of ["start", "startAfter", "end", "prefix", "limit", "reverse"]) {
-      if (o[name] !== undefined) request[name] = o[name];
-    }
+    const request = __storageListRequest(options, "list", "DurableObjectStorage");
     if (!this._transactionControl) await Promise.resolve();
     if (!this._flushPendingPuts()) return new Map();
     return __unwrapStoredMap(__storage_list(
@@ -3136,6 +3212,7 @@ class DurableObjectStorage {
     return outcome.value;
   }
 }
+__nativeMethodArities(DurableObjectStorage);
 class DurableObjectId {
   constructor(className, value, name = undefined) {
     Object.defineProperties(this, {
@@ -3151,6 +3228,7 @@ class DurableObjectId {
   }
   _scope() { return this._className + ":" + this._value; }
 }
+__nativeMethodArities(DurableObjectId);
 // Internal to the runtime: workerd has no such global, and a bundle that
 // catches it sees the message and code, not this class.
 const DurableObjectRoutingError = class DurableObjectRoutingError
@@ -4175,6 +4253,7 @@ class DurableObjectState {
     __registerWaitUntil(promise);
   }
 }
+__nativeMethodArities(DurableObjectState);
 function _instance(scope) {
   let inst = __cell.instances[scope];
   if (!inst) {
@@ -7880,6 +7959,7 @@ class DurableObjectNamespace {
     return stub;
   }
 }
+__nativeMethodArities(DurableObjectNamespace);
 const __attachResponseRequestCancellation = (
   response,
   requestController,
@@ -10850,6 +10930,7 @@ class Queue {
   }
 }
 
+__nativeMethodArities(Queue);
 __cello.__makeQueue = (queue, cellName, deliveryDelay) =>
   new Queue(queue, cellName, deliveryDelay);
 
@@ -11256,7 +11337,7 @@ class D1Database {
   // Workerd defines query() but refuses it until the d1_binding_jsrpc compat
   // flag is on; a cell does not implement that flag, so it refuses exactly as
   // workerd does here.
-  query(_sql, _params) {
+  query(_sql) {
     throw __d1Error(
       "D1Database.query() requires the d1_binding_jsrpc compatibility " +
       "flag. Enable d1_binding_jsrpc before calling query().");

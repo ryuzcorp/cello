@@ -33,6 +33,7 @@ const meta = (value) => ({
 });
 
 let DB;
+let FRESH;
 const routes = {
   // Result shapes: first, first(column), all, raw, raw({columnNames}), run.
   async "/shape"() {
@@ -142,6 +143,37 @@ const routes = {
     return report(out);
   },
 
+  // exec() answers one count per input line that carries a statement: a line
+  // may hold several statements and still count once, and blank, whitespace
+  // and comment-only lines count not at all. `count` is the number of lines
+  // workerd sends, not the number of statements SQLite ran (#239).
+  async "/exec-lines"() {
+    const out = {};
+    for (const [name, sql] of [
+      ["oneLineTwoStatements", "CREATE TABLE IF NOT EXISTS l1 (x); CREATE TABLE IF NOT EXISTS l2 (y)"],
+      ["twoLines", "CREATE TABLE IF NOT EXISTS l3 (x);\nCREATE TABLE IF NOT EXISTS l4 (y)"],
+      ["twoSelects", "SELECT 1;\nSELECT 2"],
+      ["blankLine", "SELECT 1;\n\nSELECT 2"],
+      ["whitespaceLine", "SELECT 1;\n   \nSELECT 2"],
+      ["commentLine", "SELECT 1;\n-- nothing\nSELECT 2"],
+      ["blockCommentLine", "SELECT 1;\n/* nothing */\nSELECT 2"],
+      ["semicolonLine", "SELECT 1;\n;\nSELECT 2"],
+      ["trailingComment", "SELECT 1; -- done\nSELECT 2"],
+      ["padded", "\n\n  SELECT 1  \n\n"],
+      ["crlf", "SELECT 1;\r\nSELECT 2"],
+      ["semicolonOnly", ";"],
+      ["empty", ""],
+      ["commentOnly", "-- nothing\n/* nor this */"],
+    ]) {
+      out[name] = await attempt(async () => (await DB.exec(sql)).count);
+    }
+    // A failing line reports the first line's text, as workerd's wrapper
+    // does whatever line failed.
+    out.multiLineError = await attempt(() =>
+      DB.exec("CREATE TABLE IF NOT EXISTS e1 (x);\nSELEC broken"));
+    return report(out);
+  },
+
   // An empty batch and an empty prepared statement are refused the same
   // way; a batch result keeps its per-statement shape and rolls back whole.
   async "/batch"() {
@@ -226,11 +258,51 @@ const routes = {
       selectedChangedDb: selected.meta.changed_db,
     });
   },
+  // A statement's `meta` on a database nothing has touched yet: the pair of
+  // values Cello's own cell file would otherwise report, because Cello
+  // creates its storage tables on open (`size_after`) and inserts one row of
+  // them (`last_row_id`). workerd's D1 database has neither: its control
+  // tables are created lazily and a D1 database never uses them (#239).
+  async "/meta-fresh"() {
+    const out = {};
+    const meta = (result) => ({
+      last_row_id: result.meta.last_row_id,
+      changes: result.meta.changes,
+      changed_db: result.meta.changed_db,
+      size_after: result.meta.size_after,
+    });
+    const db = FRESH;
+    out.read = meta(await db.prepare("SELECT 1 AS one").run());
+    out.createTable = meta(await db.prepare(
+      "CREATE TABLE f (id INTEGER PRIMARY KEY, v TEXT)").run());
+    out.createSecond = meta(await db.prepare(
+      "CREATE TABLE f2 (id INTEGER PRIMARY KEY)").run());
+    out.insert = meta(await db.prepare("INSERT INTO f (v) VALUES ('a')").run());
+    out.insertMany = meta(await db.prepare(
+      "INSERT INTO f (v) VALUES ('b'), ('c'), ('d')").run());
+    // `last_row_id` is the connection's last assignment, so a read after a
+    // write reports it too, and an exec() is a write like any other.
+    out.readAfterWrite = meta(await db.prepare("SELECT * FROM f").run());
+    await db.exec("INSERT INTO f (v) VALUES ('e')");
+    out.readAfterExec = meta(await db.prepare("SELECT * FROM f").run());
+    out.insertAfterExec = meta(await db.prepare(
+      "INSERT INTO f (v) VALUES ('f')").run());
+    // Size follows the pages the database owns: one page per table, then the
+    // pages a bulk insert grows into.
+    await db.exec(
+      "INSERT INTO f (v) SELECT hex(randomblob(200)) FROM " +
+      "(WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 300) SELECT i FROM n)",
+    );
+    out.afterBulk = meta(await db.prepare("SELECT COUNT(*) AS n FROM f").run());
+    out.bulkCount = (await db.prepare("SELECT COUNT(*) AS n FROM f").first()).n;
+    return report(out);
+  },
 };
 
 export default {
   async fetch(request, env) {
     DB = env.DB;
+    FRESH = env.FRESH;
     const { pathname } = new URL(request.url);
     const route = routes[pathname];
     if (!route) return new Response("not found", { status: 404 });

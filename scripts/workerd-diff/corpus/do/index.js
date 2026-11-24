@@ -234,6 +234,150 @@ export class Probe {
         await s.deleteAll();
         return report(out);
       },
+      async "/storage-put-entries"() {
+        // workerd's `put(entries)` takes a plain object: its own enumerable
+        // string keys are the pairs, and an undefined value leaves the key
+        // out. A Map, a Set or a Date has none of those, so it writes nothing
+        // and resolves; an array is not a dictionary, so it falls to the
+        // single-pair form, where the key is coerced and a missing value is
+        // refused. Every probe starts from empty storage, and what it stored
+        // is read back, so a shape that writes nothing cannot hide behind the
+        // next one (#239).
+        const s = this.state.storage;
+        class Entries {
+          constructor() {
+            this.a = 1;
+            this.b = "two";
+          }
+        }
+        const hidden = { visible: 1 };
+        Object.defineProperty(hidden, "secret", { value: 2, enumerable: false });
+        const inherited = Object.create({ inherited: 9 });
+        inherited.own = 1;
+        const asFunction = () => {};
+        asFunction.prop = 1;
+        // Sequential: each probe clears the storage its predecessor filled.
+        const probes = [
+          ["plain", () => s.put({ a: 1, b: "two" })],
+          ["map", () => s.put(new Map([["a", 1], ["b", 2]]))],
+          ["set", () => s.put(new Set([1, 2]))],
+          ["date", () => s.put(new Date(0))],
+          ["instance", () => s.put(new Entries())],
+          ["function", () => s.put(asFunction)],
+          ["hidden", () => s.put(hidden)],
+          ["inherited", () => s.put(inherited)],
+          ["undefinedEntry", () => s.put({ undef: undefined, keep: 1 })],
+          ["symbolKey", () => s.put({ [Symbol("s")]: 1, a: 2 })],
+          ["arrayPairs", () => s.put([["a", 1]])],
+          ["arrayEmpty", () => s.put([])],
+          ["noArgs", () => s.put()],
+          ["stringOnly", () => s.put("k")],
+          ["stringUndefined", () => s.put("k", undefined)],
+          ["numberKey", () => s.put(5, "five")],
+          ["booleanKey", () => s.put(true, "yes")],
+          ["bigintKey", () => s.put(7n, "seven")],
+          ["nullKey", () => s.put(null, 1)],
+          ["symbolArgument", () => s.put(Symbol("s"))],
+          ["arrayWithValue", () => s.put([["r", 1]], { allowUnconfirmed: true })],
+          ["arrayWithOptions", () => s.put([], {})],
+          ["mapWithOptions", () => s.put(new Map([["m", 1]]), {})],
+          ["batchWithUnknownOption", () => s.put({ u: 1 }, { bogus: true })],
+          ["batchWithNullOption", () => s.put({ n: 1 }, null)],
+          ["batchWithBadOption", () => s.put({ x: 1 }, "nope")],
+        ];
+        const out = {};
+        for (const [name, run] of probes) {
+          await s.deleteAll();
+          const result = await attempt(run);
+          result.stored = [...(await s.list()).entries()];
+          out[name] = result;
+        }
+        return report(out);
+      },
+      async "/storage-list-fields"() {
+        // A ListOptions field converts the way workerd's JSG converts it:
+        // the string fields take any value (ToString, so `start: 5` reads
+        // "5"), `reverse` is a boolean coercion, and `limit` is an `int`
+        // with the WebIDL range and positivity checks. Nothing here is a
+        // several-JSON error (#239).
+        const s = this.state.storage;
+        await s.deleteAll();
+        for (const key of ["c", "a", "b"]) await s.put(key, key.toUpperCase());
+        const list = async (options) => [...(await s.list(options)).keys()];
+        const out = {};
+        for (const [name, options] of Object.entries({
+          limitString: { limit: "5" },
+          limitFloat: { limit: 1.9 },
+          limitNegative: { limit: -1 },
+          limitHuge: { limit: 2 ** 31 },
+          limitBigint: { limit: 5n },
+          limitNull: { limit: null },
+          limitObject: { limit: {} },
+          limitUndefined: { limit: undefined },
+          limitZero: { limit: 0 },
+          prefixNumber: { prefix: 5 },
+          prefixNull: { prefix: null },
+          prefixBigint: { prefix: 5n },
+          startNumber: { start: 5 },
+          startAfterNumber: { startAfter: 5 },
+          endNumber: { end: 5 },
+          reverseString: { reverse: "yes" },
+          reverseZeroString: { reverse: "0" },
+          reverseOne: { reverse: 1 },
+          reverseNull: { reverse: null },
+          reverseUndefined: { reverse: undefined },
+          unknownField: { bogus: 1 },
+          bothStart: { start: "a", startAfter: "b" },
+          padded: { prefix: "", start: "a", end: "c" },
+        })) {
+          out[name] = await attempt(() => list(options));
+        }
+        return report(out);
+      },
+      async "/method-lengths"() {
+        // A binding's methods are native in workerd, and V8 publishes a
+        // native function's `length` as the zero parameters its template
+        // carries, so every JSG interface reports 0 whatever its signature
+        // reads. The D1 interface is a TypeScript class there and keeps its
+        // declared arities, which is what makes it the exception here (#239).
+        const arities = (owner, names) =>
+          names.map((name) => [name, typeof owner[name], owner[name]?.length]);
+        const statement = this.env.DB.prepare("SELECT 1");
+        return report({
+          storage: arities(this.state.storage, [
+            "get", "list", "put", "delete", "deleteAll", "transaction",
+            "transactionSync", "getAlarm", "setAlarm", "deleteAlarm", "sync",
+          ]),
+          sql: arities(this.state.storage.sql, ["exec"]),
+          state: arities(this.state, [
+            "waitUntil", "blockConcurrencyWhile", "acceptWebSocket",
+            "getWebSockets", "getTags", "setWebSocketAutoResponse",
+            "getWebSocketAutoResponse", "abort",
+          ]),
+          namespace: arities(this.env.OBJ, [
+            "newUniqueId", "idFromName", "idFromString", "get", "getByName",
+            "jurisdiction",
+          ]),
+          id: arities(this.state.id, ["toString", "equals"]),
+          kv: arities(this.env.KV, [
+            "get", "list", "put", "getWithMetadata", "delete",
+          ]),
+          r2: arities(this.env.BUCKET, [
+            "head", "get", "put", "delete", "list", "createMultipartUpload",
+            "resumeMultipartUpload",
+          ]),
+          queue: arities(this.env.QUEUE, ["send", "sendBatch", "metrics"]),
+          caches: arities(caches, ["open", "delete", "match", "has", "keys"]),
+          cache: arities(caches.default, [
+            "put", "match", "delete", "add", "addAll", "matchAll", "keys",
+          ]),
+          // D1 is a TypeScript class in workerd: these arities are real.
+          db: arities(this.env.DB, [
+            "prepare", "batch", "exec", "withSession", "query", "dump",
+          ]),
+          prepared: arities(statement, ["bind", "first", "run", "all", "raw"]),
+        });
+      },
       async "/sql"() {
         const sql = this.state.storage.sql;
         sql.exec("DROP TABLE IF EXISTS t");

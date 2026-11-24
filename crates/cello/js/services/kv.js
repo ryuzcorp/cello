@@ -1274,6 +1274,19 @@ function kvService(host) {
     value: "KvNamespace", configurable: true, writable: true,
     enumerable: false,
   });
+  // Native methods report length 0 in workerd whatever the JSG signature
+  // reads out of them; a JS class body would publish its declared parameters
+  // (#239). The D1 binding, a TypeScript class there, keeps its arities.
+  for (const key of Object.getOwnPropertyNames(KvNamespace.prototype)) {
+    if (key === "constructor") continue;
+    const descriptor =
+      Object.getOwnPropertyDescriptor(KvNamespace.prototype, key);
+    if (descriptor === undefined || typeof descriptor.value !== "function")
+      continue;
+    Object.defineProperty(descriptor.value, "length", {
+      value: 0, configurable: true, writable: false,
+    });
+  }
 
   // The bulk ceiling belongs to the binding, and a CLI chunks beneath it rather
   // than inheriting it. An empty array is refused because upstream refuses it:

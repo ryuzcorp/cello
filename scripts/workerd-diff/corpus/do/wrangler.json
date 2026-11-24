@@ -33,5 +33,11 @@
         "Thrower"
       ]
     }
-  ]
+  ],
+  "kv_namespaces": [{ "binding": "KV", "id": "do-kv" }],
+  "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "do-bucket" }],
+  "d1_databases": [{ "binding": "DB", "database_name": "do-d1" }],
+  "queues": {
+    "producers": [{ "binding": "QUEUE", "queue": "do-queue" }]
+  }
 }

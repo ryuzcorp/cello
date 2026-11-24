@@ -241,13 +241,20 @@ service; the [KV](../services/kv.md), [R2](../services/r2.md) and
 
 - **D1 `meta.rows_read`/`rows_written` are Cello's own counters.**
   `changes`, `last_row_id`, `changed_db`, `size_after`, `total_attempts` and
-  `timings.sql_duration_ms` mean what they mean on Cloudflare. The two row
+  `timings.sql_duration_ms` mean what they mean on Cloudflare: `last_row_id`
+  is the last row id an application statement assigned (a read after a write
+  still reports it), and `size_after` counts the application's pages only,
+  because Cello's storage and replica control tables live in the same file
+  and a D1 database on Cloudflare has none. Two deviations remain. The two row
   counters do not: workerd reads them from libSQL's btree layer, which
   charges a write for the rows it reads and a DDL statement for pages, so a
   `CREATE TABLE` reports `rows_read: 1, rows_written: 2` there and `0, 0`
   here. A statement whose row counts follow from its result (a `SELECT`
   returns the rows it read; an `INSERT`/`UPDATE`/`DELETE` reports the rows it
-  wrote) agrees with workerd.
+  wrote) agrees with workerd. `exec()` runs the whole input as one statement
+  stream, where Cloudflare's local runtime sends each line as its own query
+  (so a statement may not span lines there); its `count` follows Cloudflare's
+  one-per-input-line rule in both.
 - **Durable Object SQL boolean binds are TEXT from compatibility date
   2026-11-24.** Workerd stores a `true`/`false` bind as `'true'`/`'false'`;
   Cello wrote INTEGER `1`/`0` before that date and keeps doing so at an older

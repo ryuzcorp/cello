@@ -3,5 +3,8 @@
   "main": "index.js",
   "compatibility_date": "2026-11-01",
   "no_bundle": true,
-  "d1_databases": [{ "binding": "DB", "database_name": "diff-d1" }]
+  "d1_databases": [
+    { "binding": "DB", "database_name": "diff-d1" },
+    { "binding": "FRESH", "database_name": "diff-d1-fresh" }
+  ]
 }

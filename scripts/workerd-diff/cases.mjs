@@ -134,6 +134,10 @@ export const cases = [
   { name: "d1-exec-errors", fixture: "d1", path: "/exec-errors" },
   { name: "d1-batch", fixture: "d1", path: "/batch" },
   { name: "d1-meta", fixture: "d1", path: "/meta" },
+  // #239: exec() counts input lines, and a fresh database's last_row_id and
+  // size_after are the application's own, not a cell's storage tables'.
+  { name: "d1-exec-lines", fixture: "d1", path: "/exec-lines" },
+  { name: "d1-meta-fresh", fixture: "d1", path: "/meta-fresh" },
   { name: "cache-put-refusals", fixture: "cache", path: "/put-refusals" },
   { name: "cache-match-options", fixture: "cache", path: "/match-options" },
   { name: "cache-delete", fixture: "cache", path: "/delete" },
@@ -157,7 +161,11 @@ export const cases = [
     "/storage-list", "/storage-delete", "/storage-keys", "/storage-options",
     "/sql", "/sql-types",
     "/alarms", "/websockets", "/block-concurrency", "/storage-sync",
-    "/transaction", "/ws-message-types"].map((path) => ({
+    "/transaction", "/ws-message-types",
+    // #239: put(entries) shapes, ListOptions field conversion and the arity
+    // of every binding method.
+    "/storage-put-entries", "/storage-list-fields", "/method-lengths",
+  ].map((path) => ({
     name: `do${path}`,
     fixture: "do",
     path,
