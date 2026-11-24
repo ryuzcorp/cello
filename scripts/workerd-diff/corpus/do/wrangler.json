@@ -16,6 +16,10 @@
       {
         "name": "THROWER",
         "class_name": "Thrower"
+      },
+      {
+        "name": "RPCDO",
+        "class_name": "Rpc"
       }
     ]
   },
@@ -32,7 +36,13 @@
         "Timer",
         "Thrower"
       ]
-    }
+    },
+    {
+      "tag": "v3",
+      "new_sqlite_classes": [
+        "Rpc"
+      ]
+     }
   ],
   "kv_namespaces": [{ "binding": "KV", "id": "do-kv" }],
   "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "do-bucket" }],
