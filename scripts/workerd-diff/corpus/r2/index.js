@@ -125,7 +125,8 @@ const routes = {
     return report(out);
   },
 
-  // Listing: prefix, delimiter, cursor paging, include, and the limit bounds.
+  // Listing: prefix, delimiter, cursor paging, include, the limit bounds,
+  // and the answer an undecodable cursor gets (#164).
   async "/list"() {
     for (const key of ["l/a", "l/b", "l/dir/c", "l/dir/d", "m/e"]) {
       await B.put(key, "v");
@@ -142,15 +143,27 @@ const routes = {
       prefix: "l/meta",
       include: ["httpMetadata", "customMetadata"],
     });
+    const bad = await B.list({ prefix: "l/", cursor: "garbage" });
+    const pageShape = async (options) => {
+      const listed = await B.list(options);
+      return {
+        names: listed.objects.map((object) => object.key),
+        truncated: listed.truncated,
+      };
+    };
     return report({
       allNames: all.objects.map((object) => object.key),
       allTruncated: all.truncated,
       allCursorAbsent: all.cursor === undefined,
+      allKeys: Object.keys(all).sort(),
       delimitedNames: delimited.objects.map((object) => object.key),
       delimitedPrefixes: delimited.delimitedPrefixes,
       pageNames: page.objects.map((object) => object.key),
       pageTruncated: page.truncated,
       pageCursorSet: page.cursor !== undefined,
+      // A cursor is opaque in both runtimes: it is never the key the page
+      // stopped at, so a client cannot mint one from a key.
+      pageCursorIsLastKey: page.cursor === page.objects[page.objects.length - 1].key,
       nextNames: next.objects.map((object) => object.key),
       nextTruncated: next.truncated,
       withMeta: withMeta.objects.map((object) => ({
@@ -160,6 +173,35 @@ const routes = {
       })),
       limitZero: await attempt(() => B.list({ prefix: "l/", limit: 0 })),
       limitTooBig: await attempt(() => B.list({ prefix: "l/", limit: 1001 })),
+      // A negative bound is R2's "use the default"; a fractional one
+      // truncates; a finite value outside int32 is the conversion refusal.
+      limitNegative: await attempt(() => pageShape({ prefix: "l/", limit: -1 })),
+      limitFraction: await attempt(() => pageShape({ prefix: "l/", limit: 1.5 })),
+      limitString: await attempt(() => pageShape({ prefix: "l/", limit: "2" })),
+      limitNull: await attempt(() => pageShape({ prefix: "l/", limit: null })),
+      limitNan: await attempt(() => pageShape({ prefix: "l/", limit: NaN })),
+      limitOutOfRange: await attempt(() =>
+        pageShape({ prefix: "l/", limit: Number.MAX_SAFE_INTEGER })),
+      // An invalid cursor answers the empty page, and a cursor field that is
+      // not a string is a conversion refusal.
+      badCursorObjects: bad.objects.length,
+      badCursorTruncated: bad.truncated,
+      badCursorPrefixes: bad.delimitedPrefixes,
+      badCursorAbsent: bad.cursor === undefined,
+      badCursorKeys: Object.keys(bad).sort(),
+      corruptToken: await attempt(() =>
+        pageShape({ prefix: "l/", cursor: "cello-r2-cursor-v1.not-base64!!!" })),
+      emptyCursor: await attempt(() => pageShape({ prefix: "l/", cursor: "" })),
+      cursorNumber: await attempt(() => pageShape({ prefix: "l/", cursor: 5 })),
+      cursorNull: await attempt(() => pageShape({ prefix: "l/", cursor: null })),
+      prefixNumber: await attempt(() => pageShape({ prefix: 5 })),
+      prefixNull: await attempt(() => pageShape({ prefix: null })),
+      startAfterNumber: await attempt(() => pageShape({ startAfter: 5 })),
+      startAfterNull: await attempt(() => pageShape({ startAfter: null })),
+      delimiterNumber: await attempt(() => pageShape({ delimiter: 5 })),
+      delimiterNull: await attempt(() => pageShape({ delimiter: null })),
+      includeString: await attempt(() => pageShape({ include: "httpMetadata" })),
+      includeNull: await attempt(() => pageShape({ include: null })),
     });
   },
 
@@ -255,6 +297,46 @@ const routes = {
       await upload.abort();
       return typeof upload.uploadId;
     });
+    return report(out);
+  },
+
+  // The options argument of each method, converted as workerd's JSG converts
+  // a dictionary: an absent or null argument is the empty dictionary, an
+  // object is the dictionary its properties spell, and anything else is the
+  // WebIDL refusal (#187). `head` and `delete` take no options in workerd,
+  // so a stray second argument is ignored there.
+  async "/options"() {
+    await B.put("o/key", "v");
+    const out = {};
+    const values = [
+      ["string", "arrayBuffer"],
+      ["number", 1],
+      ["true", true],
+      ["null", null],
+      ["array", []],
+      ["function", () => {}],
+      ["date", new Date(0)],
+      ["undefined", undefined],
+      ["object", {}],
+    ];
+    for (const [name, value] of values) {
+      out[`get:${name}`] = await attempt(async () => {
+        const got = await B.get("o/key", value);
+        return got === null ? null : "body";
+      });
+      out[`head:${name}`] = await attempt(async () =>
+        (await B.head("o/key", value)) === null ? null : "object");
+      out[`put:${name}`] = await attempt(async () =>
+        (await B.put("o/put", "v", value)) === null ? null : "object");
+      out[`list:${name}`] = await attempt(async () => {
+        const page = await B.list(value);
+        return { n: page.objects.length };
+      });
+      out[`delete:${name}`] = await attempt(async () => {
+        await B.delete("o/absent", value);
+        return "ok";
+      });
+    }
     return report(out);
   },
 };

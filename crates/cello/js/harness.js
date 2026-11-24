@@ -1627,6 +1627,48 @@ const __r2Reject = (bucket, method, detail) => {
 // Cello's own words.
 const __r2Failure = (method, text, code) =>
   new Error(`${method}: ${text} (${code})`);
+// An options dictionary, converted as workerd's JSG converts one: an absent
+// or null argument is the empty dictionary, an object (a plain one, an array,
+// a Date, a function) is the dictionary its own properties spell, and any
+// other argument is the WebIDL refusal. Interpreting a string or a number as
+// "no options" turned a typo into a silently different read or write.
+const __bindingOptions = (value, method, target, position, type) => {
+  if (value === undefined || value === null) return {};
+  const kind = typeof value;
+  if (kind === "object" || kind === "function") return value;
+  throw new TypeError(
+    `Failed to execute '${method}' on '${target}': parameter ${position} ` +
+      `is not of type '${type}'.`,
+  );
+};
+// One field of an options dictionary, converted as JSG converts a
+// non-coercible field: a present value of another type is refused, and a
+// missing one leaves the default.
+const __boundStringField = (options, field, type, absent) => {
+  const value = options[field];
+  if (value === undefined) return absent;
+  if (typeof value !== "string") throw __boundFieldType(field, type);
+  return value;
+};
+const __boundFieldType = (field, type) =>
+  new TypeError(
+    `Incorrect type for the '${field}' field on 'ListOptions': the provided ` +
+      `value is not of type '${type}'.`,
+  );
+// One numeric field of an options dictionary, converted as JSG converts an
+// `int`: a non-finite value becomes 0 (a JS bitwise conversion would), a
+// finite value outside int32 is refused, and a fractional one truncates.
+const __boundInt32 = (value) => {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return 0;
+  if (number < -2147483648 || number > 2147483647) {
+    throw new TypeError(
+      "Value out of range. Must be between -2147483648 and 2147483647 " +
+        "(inclusive).",
+    );
+  }
+  return Math.trunc(number);
+};
 // R2's key rules, checked here so a key the real thing refuses is refused
 // here too rather than quietly written.
 const __r2Key = (binding, method, key) => {
@@ -2005,7 +2047,7 @@ class R2Bucket {
   async get(key, options) {
     const { binding, bucketName } = this.#state();
     const name = __r2Key(binding, "get", key);
-    const o = options ?? {};
+    const o = __bindingOptions(options, "get", "R2Bucket", 2, "GetOptions");
     if (o.ssecKey !== undefined) {
       __r2Reject(binding, "get(ssecKey)", "cello has no customer-key encryption");
     }
@@ -2023,7 +2065,11 @@ class R2Bucket {
   async put(key, value, options) {
     const { binding, bucketName } = this.#state();
     const name = __r2Key(binding, "put", key);
-    const write = __r2WriteOptions(binding, "put", options);
+    const write = __r2WriteOptions(
+      binding,
+      "put",
+      __bindingOptions(options, "put", "R2Bucket", 3, "PutOptions"),
+    );
     const body = await __r2Value(binding, value);
     const r = body instanceof Uint8Array
       ? JSON.parse(await __r2_put(bucketName, name, body, JSON.stringify(write)))
@@ -2045,36 +2091,48 @@ class R2Bucket {
   }
   async list(options) {
     const { binding, bucketName } = this.#state();
-    const o = options ?? {};
-    if (o.limit !== undefined && o.limit !== null) {
-      const limit = Number(o.limit);
-      if (!Number.isInteger(limit) || limit < 1 || limit > 1000) {
+    const o = __bindingOptions(options, "list", "R2Bucket", 1, "ListOptions");
+    // `limit` is an int: a non-finite value is 0, a fractional one truncates,
+    // and R2's MaxKeys rule refuses a page bound that converts to zero or is
+    // over 1000. A negative bound is R2's "use the default", not a refusal --
+    // workerd answers the full page for it -- and an absent one is the same
+    // page.
+    let limit = 0;
+    if (o.limit !== undefined) {
+      const requested = __boundInt32(o.limit);
+      if (requested === 0 || requested > 1000) {
         throw __r2Failure(
           "list",
           "MaxKeys params must be positive integer <= 1000.",
           10022,
         );
       }
+      limit = requested > 0 ? requested : 0;
     }
-    const include = Array.isArray(o.include) ? o.include : [];
+    const include = o.include === undefined ? [] : o.include;
+    if (!Array.isArray(include)) throw __boundFieldType("include", "Array");
     for (const entry of include) {
       if (!["httpMetadata", "customMetadata"].includes(entry)) {
         __r2Reject(binding, "list(include)", `${entry} is not an R2 listing extra`);
       }
     }
     const request = {
-      prefix: o.prefix === undefined || o.prefix === null ? "" : String(o.prefix),
-      cursor: o.cursor === undefined || o.cursor === null ? null : String(o.cursor),
-      startAfter: o.startAfter === undefined || o.startAfter === null
-        ? null
-        : String(o.startAfter),
-      limit: o.limit === undefined || o.limit === null ? 0 : o.limit | 0,
-      delimiter: o.delimiter === undefined || o.delimiter === null
-        ? null
-        : String(o.delimiter),
+      prefix: __boundStringField(o, "prefix", "string", ""),
+      cursor: __boundStringField(o, "cursor", "string", null),
+      startAfter: __boundStringField(o, "startAfter", "string", null),
+      limit: limit > 0 ? limit : 0,
+      delimiter: __boundStringField(o, "delimiter", "string", null),
       include: include.length > 0,
     };
     const r = JSON.parse(await __r2_list(bucketName, JSON.stringify(request)));
+    // A cursor this node did not issue is not a listing position. R2 answers
+    // the empty page for one and Cello holds to the same answer; restarting
+    // from the first page instead would loop a paginating client forever.
+    if (r.cursor_error !== undefined) {
+      return {
+        objects: [], truncated: false, delimitedPrefixes: [], cursor: undefined,
+      };
+    }
     const objects = r.objects.map((object) => {
       // A listing carries the extras it was asked for and nothing else,
       // so a caller cannot mistake an empty map for an empty object.
@@ -2082,11 +2140,15 @@ class R2Bucket {
       if (!include.includes("customMetadata")) object.custom = {};
       return __r2Object(object);
     });
-    // R2 omits `cursor` entirely when the listing is complete, and callers
-    // test `truncated` before reading it.
-    const page = { objects, truncated: r.truncated, delimitedPrefixes: r.prefixes };
-    if (r.truncated && r.cursor) page.cursor = r.cursor;
-    return page;
+    // Workerd's `R2Objects` carries every member: `cursor` is present and
+    // undefined on a complete listing, and callers test `truncated` before
+    // reading it.
+    return {
+      objects,
+      truncated: r.truncated,
+      delimitedPrefixes: r.prefixes,
+      cursor: r.truncated && r.cursor ? r.cursor : undefined,
+    };
   }
   async createMultipartUpload(key, options) {
     const { binding, bucketName } = this.#state();
@@ -2607,8 +2669,12 @@ class DurableObjectStorage {
     __storage_flush_pending_puts(this._scope);
     return true;
   }
-  async get(k) {
+  async get(k, options) {
     this._assertTransactionActive("get");
+    // `allowConcurrency`/`noCache` reach the host's own scheduling, which
+    // this cell answers from its own storage; the argument is still
+    // converted, because a typo in it must not read as "no options".
+    __bindingOptions(options, "get", "DurableObjectStorage", 2, "GetOptions");
     // Transaction operations reach SQLite before their caller can roll back.
     if (!this._transactionControl) await Promise.resolve();
     if (!this._flushPendingPuts()) return;
@@ -2621,9 +2687,10 @@ class DurableObjectStorage {
         __storage_get(this._scope, k, __storedSentinel));
     });
   }
-  async put(k, val) {
+  async put(k, val, options) {
     this._assertTransactionActive("put");
     if (typeof k === "string") {
+      __bindingOptions(options, "put", "DurableObjectStorage", 3, "PutOptions");
       // Workerd (actor-state.c++ putOne) refuses an undefined value on a
       // single put: it would store nothing and leave any earlier value in
       // place. A batch put may carry undefined values, as workerd's does.
@@ -2638,6 +2705,19 @@ class DurableObjectStorage {
       await Promise.resolve();
       this._flushPendingPuts();
       return;
+    }
+    // The batch form is `put(entries, options)`: its options are the second
+    // argument, and workerd refuses an overload it cannot match with this
+    // message rather than the dictionary conversion -- `put(entries, "nope")`
+    // names no signature.
+    const kind = typeof val;
+    if (val !== undefined && val !== null && kind !== "object" &&
+        kind !== "function") {
+      throw new TypeError(
+        "put() may only be called with a single key-value pair and optional " +
+          "options as put(key, value, options) or with multiple key-value " +
+          "pairs and optional options as put(entries, options)",
+      );
     }
     const source = k instanceof Map ? Array.from(k) : Object.entries(k);
     if (source.length === 0) return;
@@ -2664,8 +2744,11 @@ class DurableObjectStorage {
     await Promise.resolve();
     this._flushPendingPuts();
   }
-  async delete(k) {
+  async delete(k, options) {
     this._assertTransactionActive("delete");
+    // Workerd's delete names PutOptions in its refusal: the two dictionaries
+    // carry the same flags (`allowUnconfirmed`).
+    __bindingOptions(options, "delete", "DurableObjectStorage", 2, "PutOptions");
     if (!this._transactionControl) await Promise.resolve();
     if (!this._flushPendingPuts()) return;
     if (Array.isArray(k)) {
@@ -2674,12 +2757,20 @@ class DurableObjectStorage {
     }
     return __storage_delete(this._scope, k);
   }
-  async list(options = {}) {
+  async list(options) {
     this._assertTransactionActive("list");
+    const o = __bindingOptions(options, "list", "DurableObjectStorage", 1, "ListOptions");
+    // The request carries the fields the store knows, and only those: an
+    // array or a Date is an object with none of them, which is the empty
+    // listing options workerd reads off it.
+    const request = {};
+    for (const name of ["start", "startAfter", "end", "prefix", "limit", "reverse"]) {
+      if (o[name] !== undefined) request[name] = o[name];
+    }
     if (!this._transactionControl) await Promise.resolve();
     if (!this._flushPendingPuts()) return new Map();
     return __unwrapStoredMap(__storage_list(
-      this._scope, JSON.stringify(options), __storedSentinel));
+      this._scope, JSON.stringify(request), __storedSentinel));
   }
   async deleteAll() {
     this._assertTransactionActive("deleteAll");

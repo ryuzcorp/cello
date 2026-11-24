@@ -106,10 +106,12 @@ export const cases = [
   { name: "kv-validation", fixture: "kvbindings", path: "/validation" },
   { name: "kv-list", fixture: "kvbindings", path: "/list" },
   { name: "kv-bulk", fixture: "kvbindings", path: "/bulk" },
+  { name: "kv-options", fixture: "kvbindings", path: "/options" },
   { name: "r2-etag", fixture: "r2", path: "/etag" },
   { name: "r2-ranges", fixture: "r2", path: "/ranges" },
   { name: "r2-conditional", fixture: "r2", path: "/conditional" },
   { name: "r2-list", fixture: "r2", path: "/list" },
+  { name: "r2-options", fixture: "r2", path: "/options" },
   { name: "r2-keys", fixture: "r2", path: "/keys" },
   { name: "r2-metadata", fixture: "r2", path: "/metadata" },
   { name: "r2-multipart", fixture: "r2", path: "/multipart" },
@@ -138,7 +140,8 @@ export const cases = [
   // Durable Objects and WebSockets: the bindings-sweep probes that agree, plus
   // the behaviour each fixed divergence pins.
   ...["/ids", "/alarm-handler", "/thrower", "/stub-errors", "/storage-basics",
-    "/storage-list", "/storage-delete", "/storage-keys", "/sql", "/sql-types",
+    "/storage-list", "/storage-delete", "/storage-keys", "/storage-options",
+    "/sql", "/sql-types",
     "/alarms", "/websockets", "/block-concurrency", "/storage-sync",
     "/transaction", "/ws-message-types"].map((path) => ({
     name: `do${path}`,

@@ -53,11 +53,11 @@ curl "http://127.0.0.1:9876/greet"   # hello-kv
 
 ## Use the supported API
 
-- `get(key, type)` returns the value as `"text"`, `"json"`, `"arrayBuffer"`, or `"stream"`. A missing key gives `null`.
+- `get(key, type)` returns the value as `"text"`, `"json"`, `"arrayBuffer"`, or `"stream"`. A missing key gives `null`. Any other name fails with `Unknown response type. Possible types are "text", "arrayBuffer", "json", and "stream".`, as on Cloudflare, rather than falling back to text.
 - `getWithMetadata(key, type)` also returns the metadata of the write.
-- `put(key, value, options)` takes a string, an `ArrayBuffer`, a typed array, or a `ReadableStream`. The options are `expiration` (absolute time in seconds), `expirationTtl` (seconds from now), and `metadata`.
+- `put(key, value, options)` takes a string, an `ArrayBuffer`, a typed array, or a `ReadableStream`. The options are `expiration` (absolute time in seconds), `expirationTtl` (seconds from now), and `metadata`. A non-object options argument fails with `parameter 3 is not of type 'PutOptions'.`, as it does on Cloudflare.
 - `delete(key)` removes a key.
-- `list({ prefix, cursor })` returns a page of key names and a cursor for the next page. A `limit` above 1000 is refused.
+- `list({ prefix, cursor })` returns a page of key names and a cursor for the next page. A `limit` above 1000 is refused, and a non-object options argument fails with `parameter 1 is not of type 'ListOptions'.`.
 
 A `kv_namespaces` entry gives a `binding` and an `id`. The `id` is the namespace identity, and it can be any string, such as a Cloudflare hexadecimal id or `sessions`. Two Workers that name one `id` reach one namespace. Cello ignores `preview_id`.
 

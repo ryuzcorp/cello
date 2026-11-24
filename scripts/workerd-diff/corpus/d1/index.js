@@ -180,17 +180,50 @@ const routes = {
     return report(out);
   },
 
-  // The retry accounting a Worker reads off `meta`.
+  // The retry accounting and the row accounting a Worker reads off `meta`.
+  // `rows_read`/`rows_written` are compared only where they are a function
+  // of the result: workerd counts them in libSQL's btree layer, so a write
+  // also charges the rows it reads and a DDL statement charges pages, which
+  // a stock-SQLite counter cannot reproduce (#158).
   async "/meta"() {
     await DB.exec("CREATE TABLE IF NOT EXISTS m (id INTEGER PRIMARY KEY, v TEXT)");
     const run = await DB.prepare("INSERT INTO m (v) VALUES (?)").bind("x").run();
     const read = await DB.prepare("SELECT COUNT(*) AS n FROM m").first();
+    const ddl = await DB.prepare("CREATE TABLE timing (id INTEGER PRIMARY KEY)").run();
+    const noop = await DB.prepare(
+      "CREATE TABLE IF NOT EXISTS timing (id INTEGER PRIMARY KEY)",
+    ).run();
+    const second = await DB.prepare("INSERT INTO m (v) VALUES ('y')").run();
+    const updated = await DB.prepare("UPDATE m SET v = 'z'").run();
+    const selected = await DB.prepare("SELECT id, v FROM m").all();
+    const deleted = await DB.prepare("DELETE FROM m WHERE v = 'z'").run();
+    const rowCounts = (result) => ({
+      changes: result.meta.changes,
+      rows_written: result.meta.rows_written,
+      changed_db: result.meta.changed_db,
+    });
     return report({
       total_attempts: run.meta.total_attempts,
       changed_db: run.meta.changed_db,
       changes: run.meta.changes,
       rows_written: run.meta.rows_written,
       read: read.n,
+      // `timings` is present with the one member Cloudflare's D1Meta carries,
+      // and it is the same measurement as `duration`.
+      timingsKeys: Object.keys(run.meta.timings ?? {}).sort(),
+      timingIsNumber: typeof run.meta.timings?.sql_duration_ms === "number",
+      timingsMatchDuration: run.meta.timings?.sql_duration_ms === run.meta.duration,
+      // `changes` is what the statement changed, not SQLite's connection
+      // counter: a DDL statement changes no row.
+      ddl: { changes: ddl.meta.changes, changed_db: ddl.meta.changed_db },
+      noop: { changes: noop.meta.changes, changed_db: noop.meta.changed_db },
+      inserted: rowCounts(run),
+      secondInsert: rowCounts(second),
+      updated: rowCounts(updated),
+      deleted: rowCounts(deleted),
+      selectedRows: selected.results.length,
+      selectedChanges: selected.meta.changes,
+      selectedChangedDb: selected.meta.changed_db,
     });
   },
 };

@@ -230,6 +230,27 @@ Known reflection-only differences:
 
 Only the binding types in the [services table](#services) are available.
 
+Every binding method converts its options argument the way workerd does: an
+absent or `null` argument means no options, any object is read for its
+fields, and another argument throws `parameter N is not of type
+'XOptions'`. What a binding's *own* fields accept is per service; the
+[KV](../services/kv.md), [R2](../services/r2.md) and [D1](../services/d1.md)
+pages list them.
+
+- **D1 `meta.rows_read`/`rows_written` are Cello's own counters.**
+  `changes`, `last_row_id`, `changed_db`, `size_after`, `total_attempts` and
+  `timings.sql_duration_ms` mean what they mean on Cloudflare. The two row
+  counters do not: workerd reads them from libSQL's btree layer, which
+  charges a write for the rows it reads and a DDL statement for pages, so a
+  `CREATE TABLE` reports `rows_read: 1, rows_written: 2` there and `0, 0`
+  here. A statement whose row counts follow from its result (a `SELECT`
+  returns the rows it read; an `INSERT`/`UPDATE`/`DELETE` reports the rows it
+  wrote) agrees with workerd.
+- **R2 cursors are opaque tokens.** A string Cello did not issue answers the
+  empty page R2 answers instead of restarting the listing. For the release
+  after 0.2.9 a plain key is still accepted as the cursor a page used to
+  answer with, while the bucket holds an object at that key.
+
 `env` additionally carries `CELLO_NODE`: the name of the node running your
 code, injected by the host after every deployment binding. A bundle that
 must refuse a credential minted for another region reads this, not

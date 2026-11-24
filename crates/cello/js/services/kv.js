@@ -962,7 +962,18 @@ function kvService(host) {
     return limit;
   };
 
-  // Upstream's four content types, and what each one means on the way in and out.
+  // Upstream's four content types, and what each one means on the way in
+  // and out. The name is checked here rather than at decode time: a type
+  // Cello does not know used to fall back to text, so a typo answered a
+  // different read instead of the refusal workerd raises.
+  const __kvResponseTypes = ["text", "arrayBuffer", "json", "stream"];
+  const __kvCheckResponseType = (type) => {
+    if (__kvResponseTypes.includes(type)) return type;
+    throw new TypeError(
+      'Unknown response type. Possible types are "text", "arrayBuffer", ' +
+        '"json", and "stream".',
+    );
+  };
   const __KV_TAG_TEXT = "text";
   const __KV_TAG_BYTES = "bytes";
 
@@ -1069,10 +1080,34 @@ function kvService(host) {
     }
   };
 
+  // The second argument of `get`/`getWithMetadata` is the response type: a
+  // string names it, an object carries it in `type`, and an absent or null
+  // one asks for text. A number or a boolean is not either shape and gets
+  // the unknown-type refusal, as it does on workerd.
   const __kvReadOptions = (options) => {
-    if (typeof options === "string") return { type: options };
     if (options === null || options === undefined) return { type: "text" };
-    return { type: options.type ?? "text", cacheTtl: options.cacheTtl };
+    const kind = typeof options;
+    if (kind === "object" || kind === "function") {
+      const type = options.type;
+      return {
+        type: __kvCheckResponseType(type === undefined || type === null ? "text" : String(type)),
+        cacheTtl: options.cacheTtl,
+      };
+    }
+    return { type: __kvCheckResponseType(String(options)) };
+  };
+
+  // An options dictionary, converted as workerd's JSG converts one: absent
+  // or null is the empty dictionary, an object is the dictionary its own
+  // properties spell, and any other argument is the refusal.
+  const __kvDictionary = (value, method, position, type) => {
+    if (value === undefined || value === null) return {};
+    const kind = typeof value;
+    if (kind === "object" || kind === "function") return value;
+    throw new TypeError(
+      `Failed to execute '${method}' on 'KvNamespace': parameter ${position} ` +
+        `is not of type '${type}'.`,
+    );
   };
 
   class KvNamespace {
@@ -1172,6 +1207,7 @@ function kvService(host) {
     }
 
     async put(key, value, options) {
+      const o = __kvDictionary(options, "put", 3, "PutOptions");
       const name = String(key);
       __kvCheckKey(name, "PUT");
       let encoded;
@@ -1181,14 +1217,14 @@ function kvService(host) {
         encoded = __kvEncodeValue(value);
         __kvCheckValue(encoded.value.byteLength);
       }
-      const metadata = options && options.metadata !== undefined
-        ? JSON.stringify(options.metadata)
+      const metadata = o.metadata !== undefined
+        ? JSON.stringify(o.metadata)
         : null;
       if (metadata !== null) __kvCheckMetadata(metadata);
       const expiresAt = __kvExpiryAt(
         Date.now(),
-        options && options.expiration,
-        options && options.expirationTtl,
+        o.expiration,
+        o.expirationTtl,
       );
       await this.#stub.__kvPut({
         entries: [{ key: name, value: encoded.value, tag: encoded.tag, metadata, expiresAt }],
@@ -1202,9 +1238,10 @@ function kvService(host) {
     }
 
     async list(options) {
-      const prefix = options && options.prefix ? String(options.prefix) : "";
-      const limit = __kvListLimit(options && options.limit);
-      const after = options && options.cursor ? __kvCursor.decode(String(options.cursor)) : "";
+      const o = __kvDictionary(options, "list", 1, "ListOptions");
+      const prefix = o.prefix ? String(o.prefix) : "";
+      const limit = __kvListLimit(o.limit);
+      const after = o.cursor ? __kvCursor.decode(String(o.cursor)) : "";
       const page = await this.#stub.__kvList({ prefix, limit, after, now: Date.now() });
       const keys = page.keys.map((entry) => {
         const key = { name: entry.name };

@@ -444,6 +444,12 @@ async fn list_json(
         )
         .await
         .map_err(anyhow::Error::msg)?;
+        // A cursor this node did not issue is the empty page R2 answers, so
+        // the page carries the reason and an operator sees it instead of
+        // reading the empty page as "the bucket has nothing".
+        if let Some(error) = page.get("cursor_error").and_then(Value::as_str) {
+            return Err(anyhow::Error::msg(error.to_string()));
+        }
         let listed = page
             .get("objects")
             .and_then(Value::as_array)
@@ -1386,8 +1392,8 @@ mod tests {
 
     /// A delimiter page's trailing prefix resumes past the folder: the
     /// next page lists what follows it, not the folder again. The row's
-    /// cursor is the last key that rolled into it, not the prefix string,
-    /// which encodes ahead of the keys it stands for.
+    /// cursor is a token over the last key that rolled into it, not the
+    /// prefix string, which encodes ahead of the keys it stands for.
     #[tokio::test]
     async fn delimiter_hint_passes_its_prefix() {
         for key in ["a/1", "a/2", "b/1", "top.txt"] {
@@ -1409,7 +1415,11 @@ mod tests {
             .map(Resumable::cursor)
             .expect("a row to resume after")
             .to_string();
-        assert_eq!(hint, "b/1");
+        assert!(
+            hint.starts_with("cello-r2-cursor-v1."),
+            "a row's hint is a cursor token, never the key itself: {hint}"
+        );
+        assert_ne!(hint, "b/1");
         let resumed = fetch_text_page(
             "hintprefix",
             "",
