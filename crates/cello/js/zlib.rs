@@ -893,15 +893,19 @@ export default {
         const read = drain(poisoned.readable).then(() => "resolved", (e) => e.name);
         const wrote = await writer.write(new Uint8Array(16).fill(7))
           .then(() => "resolved", (e) => e.name);
-        // A non-BufferSource chunk fails before any push, so the transform
-        // must still release its native entry.
+        // A non-BufferSource chunk fails before any push, so it rejects
+        // only that write: a valid write still runs, the close resolves,
+        // and the close's flush releases the native entry (#276).
         const invalid = new CompressionStream("gzip");
         held.push(invalid);
         const iwriter = invalid.writable.getWriter();
         const iread = drain(invalid.readable).then(() => "resolved", (e) => e.name);
         const iwrote = await iwriter.write(123)
           .then(() => "resolved", (e) => e.name);
-        return Response.json({ wrote, read: await read, iwrote, iread: await iread });
+        const vwrite = await iwriter.write(new Uint8Array([1]))
+          .then(() => "ok", (e) => e.name);
+        const iclose = await iwriter.close().then(() => "ok", (e) => e.name);
+        return Response.json({ wrote, read: await read, iwrote, iread: await iread, vwrite, iclose });
       }
       case "/close-cancel-loop": {
         // writer.close() around a same-turn readable cancel, both orderings
@@ -1154,8 +1158,9 @@ export default {
 
     /// A readable cancel ends its compressor once nothing accepted is
     /// still outstanding, an abort drops its stream, and a poisoning push
-    /// or an invalid chunk each release the native stream too -- all while
-    /// JS still holds the stream object.
+    /// releases the native stream too -- all while JS still holds the
+    /// stream object. An invalid chunk rejects only its own write, so the
+    /// stream stays usable and its close flush releases the entry (#276).
     #[test]
     fn cancel_abort_and_push_error_release_while_held() {
         on_engine_thread(|| {
@@ -1164,7 +1169,9 @@ export default {
             assert_eq!(report["wrote"], "TypeError", "{report}");
             assert_eq!(report["read"], "TypeError", "{report}");
             assert_eq!(report["iwrote"], "TypeError", "{report}");
-            assert_eq!(report["iread"], "TypeError", "{report}");
+            assert_eq!(report["iread"], "resolved", "{report}");
+            assert_eq!(report["vwrite"], "ok", "{report}");
+            assert_eq!(report["iclose"], "ok", "{report}");
             assert_eq!(live(&worker), 0);
         });
     }
