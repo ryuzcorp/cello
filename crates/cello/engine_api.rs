@@ -483,9 +483,15 @@ impl std::fmt::Display for CellHandlerError {
 impl std::error::Error for CellHandlerError {}
 
 /// The cell handler exception an error carries, when it has one.
+///
+/// A failure a peer owner reported carries one too: the caller rebuilds it as
+/// the value the handler threw instead of a host message (#226).
 pub fn cell_handler_error(error: &anyhow::Error) -> Option<&CellHandlerError> {
     if let Some(handler) = error.downcast_ref::<CellHandlerError>() {
         return Some(handler);
+    }
+    if let Some(remote) = error.downcast_ref::<crate::peer_failure::RemoteHandlerFailure>() {
+        return Some(&remote.0);
     }
     error
         .downcast_ref::<FailedInTurn>()

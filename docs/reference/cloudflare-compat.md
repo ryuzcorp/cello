@@ -428,7 +428,16 @@ The `tail` and `email` handlers are unavailable.
   rejects, and an HTTP client receives status 500. The server end of the
   socket receives a close event with code 1006.
 - Your Durable Object's `stub.fetch()` call rejects when the handler
-  fails, on the owner node and on any other node.
+  fails, on the owner node and on any other node. A failure on another node
+  reports the same value a local owner would: the class is kept (an `Error`
+  subclass stays that class, a `DOMException` stays one, a thrown object
+  crosses by value), every object carries the `remote` marker, and a stack
+  is its first line only. Two bounded exceptions apply to a remote owner: a
+  thrown object whose clone does not fit the 64 KiB peer handler-failure
+  body arrives as an `Error` carrying its message, and an owner running an
+  older release reports its text message as an `Error` instead. Both are
+  rolling-upgrade or bound cases; neither turns the failure into an
+  application response.
 - A Worker Loader worker (`env.LOADER`) answers a WebSocket upgrade the
   same way: a `101` response carrying `webSocket` routes to its target
   whether the loaded worker made the socket itself or forwards the
