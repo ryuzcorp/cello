@@ -238,10 +238,23 @@ export class Thrower {
 }
 
 export class RpcThrow extends DurableObject {
+  constructor(state, env) {
+    super(state, env);
+    this.env = env;
+  }
+  // Which node owns this cell, for the cross-node conformance test: the
+  // caller reports its own node beside it.
+  whoami() { return this.env.CELLO_NODE ?? null; }
   dom() { throw new DOMException("aborted!", "AbortError"); }
+  range() { throw new RangeError("bad range"); }
   str() { throw "plain string"; }
   obj() { throw { name: "ObjError", message: "obj msg" }; }
   empty() { throw new TypeError(""); }
+  // The RPC reply is the structured-clone envelope, not the bounded peer
+  // handler-failure body, so a clone this size still crosses intact (#238).
+  oversize() {
+    throw { name: "BigError", message: "too big", payload: "x".repeat(70_000) };
+  }
 }
 
 export class CtorAlarm {
@@ -330,9 +343,15 @@ export default {
         () => stub.fetch("https://do.test/replaced-dom"), shape));
     }
     if (route === "/rpc-throw") {
-      const stub = env.RPC.getByName("rpc");
-      const out = {};
-      for (const method of ["dom", "str", "obj", "empty"]) {
+      // `?name=` picks the instance, so the cross-node test can find one the
+      // other node owns; `/whoami` reports the owner's node.
+      const stub = env.RPC.getByName(
+        new URL(request.url).searchParams.get("name") ?? "rpc");
+      const out = {
+        caller: env.CELLO_NODE ?? null,
+        throwerNode: await stub.whoami(),
+      };
+      for (const method of ["dom", "range", "str", "obj", "empty", "oversize"]) {
         out[method] = await attempt(() => stub[method](), shape);
       }
       return Response.json(out);
