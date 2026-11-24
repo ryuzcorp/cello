@@ -376,6 +376,16 @@ the union of the main module's and every sibling's imports.
   interface's refusals, the tags, the prototype levels, and the specialized
   class handle. A non-function, non-object export fails the deployment's
   load, as it does on workerd.
+- A `WorkflowEntrypoint` class export is the one export that is not a
+  `typeof "function"` handle: it is the Workflow's **binding**, keyed by the
+  class name rather than the binding name, so `ctx.exports.ReportBuilder`
+  names the same workflow `env.REPORTS` does. It is a distinct object over
+  the same instance store -- a create through one path is visible to the
+  other -- reflecting as workerd's `[object WrappedBinding]`: a `WorkflowImpl`
+  over `WrappedBinding`, with `create`, `createBatch`, `deleteBatch` and `get`
+  on the prototype and no own property at all, the workflow name in a private
+  slot. Because the class name is the key, a config that names one class for
+  two workflows, or that names the `default` export, is refused.
 
 ### [Handlers](https://developers.cloudflare.com/workers/runtime-apis/handlers/)
 

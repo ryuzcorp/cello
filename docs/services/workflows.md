@@ -50,6 +50,7 @@ const status = await env.REPORTS.get(instance.id).status();
 - `step.sleep(name, duration)` and `step.sleepUntil(name, timestamp)` stop the instance until a deadline.
 - `step.waitForEvent(name, options)` stops the instance until a matching event arrives. It times out after 24 hours by default. An event that arrives before the instance reaches its wait step is buffered.
 - `env.MY_WORKFLOW.create()`, `createBatch()`, and `get(id)` return an instance. `deleteBatch()` deletes several instances.
+- The class is also in `ctx.exports` under its own name, as the same binding over the same instances: `ctx.exports.ReportBuilder.get(instance.id)` reaches the instance `env.REPORTS` created, and vice versa. Workerd keys it by class name, so two workflows cannot name one class.
 - An instance has `status()`, `sendEvent()`, `pause()`, `resume()`, `restart()`, `terminate()`, and `delete()`.
 
 Each time an instance makes progress, Cello calls `run()` again from the first line. A finished step returns its stored result and does not run its callback again. Put each subrequest, each side effect, and each value that must stay stable inside a `step.do()` callback, as the [rules of Workflows](https://developers.cloudflare.com/workflows/build/rules-of-workflows/) require. A step whose result did not commit before a node failure runs again, so a step callback must tolerate a second attempt.

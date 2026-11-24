@@ -8038,6 +8038,13 @@ const __ctxExports = () => __ctxExportsCache ??= (() => {
     if (name.startsWith(".")) continue;
     out[name] = actor(name);
   }
+  // A module's `WorkflowEntrypoint` classes are the Workflows it declares, and
+  // workerd keys each one by its class name, not its binding name: the entry
+  // is the workflow binding (`[object WrappedBinding]`), a distinct object over
+  // the same instance store `env.<binding>` reaches (#266). A workflow class
+  // never reaches `__cell.classes`, so no earlier loop has claimed the name.
+  for (const workflow of Object.keys(__cell.workflows))
+    out[__cell.workflows[workflow]] = __makeWorkflow(workflow);
   return out;
 })();
 // ---- RPC envelope ----------------------------------------------
@@ -13578,15 +13585,22 @@ class WorkflowInstance {
   }
 }
 
-class Workflow {
+// Workerd's workflow binding: a `WorkflowImpl` over the shared
+// `WrappedBinding` level, both tagged `[object WrappedBinding]`, the name in a
+// private slot so the instance carries no own property, and the methods on the
+// prototype in workerd's order (#266). `ctx.exports` hands out the same shape
+// over the same instance store as `env.<binding>`.
+class WorkflowImpl extends WrappedBinding {
+  #workflowName;
   constructor(workflowName) {
-    Object.defineProperty(this, "_workflowName", { value: workflowName });
+    super();
+    this.#workflowName = workflowName;
   }
-  async _create(options, skipExisting) {
+  async #create(options, skipExisting) {
     const { id, params, retention, locationHint } = options;
-    const instance = new WorkflowInstance(this._workflowName, id);
+    const instance = new WorkflowInstance(this.#workflowName, id);
     const result = await instance._stub.__wfCreate({
-      workflowName: this._workflowName,
+      workflowName: this.#workflowName,
       instanceId: id,
       params,
       retention,
@@ -13596,7 +13610,7 @@ class Workflow {
     return result.created ? instance : undefined;
   }
   async create(options = {}) {
-    return await this._create(__wfCreateOptions(options, "create()"), false);
+    return await this.#create(__wfCreateOptions(options, "create()"), false);
   }
   async createBatch(batch) {
     if (!Array.isArray(batch)) {
@@ -13633,7 +13647,7 @@ class Workflow {
     }
     const created = [];
     for (const options of creatable) {
-      const instance = await this._create(options, true);
+      const instance = await this.#create(options, true);
       if (instance !== undefined) created.push(instance);
     }
     return created;
@@ -13642,7 +13656,7 @@ class Workflow {
     if (!__wfValidInstanceId(id)) {
       throw __wfError(`invalid instance id ${JSON.stringify(id)}`);
     }
-    const instance = new WorkflowInstance(this._workflowName, id);
+    const instance = new WorkflowInstance(this.#workflowName, id);
     // The cell exists on first address like any cell, but get() must not
     // mint an instance for a typo: an id with no ledger rejects here.
     await instance._stub.__wfStatus();
@@ -13664,7 +13678,7 @@ class Workflow {
     }
     const uniqueIds = [...new Set(instanceIds)];
     const settled = await Promise.allSettled(uniqueIds.map(async (id) => {
-      const instance = new WorkflowInstance(this._workflowName, id);
+      const instance = new WorkflowInstance(this.#workflowName, id);
       await instance.delete();
     }));
     const results = new Map(uniqueIds.map((id, index) => [id, settled[index]]));
@@ -13690,7 +13704,7 @@ class Workflow {
 }
 
 const __makeWorkflow = __cello.__makeWorkflow =
-  (workflowName) => new Workflow(workflowName);
+  (workflowName) => new WorkflowImpl(workflowName);
 // `cloudflare:workers` module surface. The DO base class sets ctx/env the
 // way `class X extends DurableObject` expects; env aliases the cell env.
 const __cf = __cello.__cf = {
