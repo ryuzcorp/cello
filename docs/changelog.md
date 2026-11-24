@@ -3,16 +3,23 @@ title: Changelog
 description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.9.
 ---
 ## Unreleased
-- **Several timers held past their deadlines release innermost scope first,
+ - **Several timers held past their deadlines release innermost scope first,
    the way workerd releases them (#282).** Cello fired every held timer in
    global deadline order; on workerd each scope drains before the one around
    it, deadline order only within a scope, with scopeless handler timers
    last. A section now releases only after the timers it held have fired,
    and the root section is recorded synchronously at block entry and stays
    open in the map, so a completion that lands in the microtasks before the
-   gate ticket arrives still sees it open. The differential gate gained one
-   case (`do/nested-hold-order`, with scope, depth-2 and interval shapes)
-   that fails on `origin/main` and every case agrees.
+   gate ticket arrives still sees it open. A held timer whose callback
+   throws no longer wedges the section: the throw stays an unhandled
+   rejection while the release bookkeeping runs regardless. Resetting after
+   a failure force-resolves the open sections' `settled` (carrying the
+   failure) and `release` promises, so waits held on them are released and
+   fail fast instead of pending forever, and a block refused at acquisition
+   forgets its synchronously opened root. The differential gate gained two
+   cases (`do/nested-hold-order`, with scope, depth-2 and interval shapes,
+   and `do/nested-hold-throwstuck`) that fail on `origin/main` and every
+   case agrees.
 - **Sibling nested `blockConcurrencyWhile` sections run one at a time, in
    schedule order, the way workerd runs them (#278).** Two nested sections
    the same body starts used to run concurrently; on workerd the second
