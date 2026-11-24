@@ -174,6 +174,13 @@ class ReadableStreamState {
     // stream is cancelled instead of resolving {done: true} (compression
     // streams opt in).
     this.cancelRejectsReads = false;
+    // Workerd's internal streams settle a pending read() only after the
+    // isolate drains its microtasks, so a cancel() called synchronously
+    // after the write that produced the chunk still rejects the read. JS
+    // streams settle it inside the enqueue (compression streams opt in,
+    // #252).
+    this.deferReads = false;
+    this.readDrainQueued = false;
     // The byte-stream controller (byte_streams.js) or internal-transform
     // controller (identity_transform_stream.js) layered on this stream, and
     // the materialized-body cursor the BYOB reader turns into a controller.
@@ -207,6 +214,35 @@ const __rsIs = (value) =>
 
 // Resolve one pending read request from queue.
 function __resolveRead(st) {
+  // An internal stream settles its reads on the microtask drain, so a
+  // cancel() or an error() in the same turn wins over the chunk just
+  // enqueued (#252).
+  if (st.deferReads) {
+    __settleReadsLater(st);
+    return;
+  }
+  __drainReads(st);
+}
+
+function __settleReadsLater(st) {
+  if (st.readDrainQueued) return;
+  st.readDrainQueued = true;
+  Promise.resolve().then(() => {
+    st.readDrainQueued = false;
+    __drainReads(st);
+  });
+}
+
+function __drainReads(st) {
+  if (st.errored) {
+    // Workerd's internal streams reject the read with an Error built from
+    // the reason the stream died of (#252).
+    const error = st.cancelRejectsReads ? __cancelError(st.error) : st.error;
+    for (const r of st.readRequests)
+      r.reject(error);
+    st.readRequests = [];
+    return;
+  }
   while (st.readRequests.length > 0 &&
          st.queue.length > 0) {
     const r = st.readRequests.shift();
@@ -285,6 +321,35 @@ function __maybePull(st) {
   );
 }
 
+// Workerd's internal streams reject a pending read with an `Error` built
+// from the cancellation reason: an `Error` reason keeps its class, message
+// and own enumerable properties on a fresh instance, `undefined` gets
+// workerd's own text, and anything else is stringified (#252).
+function __cancelError(reason) {
+  if (reason instanceof Error) {
+    let copy;
+    try {
+      copy = new reason.constructor(reason.message);
+    } catch (e) {
+      copy = new Error(reason.message);
+    }
+    // The reason is tenant code: a Proxy may throw from `ownKeys`, and a
+    // copied property may be read-only on the copy.
+    let keys = [];
+    try {
+      keys = Object.keys(reason);
+    } catch (e) {}
+    for (const key of keys) {
+      try {
+        copy[key] = reason[key];
+      } catch (e) {}
+    }
+    return copy;
+  }
+  if (reason === undefined) return new Error("Stream was cancelled.");
+  return new Error(String(reason));
+}
+
 // Discard queued chunks and transition to closed. The shared tail of
 // cancel() and the internal-stream/byte-stream cancel paths.
 function __cancelStream(stream, st, reason) {
@@ -299,10 +364,13 @@ function __cancelStream(stream, st, reason) {
   // Workerd's internal (native) streams reject a pending
   // read() when the stream is cancelled; spec JS streams
   // resolve it {done: true}. Compression streams opt in
-  // to the internal behavior (compression_streams.js).
+  // to the internal behavior (compression_streams.js), and
+  // the rejection carries an Error built from the reason
+  // (#252).
   if (st.cancelRejectsReads) {
+    const error = __cancelError(reason);
     for (const r of st.readRequests)
-      r.reject(reason);
+      r.reject(error);
     st.readRequests = [];
   }
   __finishClose(st);
@@ -399,7 +467,13 @@ class ReadableStreamDefaultController {
     st.queueTotalSize = 0;
     // Reject closed first (spec order).
     __rejectClosed(st, e);
-    // Then reject pending reads.
+    // Then reject pending reads. An internal stream defers the rejection to
+    // the microtask drain so a cancel() later in the same turn rejects the
+    // read with its own Error instead (#252).
+    if (st.deferReads) {
+      __settleReadsLater(st);
+      return;
+    }
     for (const r of st.readRequests)
       r.reject(e);
     st.readRequests = [];
@@ -1176,6 +1250,10 @@ __cello.$$rejectClosedStream = (stream, e) =>
   __rejectClosed(__rsState(stream), e);
 __cello.$$cancelReadableStream = (stream, reason) =>
   __cancelReadable(stream, reason);
+// The Error an internal stream's pending read rejects with when it is
+// cancelled; writable_stream.js records it for a compression stream's
+// writable (#252).
+__cello.$$cancelError = __cancelError;
 
 // WebIDL reflection (enumerable members, data tag, hidden constructor) for
 // every interface this file defines (#171, #206).

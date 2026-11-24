@@ -386,6 +386,16 @@ The `tail` and `email` handlers are unavailable.
   throws a `RangeError`. Finish, cancel, or abort streams you no longer use.
   Their writable side is an internal stream: once it has closed,
   `releaseLock()` is a no-op and the stream stays locked, as on Workerd. A
+  readable `cancel()` records its error on the writable instead of erroring
+  it, so a write already in flight still completes and a later one fails
+  with the closed-stream error; a pending `read()` rejects with an `Error`
+  built from the cancel reason, and it settles after the isolate's microtask
+  drain, so a `cancel()` or `abort()` in the same turn as the producing
+  write wins over the chunk. `abort()` on that writable is an ordinary
+  abort: it resolves, `writer.closed` rejects with the abort reason, and the
+  writable ends in the closed shape (`desiredSize` 0, later `write()` and
+  `close()` report the closed stream) instead of the errored one a JS sink
+  gets. A
   string chunk is UTF-8 encoded and `undefined` is an empty chunk; any
   other non-`ArrayBuffer`/`ArrayBufferView` chunk fails the same way. A
   gzip header CRC (FHCRC) is verified, and the trailer's CRC-32 and ISIZE

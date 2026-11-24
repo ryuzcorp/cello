@@ -4,6 +4,19 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
 ---
 ## Unreleased
 
+- **A compression stream settles a cancel racing an abort the way Workerd
+  does (#252).** A `DecompressionStream`/`CompressionStream` with a write in
+  flight, a pending `read()` and a synchronous `reader.cancel()` followed by
+  `writer.abort()` now answers what Workerd answers: `abort()` resolves,
+  `writer.closed` rejects with the **abort** reason, and the pending read
+  rejects with an `Error` carrying the cancel reason. The readable cancel no
+  longer errors the writable side: the write in flight still completes, a
+  later write reports the closed stream, and the writable ends in Workerd's
+  closed shape (`desiredSize` 0, still locked) instead of the errored one.
+  A read on these internal streams settles after the isolate's microtask
+  drain, so a same-turn cancel wins over the chunk the write just produced.
+  The `compression-cancel-then-abort` gate case now pins the reasons and the
+  pending-read outcome, not just their presence.
 - **A boolean SQL bind is stored as workerd's TEXT `'true'`/`'false'` from
   compatibility date 2026-11-24 (#154) — Breaking for new compatibility
   dates.** Workerd stores a `true`/`false` bind as TEXT; Cello stored INTEGER
