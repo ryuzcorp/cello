@@ -1452,12 +1452,19 @@ mod tests {
                 .map(|row| row.text().into_owned())
                 .collect::<Vec<_>>()
         };
+        // The seed is a cursor a page answered with, over the first key: a
+        // plain key is not a cursor any more, so it would be the empty page.
+        let first = fetch_text_page("cursorwins", "", None, &Resume::From(None), None, 1)
+            .await
+            .expect("list the first page");
+        assert_eq!(rows(&first), ["a"]);
+        let seed = first.next.expect("a truncated page names its cursor");
         let from_cursor = fetch_text_page(
             "cursorwins",
             "",
             None,
             &Resume::From(None),
-            Some("a".to_string()),
+            Some(seed.clone()),
             100,
         )
         .await
@@ -1468,7 +1475,7 @@ mod tests {
             "",
             None,
             &Resume::From(Some("b".to_string())),
-            Some("a".to_string()),
+            Some(seed),
             100,
         )
         .await
