@@ -132,8 +132,13 @@ export class Timer {
 }
 
 export class Thrower {
+  constructor(state, env) {
+    this.env = env;
+  }
   async fetch(request) {
     const kind = new URL(request.url).pathname;
+    // Which node owns this cell, for the cross-node conformance test.
+    if (kind === "/whoami") return Response.json({ node: this.env.CELLO_NODE ?? null });
     if (kind === "/type") throw new TypeError("bad type");
     if (kind === "/string") throw "plain string";
     if (kind === "/dom") throw new DOMException("aborted!", "AbortError");
@@ -141,6 +146,11 @@ export class Thrower {
     if (kind === "/num") throw 42;
     if (kind === "/null") throw null;
     if (kind === "/empty") throw new TypeError("");
+    // Larger than the peer body can carry (#226): the caller must still get a
+    // shaped error, degraded as the documented bound requires.
+    if (kind === "/oversize") {
+      throw { name: "BigError", message: "too big", payload: "x".repeat(70_000) };
+    }
     if (kind === "/replaced-dom") {
       // A Worker that replaces the global class owns the instance it throws;
       // workerd treats it as a plain Error, never a DOMException.
@@ -219,10 +229,17 @@ export default {
     if (route === "/alarm-ctor")
       return env.CTOR.getByName("ctor").fetch("https://do.test/alarm-ctor");
     if (route === "/throw") {
-      const stub = env.THROWER.getByName("thrower");
-      const out = {};
+      // `?name=` lets the cross-node test pick an instance until the caller
+      // and the owner are different nodes; `/whoami` reports the owner's.
+      const stub = env.THROWER.getByName(
+        new URL(request.url).searchParams.get("name") ?? "thrower");
+      const out = {
+        caller: env.CELLO_NODE ?? null,
+        throwerNode: (await (await stub.fetch("https://do.test/whoami")).json()).node,
+      };
       for (const [label, kind] of [["error", ""], ["type", "/type"], ["string", "/string"],
-        ["dom", "/dom"], ["obj", "/obj"], ["num", "/num"], ["null", "/null"], ["empty", "/empty"]]) {
+        ["dom", "/dom"], ["obj", "/obj"], ["num", "/num"], ["null", "/null"], ["empty", "/empty"],
+        ["oversize", "/oversize"]]) {
         out[label] = await attempt(
           () => stub.fetch(`https://do.test${kind}`), shape);
       }

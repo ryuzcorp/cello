@@ -249,24 +249,7 @@ fn clean_reload_is_eligible(
 type HttpReply = Response<UnsyncBoxBody<Bytes, std::io::Error>>;
 
 use cello::peer_auth::{OVERLOAD_HEADER, STALE_ROUTE_HEADER, STALE_ROUTE_VALUE};
-/// Marks a forwarded fetch whose handler failed on the owner, so the caller's
-/// `stub.fetch()` rejects as it does for a local owner. Without the marker a
-/// remote handler failure looks like an application 500 response.
-const HANDLER_FAILURE_HEADER: &str = "x-cells-handler-failure";
-const HANDLER_FAILURE_PREFIX: &str = "cell Worker failed: ";
-
-/// A handler failure that the owner reported for a forwarded fetch. The owner
-/// ran the handler, so a retry would run it a second time.
-#[derive(Debug)]
-struct RemoteHandlerFailure(String);
-
-impl std::fmt::Display for RemoteHandlerFailure {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for RemoteHandlerFailure {}
+use cello::peer_failure::{RemoteHandlerFailure, HANDLER_FAILURE_HEADER};
 const DURABLE_OBJECT_ROUTING_ERROR_MARKER: &str = "__CELLO_DO_ROUTING_ERROR__:";
 
 fn owner_unreachable(scope: &str, owner: &str, source: anyhow::Error) -> anyhow::Error {
@@ -1376,16 +1359,27 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
                         // complete: the owner needs no abort, and the error
                         // must not reach the redispatch policy below.
                         abort.disarm();
-                        let body = Limited::new(response.into_body(), MAX_PEER_CONTROL_BODY_BYTES)
-                            .collect()
-                            .await
-                            .map(|body| body.to_bytes())
-                            .unwrap_or_default();
-                        let body = String::from_utf8_lossy(&body);
-                        let message = body.strip_prefix(HANDLER_FAILURE_PREFIX).unwrap_or(&body);
-                        return Err(anyhow::Error::new(RemoteHandlerFailure(
-                            message.to_string(),
-                        )));
+                        // The header value is the body version: a new owner
+                        // sends the structured handler failure, and anything
+                        // else is the legacy text an older owner wrote.
+                        let version = response
+                            .headers()
+                            .get(HANDLER_FAILURE_HEADER)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string();
+                        // Bound before parsing: the body is a peer's word, and
+                        // an unreadable one still has to fail as the handler's
+                        // failure rather than as an application response.
+                        let body =
+                            Limited::new(response.into_body(), cello::peer_failure::MAX_BODY_BYTES)
+                                .collect()
+                                .await
+                                .ok()
+                                .map(|body| body.to_bytes());
+                        let handler =
+                            cello::peer_failure::remote_handler_failure(&version, body.as_deref());
+                        return Err(anyhow::Error::new(RemoteHandlerFailure(handler)));
                     }
                     let response_headers = response
                         .headers()
@@ -2015,13 +2009,21 @@ fn internal_do_worker_error(error: anyhow::Error) -> HttpReply {
     if cell_overload_error(&error) {
         return cell_overload_response();
     }
-    let mut failed = response(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        format!("{HANDLER_FAILURE_PREFIX}{error:#}"),
-    );
+    // A handler's own exception crosses as the shape the handler threw, so a
+    // caller on another node rejects exactly as a local caller does (#226).
+    // Every other failure keeps the version 1 text body: the header still
+    // means "the handler failed", and the message is the owner's reason.
+    let (version, body) = match cello::engine_api::cell_handler_error(&error) {
+        Some(handler) => (
+            cello::peer_failure::VERSION_STRUCTURED,
+            cello::peer_failure::structured_body(handler),
+        ),
+        None => ("1", cello::peer_failure::legacy_body(&format!("{error:#}"))),
+    };
+    let mut failed = response(StatusCode::INTERNAL_SERVER_ERROR, body);
     failed.headers_mut().insert(
         hyper::header::HeaderName::from_static(HANDLER_FAILURE_HEADER),
-        hyper::header::HeaderValue::from_static("1"),
+        hyper::header::HeaderValue::from_str(version).expect("a static version token"),
     );
     failed
 }

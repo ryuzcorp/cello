@@ -2,6 +2,21 @@
 title: Changelog
 description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.9.
 ---
+## Unreleased
+
+- **A Durable Object handler failure keeps its shape across nodes (#226).** A
+  `stub.fetch()` whose handler throws on another node now rejects with the
+  value the handler threw, exactly as a local owner does: an `Error` subclass
+  keeps its class, a `DOMException` stays one, a thrown object crosses by
+  value, and every object carries workerd's `remote` marker with a
+  first-line-only stack. The owner answers the existing
+  `x-cells-handler-failure` header with body version `2`, a JSON object
+  carrying the kind, name, message and storage-clone bytes of a thrown
+  object, bounded to 64 KiB. A new caller still reads an older owner's text
+  body (version `1`), and an older caller still sees an error from a new
+  owner, so a mixed fleet keeps forwarding. A thrown object whose clone does
+  not fit the bound degrades to an `Error` carrying its message.
+
 ## v0.2.9
 
 Cello now answers like workerd 1.20261121.1 across the Fetch API, streams,

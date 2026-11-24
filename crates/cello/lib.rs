@@ -88,6 +88,7 @@ pub mod operator_token;
 pub mod otlp;
 pub mod ownership_store;
 pub mod peer_auth;
+pub mod peer_failure;
 pub mod peer_probe;
 pub mod pool;
 pub mod protocol;
