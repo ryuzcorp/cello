@@ -23,6 +23,38 @@ const errorInfo = (error) => ({
 const attempt = async (fn, describe = errorInfo) => {
   try { return { ok: await fn() }; } catch (error) { return { error: describe(error) }; }
 };
+// #251: how a binding object reflects. Own properties keep their order -- a
+// Worker can read it -- while a prototype's members are sorted, because a
+// native prototype's definition order is not a contract. An accessor reports
+// itself rather than the value it returns.
+const surfaceDescriptors = (names, value) => names.map((name) => {
+  const descriptor = Object.getOwnPropertyDescriptor(value, name);
+  return [name, descriptor.get ? "getter" : typeof descriptor.value,
+    descriptor.enumerable, descriptor.writable ?? null,
+    descriptor.configurable];
+});
+// The own properties a Worker walks with `Object.keys` or `JSON.stringify`.
+const surfaceKeys = (value) => surfaceDescriptors(Object.keys(value), value);
+// Every own property name, for an object whose internals are slots rather
+// than properties: workerd's has none, so neither may this one.
+const surfaceOwn = (value) =>
+  surfaceDescriptors(Object.getOwnPropertyNames(value), value);
+const surfaceChain = (value) => {
+  const out = [];
+  for (let proto = Object.getPrototypeOf(value);
+       proto && proto !== Object.prototype;
+       proto = Object.getPrototypeOf(proto)) {
+    const ctor = Object.getOwnPropertyDescriptor(proto, "constructor");
+    const members = Object.getOwnPropertyNames(proto).map((name) => {
+      const descriptor = Object.getOwnPropertyDescriptor(proto, name);
+      return [name, descriptor.get ? "getter" : typeof descriptor.value,
+        descriptor.enumerable];
+    });
+    members.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+    out.push([ctor?.value?.name ?? null, members]);
+  }
+  return out;
+};
 
 export class Timer {
   constructor(state) { this.state = state; }
@@ -139,6 +171,134 @@ export class Probe {
         });
         out.functionValue = await attempt(() => s.put("fn", () => 1));
         out.symbolValue = await attempt(() => s.put("sym", Symbol("s")));
+        return report(out);
+      },
+      async "/storage-surface"() {
+        // #251: the storage, state, SQL and cursor objects keep their
+        // internals private and report workerd's own surface. Ordered facts
+        // are arrays, because `canonical` sorts an object's keys.
+        const s = this.state.storage;
+        const state = this.state;
+        await s.deleteAll();
+        const cursor = s.sql.exec("SELECT 1 AS v");
+        const out = {
+          props: [
+            typeof state.props, Array.isArray(state.props),
+            Object.keys(state.props ?? {}).length,
+            state.props === null,
+            Object.getPrototypeOf(state.props ?? {}) === Object.prototype,
+          ],
+          storageTag: Object.prototype.toString.call(s),
+          stateTag: Object.prototype.toString.call(state),
+          sqlTag: Object.prototype.toString.call(s.sql),
+          storageKeys: Object.keys(s),
+          storageOwn: surfaceKeys(s),
+          storageChain: surfaceChain(s),
+          stateKeys: Object.keys(state),
+          stateOwn: surfaceKeys(state),
+          // Cello's state keeps host-internal `_` members on its prototype
+          // (a separate leftover); the public members and their existence are
+          // what this case pins.
+          statePublic: [
+            "waitUntil", "blockConcurrencyWhile", "acceptWebSocket",
+            "getWebSockets", "getWebSocketAutoResponse",
+            "getWebSocketAutoResponseTimestamp", "setWebSocketAutoResponse",
+            "setHibernatableWebSocketEventTimeout",
+            "getHibernatableWebSocketEventTimeout", "getTags", "abort",
+          ].map((name) => [name, typeof state[name]]),
+          sqlKeys: Object.keys(s.sql),
+          sqlOwn: surfaceOwn(s.sql),
+          sqlChain: surfaceChain(s.sql),
+          sqlStatics: Object.getOwnPropertyNames(
+            Object.getPrototypeOf(s.sql).constructor),
+          // Cello's own seams are test-only: a shipping node has none.
+          sqlPrepare: "prepare" in s.sql,
+          sqlIngest: "ingest" in s.sql,
+          sqlFaultHook: "setWriteFaultForTest" in s.sql,
+          cursorKeys: Object.keys(cursor),
+          cursorOwn: surfaceOwn(cursor),
+          cursorChain: surfaceChain(cursor),
+          cursorTag: Object.prototype.toString.call(cursor),
+          cursorString: String(cursor),
+          cursorInstance: await attempt(() => cursor instanceof s.sql.Cursor),
+          cursorCtorSame: s.sql.Cursor === undefined
+            ? "absent"
+            : Object.getPrototypeOf(cursor) === s.sql.Cursor.prototype,
+          cursorCtorName: cursor.constructor?.name ?? null,
+          cursorColumns: "columns" in cursor,
+          cursorCtor: typeof s.sql.Cursor,
+          statementCtor: typeof s.sql.Statement,
+          cursorNew: await attempt(() => new s.sql.Cursor()),
+          statementNew: await attempt(() => new s.sql.Statement()),
+          setterType: typeof state.setHibernatableWebSocketEventTimeout,
+          getterType: typeof state.getHibernatableWebSocketEventTimeout,
+          initialTimeout: await attempt(() =>
+            state.getHibernatableWebSocketEventTimeout()),
+          kvKeys: Object.keys(s.kv),
+          kvOwn: surfaceOwn(s.kv),
+          kvChain: surfaceChain(s.kv),
+          kvTag: Object.prototype.toString.call(s.kv),
+          kvList: (() => {
+            const iterator = s.kv.list();
+            return {
+              keys: Object.keys(iterator),
+              own: surfaceOwn(iterator),
+              chain: surfaceChain(iterator),
+              tag: Object.prototype.toString.call(iterator),
+              next: typeof iterator.next,
+              selfIterable: iterator[Symbol.iterator]() === iterator,
+            };
+          })(),
+        };
+        // The hibernatable WebSocket event timeout: workerd's conversion, and
+        // the value it reports back.
+        const timeout = async (value) => {
+          try { state.setHibernatableWebSocketEventTimeout(value); }
+          catch (error) { return errorInfo(error); }
+          return await state.getHibernatableWebSocketEventTimeout();
+        };
+        for (const [name, value] of Object.entries({
+          unset: undefined, nullTimeout: null, zero: 0, number: 1500,
+          string: "250", negative: -1, float: 1.5, nan: NaN,
+          infinity: Infinity, bigint: 5n, week: 604800000,
+          overWeek: 604800001,
+        })) out["timeout:" + name] = await timeout(value);
+        // Bookmarks: what a local storage back-end reports, and the messages
+        // the point-in-time-recovery methods refuse with.
+        out.bookmarkFirst = await attempt(() => s.getCurrentBookmark());
+        out.bookmarkSecond = await attempt(() => s.getCurrentBookmark());
+        out.bookmarkAfterWrite = await attempt(async () => {
+          await s.put("marker", 1);
+          return await s.getCurrentBookmark();
+        });
+        await s.deleteAll();
+        out.bookmarkAfterDeleteAll = await attempt(() =>
+          s.getCurrentBookmark());
+        out.bookmarkForTime = await attempt(() =>
+          s.getBookmarkForTime(Date.now()));
+        out.bookmarkForTimeNumber = await attempt(() => s.getBookmarkForTime(1));
+        out.bookmarkForTimeZero = await attempt(() => s.getBookmarkForTime(0));
+        out.bookmarkForTimeNegative = await attempt(() =>
+          s.getBookmarkForTime(-1));
+        out.bookmarkForTimeDate = await attempt(() =>
+          s.getBookmarkForTime(new Date(0)));
+        out.bookmarkForTimeNaN = await attempt(() =>
+          s.getBookmarkForTime(NaN));
+        out.bookmarkForTimeInfinity = await attempt(() =>
+          s.getBookmarkForTime(Infinity));
+        out.bookmarkForTimeBigint = await attempt(() =>
+          s.getBookmarkForTime(5n));
+        out.bookmarkForTimeSymbol = await attempt(() =>
+          s.getBookmarkForTime(Symbol("s")));
+        out.bookmarkForTimeString = await attempt(() =>
+          s.getBookmarkForTime("today"));
+        out.bookmarkForTimeNone = await attempt(() => s.getBookmarkForTime());
+        out.bookmarkRestore = await attempt(() =>
+          s.onNextSessionRestoreBookmark("abc"));
+        out.bookmarkRestoreNone = await attempt(() =>
+          s.onNextSessionRestoreBookmark());
+        out.bookmarkRestoreSymbol = await attempt(() =>
+          s.onNextSessionRestoreBookmark(Symbol("s")));
         return report(out);
       },
       async "/storage-options"() {
@@ -704,6 +864,57 @@ const routes = {
       sameNamespaceName: OBJ.idFromName("alpha").toString() === str,
       unknownClass: (() => { try { return { ok: typeof OBJ.get(a) }; } catch (error) { return { error: errorInfo(error) }; } })(),
     });
+  },
+  async "/stub-surface"() {
+    // #251: a Durable Object stub is a DurableObject over Fetcher, with its
+    // routing private: `fetch`/`connect` have a native function's arity, a
+    // detached call is refused, and the id and namespace keep their state.
+    const stub = OBJ.getByName("stub");
+    const out = {
+      keys: Object.keys(stub),
+      own: surfaceOwn(stub),
+      chain: surfaceChain(stub),
+      tag: Object.prototype.toString.call(stub),
+      json: JSON.stringify(stub),
+      hasThen: "then" in stub,
+      fetchType: typeof stub.fetch,
+      fetchLength: stub.fetch.length,
+      connectType: typeof stub.connect,
+      connectLength: stub.connect?.length ?? null,
+      getType: typeof stub.get,
+      name: stub.name,
+      idKeys: Object.keys(stub.id),
+      idOwn: surfaceOwn(stub.id),
+      idChain: surfaceChain(stub.id),
+      idTag: Object.prototype.toString.call(stub.id),
+      // The hex identity is derived from a per-namespace key the two runtimes
+      // seed differently, so its shape and round trip are what compare.
+      idShape: [
+        String(stub.id).length, /^[0-9a-f]*$/.test(String(stub.id)),
+        String(stub.id) === OBJ.idFromName("stub").toString(),
+      ],
+      idHasName: "name" in stub.id,
+      idJurisdiction: stub.id.jurisdiction ?? "<absent>",
+      nsKeys: Object.keys(OBJ),
+      nsOwn: surfaceOwn(OBJ),
+      nsChain: surfaceChain(OBJ),
+      nsTag: Object.prototype.toString.call(OBJ),
+    };
+    // A method reached off the stub is not a capability of its own.
+    const detached = stub.fetch;
+    out.detachedFetch = await attempt(async () => {
+      const response = await detached("https://do.test/rpc");
+      return { status: response.status };
+    });
+    out.foreignFetch = await attempt(async () => {
+      const response = await stub.fetch.call({}, "https://do.test/rpc");
+      return { status: response.status };
+    });
+    // `connect` converts a `SocketAddress` or a `host:port` string before the
+    // transport is reached; Cello has none, so only the two refusals compare.
+    out.connectNoArg = await attempt(() => stub.connect());
+    out.connectNoPort = await attempt(() => stub.connect("https://do.test/"));
+    return report(out);
   },
   async "/stub-errors"() {
     const stub = OBJ.getByName("errors");

@@ -64,9 +64,11 @@ curl "http://127.0.0.1:9876/?name=b"   # {"n":1}
 - `ctx.storage.sql.exec()` runs SQL on the database of the object.
 - `transaction()` and `transactionSync()` group several writes.
 - `storage.setAlarm()`, `getAlarm()`, and `deleteAlarm()` manage one alarm per object, and Cello calls the `alarm(alarmInfo)` handler.
-- `ctx.acceptWebSocket()` accepts a hibernatable WebSocket, and Cello calls `webSocketMessage()` for each frame.
+- `ctx.acceptWebSocket()` accepts a hibernatable WebSocket, and Cello calls `webSocketMessage()` for each frame. `ctx.setHibernatableWebSocketEventTimeout()` sets the hibernatable WebSocket event timeout with workerd's conversion, and `ctx.getHibernatableWebSocketEventTimeout()` reports it.
 - `blockConcurrencyWhile()` closes the input gate.
 - `storage.sync()` waits for the durability of the earlier committed writes.
+- `storage.getCurrentBookmark()`, `getBookmarkForTime()`, and `onNextSessionRestoreBookmark()` are the session-bookmark methods. A local storage back-end has no point-in-time recovery, so the last two refuse with workerd's own error, and `getCurrentBookmark()` answers a per-object bookmark: see [Bookmarks](#bookmarks).
+- `ctx.props` is a facet's props, and `{}` for a class declared without props.
 
 ## Address a cell
 
@@ -87,6 +89,29 @@ A cell keeps no in-memory state across an eviction, so the constructor runs agai
 ## Store durably and fire alarms
 
 A class that a `new_sqlite_classes` migration declares can use the key-value methods and `ctx.storage.sql.exec()`. The `transactionSync()` callback receives no argument, as in workerd, and a throw rolls it back. A transaction can start a nested transaction; a failed nested transaction discards only its own writes, and the enclosing transaction can still commit.
+
+### Bookmarks
+
+Cloudflare's session-bookmark methods describe a point-in-time-recovery
+position. A local storage back-end has none, and workerd's own local back-end
+answers the same way Cello does, so code that probes the API behaves
+identically on both.
+
+`storage.getCurrentBookmark()` resolves to
+`00000000-<sequence>-00000000-<32 zero digits>`. The sequence is the object's
+own counter, and what advances it is a call to `getCurrentBookmark()`: a write
+does not, and `deleteAll()` starts it over at 0. Two consecutive calls
+therefore answer different bookmarks, and a bookmark read after a write says
+nothing about that write. `getBookmarkForTime()` and
+`onNextSessionRestoreBookmark()` convert their argument and then reject with
+`This Durable Object's storage back-end does not implement point-in-time
+recovery.` An argument of the wrong type is refused first, with workerd's
+`parameter 1 is not of type 'date'` or `'string'` message; a `NaN` or
+`Infinity` time is refused with `The value cannot be converted because it is
+not a valid Date.`
+
+Nothing in Cello restores an object to a bookmark: take backups at the bucket,
+where the cell's SQLite file lives, rather than through this API.
 
 ### Boolean binds
 
@@ -129,8 +154,12 @@ A value whose state lives in a host object is refused rather than stored as `{}`
 | `storage.sync()` | Waits for the object store or the fleet ensemble to hold all earlier committed writes, within the shorter of the 10-second `CELLO_LTX_DURABILITY_TIMEOUT_SECS` default and the 15-second `CELLO_OPERATION_DEADLINE_MS` default. It rejects in an open transaction and after an abort; without an object store it resolves after the local commit. |
 | Limits | A transaction and `blockConcurrencyWhile()` have a 30-second limit. A timeout resets the object and rolls back an open transaction. |
 | Failed handlers | Still wait for the durability of any exposed value or write. A Cello-generated failure that exposes no object value returns immediately. |
+| Session bookmarks | `getCurrentBookmark()` answers a per-object bookmark that a call to itself advances and `deleteAll()` resets; `getBookmarkForTime()` and `onNextSessionRestoreBookmark()` reject, because Cello has no point-in-time recovery, as workerd's local back-end also reports. |
+| Hibernatable event timeout | `setHibernatableWebSocketEventTimeout()` stores and reports the value with workerd's conversion and one-week bound, but Cello does not cut a hibernatable WebSocket event short when the timeout passes. |
+| Stub `connect()` | `stub.connect()` converts its address as workerd does and then fails: Cello has no Fetcher TCP transport for a Durable Object stub. |
+| Binding reflection | `Object.keys()`, `JSON.stringify()` and every enumerable member of a storage, state, id, namespace, stub, SQL storage, cursor or synchronous KV view answer what workerd's do. Cello keeps its internals as non-enumerable properties, and the `DurableObjectState` prototype still carries host-internal `_` members, so `Object.getOwnPropertyNames()` is not identical. |
 | SQL cursors | Outside a transaction, a SQL write cursor must finish before a response, an outbound effect, or `storage.sync()`. An unfinished `RETURNING` cursor holds uncommitted writes, so Cello rejects that output. A read cursor can stay open. |
-| SQL cursor counters | `rowsRead`/`rowsWritten` count Cello's rows read by the cursor and rows changed by DML. Workerd counts libsql's b-tree rows, so a DDL statement reports 1 read and 2 writes there and 0/0 here. A cursor exposes no own enumerable fields. |
+| SQL cursor counters | `rowsRead`/`rowsWritten` count Cello's rows read by the cursor and rows changed by DML. Workerd counts libsql's b-tree rows, so a DDL statement reports 1 read and 2 writes there and 0/0 here. A cursor has no own property, its `columnNames` is an enumerable accessor, and it has no `columns` member, as on workerd. |
 
 The [Cloudflare compatibility](../reference/cloudflare-compat.md#services) page lists the runtime APIs and the unsupported services.
 
