@@ -162,11 +162,17 @@ export default {
         case 'mutated-name': {
           const stub = env.PROBE.get(env.PROBE.idFromName('r7'));
           const before = stub.name;
-          stub.name = 'evil';
+          // workerd's stub fields are read-only: a module's assignment throws
+          // a TypeError and never changes what the stub reports (#251).
+          const mutation = (() => {
+            try { stub.name = 'evil'; return 'silent'; }
+            catch (error) { return `${error.name}: ${error.message}`; }
+          })();
           const echo = await SB.echoName(stub);
           const ping = await SB.pingBack(stub);
           return {
             before,
+            mutation,
             afterSend: stub.name,
             echoName: echo.name,
             pong: ping.pong,
