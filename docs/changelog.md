@@ -17,6 +17,32 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
   drain, so a same-turn cancel wins over the chunk the write just produced.
   The `compression-cancel-then-abort` gate case now pins the reasons and the
   pending-read outcome, not just their presence.
+- **A Durable Object's storage, state, SQL, id, namespace and stub surfaces
+  keep their internals private and match workerd (#251).**
+  `ctx.storage` reports `kv` and `sql` as its only own, enumerable
+  properties, `ctx.storage.sql` reports none, and every Cello-internal field
+  is a non-enumerable property, so `Object.keys()`, `JSON.stringify()` and a
+  spread see what they see on workerd. An id's `name`/`jurisdiction` and a
+  stub's `name`/`id` are own, enumerable and read-only, and a stub is a
+  `DurableObject` over `Fetcher` whose `fetch`/`connect` have arity 0: a
+  detached `fetch` throws workerd's `Illegal invocation` message instead of
+  reaching the cell. The three session-bookmark methods exist:
+  `getCurrentBookmark()` answers a per-object bookmark whose sequence only a
+  call to itself advances and `deleteAll()` resets, and
+  `getBookmarkForTime()`/`onNextSessionRestoreBookmark()` refuse with
+  workerd's local "does not implement point-in-time recovery" error once
+  their argument converts. `SqlStorage` shows `exec()`, `databaseSize` and
+  the nested `Cursor`/`Statement` constructors, which refuse `new`; an
+  `exec()` cursor is an instance of `sql.Cursor`, carries no own property,
+  and no longer answers a `columns` member. Cello's own `sql.prepare()`,
+  `sql.ingest()` and SQL fault hooks exist only with `CELLO_TEST_WAIT=1`,
+  like every other test seam, so a shipping node has none.
+  `ctx.setHibernatableWebSocketEventTimeout()` exists with workerd's
+  conversion and `ctx.getHibernatableWebSocketEventTimeout()` reports the
+  value; Cello does not cut a hibernatable event short on it. `ctx.props` is
+  `{}` for a class declared without props, as workerd's is, and the unused
+  `storage.rollback()` method is gone. The differential gate gained three
+  cases (232 total) and every case agrees.
 - **A boolean SQL bind is stored as workerd's TEXT `'true'`/`'false'` from
   compatibility date 2026-11-24 (#154) — Breaking for new compatibility
   dates.** Workerd stores a `true`/`false` bind as TEXT; Cello stored INTEGER

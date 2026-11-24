@@ -208,10 +208,23 @@ Known reflection-only differences:
 - Method `length` values and accessor function names follow V8's class
   syntax. The differential gate pins structure, enumerability and
   accessor-versus-data, not those incidental values.
-- `D1DatabaseSession` is not pinned against workerd: workerd's own session
-  reflects internal `WrappedBinding` members (`_queryOrThrow`, `_send`,
-  `_updateBookmark`, ...). Cello exposes `prepare`, `batch` and
-  `getBookmark`.
+- `D1DatabaseSession` has no own properties and exposes `prepare`, `batch`
+  and `getBookmark`. Its prototype is not pinned against workerd: workerd's
+  own session reflects internal `WrappedBinding` members (`_queryOrThrow`,
+  `_send`, `_updateBookmark`, ...), which Cello does not reproduce.
+- A Durable Object's storage, state, SQL storage, cursor, id, namespace and
+  stub keep Cello's internals as non-enumerable own properties rather than
+  slots, so `Object.getOwnPropertyNames()` differs even though `Object.keys()`,
+  `JSON.stringify()` and every enumerable member agree. Each interface
+  reports workerd's tag (`[object DurableObjectStorage]`,
+  `[object DurableObjectState]`, `[object SqlStorage]`, `[object Cursor]`,
+  `[object DurableObjectId]`, `[object DurableObjectNamespace]`,
+  `[object SyncKvStorage]`, `[object ListIterator]`, `[object DurableObject]`
+  and `[object Fetcher]`). `DurableObjectState` is the one object whose
+  prototype still carries host-internal `_`-prefixed members (`_ready`,
+  `_socket`, `_blockConcurrencyWhile`, `_runConcurrencyBlock`,
+  `_resetAfterConcurrencyFailure`, and the facets view's helpers): they are
+  non-enumerable, unsupported, and may disappear without notice.
 - `D1PreparedStatement` carries workerd's own `statement` and `params` data
   members. They are copies for reflection; the statement's behaviour reads
   internal slots.
@@ -264,6 +277,28 @@ service; the [KV](../services/kv.md), [R2](../services/r2.md) and
   where the string `'false'` is truthy; the [Durable
   Objects](../services/durable-objects.md#boolean-binds) page has the
   migration.
+- **Durable Object session bookmarks are a local counter, and point-in-time
+  recovery does not exist.** A local storage back-end has no PITR, exactly as
+  workerd's local back end has none. `storage.getCurrentBookmark()` resolves
+  to `00000000-<sequence>-00000000-<32 zeros>`, where a call to
+  `getCurrentBookmark()` is what advances the sequence (a write does not) and
+  `deleteAll()` resets it; `getBookmarkForTime()` and
+  `onNextSessionRestoreBookmark()` convert their argument and then reject
+  with `This Durable Object's storage back-end does not implement
+  point-in-time recovery.` A wrong argument type is refused first, with
+  workerd's `parameter 1 is not of type 'date'`/`'string'` message.
+- **`ctx.setHibernatableWebSocketEventTimeout()` stores and reports the
+  timeout.** The conversion, the one-week bound and the two refusal messages
+  are workerd's, and `ctx.getHibernatableWebSocketEventTimeout()` reports the
+  value, starting at `null`. Cello's hibernation driver does not cut an event
+  short when the timeout passes, so the value is observability only.
+- **A Durable Object stub is a `DurableObject` over `Fetcher`.** `fetch` and
+  `connect` have arity 0, a detached `fetch` throws workerd's `Illegal
+  invocation` message, and `name`/`id` are own, enumerable and read-only.
+  `stub.connect()` converts its address as workerd does (`parameter 1 is not
+  of type 'SocketAddress or string'`, `Specified address is missing port.`)
+  and then rejects: Cello has no Fetcher TCP transport for a stub, so a
+  well-formed address never opens a socket.
 - **R2 cursors are opaque tokens.** A string outside the token format that
   names no object gets the empty page R2 answers instead of a listing
   restarted from the top. A plain key is still read as the cursor 0.2.9

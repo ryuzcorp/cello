@@ -139,6 +139,9 @@ export const cases = [
   { name: "d1-exec-lines", fixture: "d1", path: "/exec-lines" },
   { name: "d1-exec-unicode", fixture: "d1", path: "/exec-unicode" },
   { name: "d1-meta-fresh", fixture: "d1", path: "/meta-fresh" },
+  // #251: a session keeps its database and bookmark private, and a query
+  // advances the bookmark.
+  { name: "d1-session", fixture: "d1", path: "/session" },
   { name: "cache-put-refusals", fixture: "cache", path: "/put-refusals" },
   { name: "cache-match-options", fixture: "cache", path: "/match-options" },
   { name: "cache-delete", fixture: "cache", path: "/delete" },
@@ -166,6 +169,10 @@ export const cases = [
     // #239: put(entries) shapes, ListOptions field conversion and the arity
     // of every binding method.
     "/storage-put-entries", "/storage-list-fields", "/method-lengths",
+    // #251: storage, state, SQL, cursor, id, namespace and stub surfaces --
+    // internals private, the prototype members workerd's, the bookmark
+    // methods and the hibernatable WebSocket event timeout.
+    "/storage-surface", "/stub-surface",
   ].map((path) => ({
     name: `do${path}`,
     fixture: "do",

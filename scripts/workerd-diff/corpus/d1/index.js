@@ -31,6 +31,15 @@ const meta = (value) => ({
   rows_written: value.rows_written,
   total_attempts: value.total_attempts,
 });
+// #251: how a binding object reflects. Every own property is named with its
+// kind, enumerability and writability; an accessor reports itself rather than
+// the value it returns.
+const surfaceOwn = (value) => Object.getOwnPropertyNames(value).map((name) => {
+  const descriptor = Object.getOwnPropertyDescriptor(value, name);
+  return [name, descriptor.get ? "getter" : typeof descriptor.value,
+    descriptor.enumerable, descriptor.writable ?? null,
+    descriptor.configurable];
+});
 
 let DB;
 let FRESH;
@@ -280,6 +289,42 @@ const routes = {
       selectedChanges: selected.meta.changes,
       selectedChangedDb: selected.meta.changed_db,
     });
+  },
+  // A D1 session's state is private and its bookmark is read through a
+  // method: the database handle and the current bookmark are not own
+  // properties, its public methods keep the arities workerd declares, and a
+  // query advances the bookmark. Workerd implements the session in
+  // TypeScript, so two further facts are left out on purpose: its prototype
+  // also carries that implementation's `_`-prefixed methods, and the bookmark
+  // is the database's own opaque token -- Cello has one primary and its own
+  // token, so both are compared as "advanced", never by value (#251).
+  async "/session"() {
+    const session = DB.withSession("first-primary");
+    const initial = session.getBookmark();
+    const advanced = (bookmark) =>
+      typeof bookmark === "string" && bookmark !== initial;
+    const out = {
+      keys: Object.keys(session),
+      own: surfaceOwn(session),
+      tag: Object.prototype.toString.call(session),
+      initialBookmark: initial,
+      preparedType: typeof session.prepare,
+      preparedLength: session.prepare.length,
+      batchLength: session.batch.length,
+      bookmarkLength: session.getBookmark.length,
+      unconstrained: (() => {
+        const other = DB.withSession("first-unconstrained");
+        return [other.getBookmark(), DB.withSession().getBookmark()];
+      })(),
+    };
+    out.missing = await attempt(async () =>
+      (await session.prepare("SELECT 1 AS v").first()));
+    out.queryAdvanced = advanced(session.getBookmark());
+    out.batchAdvanced = await attempt(async () => {
+      await session.batch([DB.prepare("SELECT 2 AS v")]);
+      return advanced(session.getBookmark());
+    });
+    return report(out);
   },
   // A statement's `meta` on a database nothing has touched yet: the pair of
   // values Cello's own cell file would otherwise report, because Cello

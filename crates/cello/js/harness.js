@@ -587,6 +587,10 @@ const __webidlTag = (ctor, name) =>
 // WebIDL reports an interface's `length` as its number of required arguments;
 // every Fetch interface in workerd defines none. (A class's `prototype` stays
 // non-writable; V8 refuses to redefine it, and no Worker branch depends on it.)
+const __webidlLength = (ctor) =>
+  Object.defineProperty(ctor, "length", {
+    value: 0, configurable: true, writable: false,
+  });
 // A binding's methods are native functions in workerd, and V8 publishes a
 // native function's `length` as the zero parameters its template carries --
 // 0 for every JSG interface, whatever its C++ signature reads out of the
@@ -605,10 +609,6 @@ const __nativeMethodArities = (ctor) => {
     });
   }
 };
-const __webidlLength = (ctor) =>
-  Object.defineProperty(ctor, "length", {
-    value: 0, configurable: true, writable: false,
-  });
 
 // ---- request/response state ------------------------------------------------
 // Every field of a Request or Response lives in a private slot; the runtime's
@@ -2465,20 +2465,12 @@ class SqlCursor {
   }
   [Symbol.iterator]() { return this; }
 }
-// workerd's cursor reports its own interface, and its prototype members are
-// the enumerable ones a Worker walks (#251).
+// workerd's cursor reports its own interface, and every prototype member a
+// Worker can walk is enumerable, as a JSG interface's are (#251).
 Object.defineProperty(SqlCursor.prototype, Symbol.toStringTag, {
   value: "Cursor", configurable: true, writable: true, enumerable: false,
 });
 __webidlPrototype(SqlCursor);
-for (const name of [
-  "next", "toArray", "one", "raw", "columnNames", "rowsRead", "rowsWritten",
-]) {
-  const descriptor = Object.getOwnPropertyDescriptor(SqlCursor.prototype, name);
-  if (descriptor === undefined) continue;
-  delete SqlCursor.prototype[name];
-  Object.defineProperty(SqlCursor.prototype, name, descriptor);
-}
 // The cell the SQL storage speaks for, for the runtime's own code (the D1
 // cell runs its ops against it). A private slot has no reader outside the
 // class, and a static block is the one place that may hand one out (#251).
@@ -2574,14 +2566,23 @@ class SqlStorage {
   }
 }
 // workerd's SqlStorage surface is `exec`, the `databaseSize` getter and two
-// nested constructors a cursor reports; Cello's own seams -- a bound
-// `prepare`, the multi-statement `ingest` and the fault hooks -- are not part
-// of it, so they exist only on a node booted with CELLO_TEST_WAIT=1, like
-// every other test seam (#231, #251).
+// nested constructors (`Cursor` for the cursor `exec` answers, `Statement` for
+// the prepared form); Cello's own seams -- a bound `prepare`, the
+// multi-statement `ingest` and the fault hooks -- are not part of it, so they
+// exist only on a node booted with CELLO_TEST_WAIT=1, like every other test
+// seam (#231, #251).
 function Cursor() { throw new TypeError("Illegal constructor"); }
+// The nested constructor is the cursor's own prototype, so `exec()`'s result
+// is an instance of it and reports it as `constructor`; only the runtime can
+// build one (#251).
+Cursor.prototype = SqlCursor.prototype;
+Object.defineProperty(SqlCursor.prototype, "constructor", {
+  value: Cursor, configurable: true, writable: true, enumerable: false,
+});
 function Statement() { throw new TypeError("Illegal constructor"); }
 SqlStorage.prototype.Cursor = Cursor;
 SqlStorage.prototype.Statement = Statement;
+__webidlTag(SqlStorage, "SqlStorage");
 __webidlPrototype(SqlStorage);
 if (!__test_wait_enabled()) {
   for (const name of [
@@ -2608,27 +2609,35 @@ function __readStoredValue(scope, key, read) {
     throw contextual;
   }
 }
-class SyncKvListIterator {
+// workerd's listing iterator is its own interface: no own property, `next` on
+// an enumerable prototype, V8's iterator helpers inherited through
+// `Iterator`, and one iterator at a time per storage (#251).
+class ListIterator extends Iterator {
+  #root;
+  #generation;
+  #cursor;
   constructor(root, generation, cursor) {
-    this._root = root;
-    this._generation = generation;
-    this._cursor = cursor;
+    super();
+    this.#root = root;
+    this.#generation = generation;
+    this.#cursor = cursor;
   }
-  [Symbol.iterator]() { return this; }
   next() {
-    if (this._generation !== this._root._syncKvListGeneration) {
+    if (this.#generation !== this.#root._syncKvListGeneration) {
       throw new Error(
         "kv.list() iterator was invalidated because a new call to kv.list() was started. " +
         "Only one kv.list() iterator can exist at a time.",
       );
     }
     const value =
-      __storage_sync_list_next(this._cursor, __storedSentinel);
+      __storage_sync_list_next(this.#cursor, __storedSentinel);
     if (value === null) return { done: true, value: undefined };
     value[1] = __unwrapStored(value[1]);
     return { done: false, value };
   }
 }
+__webidlTag(ListIterator, "ListIterator");
+__webidlPrototype(ListIterator);
 class SyncKvStorage {
   // workerd's own object; its state is private, so a Worker reflecting it sees
   // no property at all (#251).
@@ -2668,11 +2677,14 @@ class SyncKvStorage {
     const cursor = __storage_sync_list_start(
       this.#storage._scope, JSON.stringify(request),
     );
-    return new SyncKvListIterator(
+    return new ListIterator(
       this.#root, generation, cursor,
     );
   }
 }
+__webidlTag(SyncKvStorage, "SyncKvStorage");
+__webidlPrototype(SyncKvStorage);
+__nativeMethodArities(SyncKvStorage);
 // A value as JSG's `kj::String` conversion reads it: V8's ToString, which
 // takes any value but refuses a symbol, because a symbol has no string form.
 // `String(symbol)` would instead answer "Symbol(...)" and let a typo through.
@@ -2745,6 +2757,9 @@ const __noPointInTimeRecovery = () =>
 // Calling `getCurrentBookmark()` is what advances the sequence (a write does
 // not), and `deleteAll()` starts it over, which is what a fixture can observe
 // (#251).
+const __storageBookmark = (sequence) =>
+  "00000000-" + sequence.toString(16).padStart(8, "0") + "-00000000-" +
+  "0".repeat(32);
 // `setHibernatableWebSocketEventTimeout`'s conversion: `undefined` and `null`
 // clear it, any other value is a number (a BigInt keeps V8's own refusal), a
 // non-finite one is "not an integer", a negative one is refused as negative,
@@ -2766,9 +2781,6 @@ const __hibernationTimeout = (value) => {
     throw new Error("Event timeout should not exceed 604800000 ms.");
   return ms === 0 ? null : ms;
 };
-const __storageBookmark = (sequence) =>
-  "00000000-" + sequence.toString(16).padStart(8, "0") + "-00000000-" +
-  "0".repeat(32);
 // The storage guard `SqlStorage` and the synchronous KV view share with the
 // storage class: a static private method is reachable from a static block and
 // from nowhere else, so neither the prototype nor the class object publishes
@@ -3089,18 +3101,6 @@ class DurableObjectStorage {
       transactionControl,
     );
   }
-  rollback() {
-    const control = this._transactionControl;
-    if (!control)
-      throw new TypeError("rollback() must be called on a transaction");
-    if (control.rolledBack) return;
-    DurableObjectStorage.#assertTransactionActive(this, "rollback");
-    // An asynchronous child can still own a nested savepoint. Mark this view
-    // terminal now, but let its runner release the child before it rolls this
-    // layer back.
-    if (control.pending.size === 0) control.rollback();
-    control.rolledBack = true;
-  }
   transactionSync(f) {
     DurableObjectStorage.#assertTransactionActive(this, "transactionSync");
     const root = this._transactionRoot;
@@ -3395,6 +3395,8 @@ class DurableObjectStorage {
 // is the one place that may hand one out (#251).
 let __idClassName;
 let __idScope;
+__webidlTag(DurableObjectStorage, "DurableObjectStorage");
+__webidlPrototype(DurableObjectStorage);
 __nativeMethodArities(DurableObjectStorage);
 class DurableObjectId {
   static {
@@ -3406,18 +3408,24 @@ class DurableObjectId {
   constructor(className, value, name = undefined) {
     this.#className = className;
     this.#value = value;
-    // workerd's own enumerable properties, in its order.
-    this.jurisdiction = undefined;
-    this.name = name;
+    // workerd's own enumerable properties, in its order and read-only: a
+    // Worker reads an id's name and jurisdiction, never writes them (#251).
+    __primDefineProp(this, "jurisdiction", {
+      value: undefined, enumerable: true, configurable: true, writable: false,
+    });
+    __primDefineProp(this, "name", {
+      value: name, enumerable: true, configurable: true, writable: false,
+    });
   }
-  // `String(id)` is the hex identity on workerd, because the interface's tag
-  // is the id itself.
-  get [Symbol.toStringTag]() { return this.#value; }
+  // `String(id)` reads the hex identity through `toString`, and the tag names
+  // the interface, as workerd's does.
   toString() { return this.#value; }
   equals(other) {
     return other instanceof DurableObjectId && other.#value === this.#value;
   }
 }
+__webidlTag(DurableObjectId, "DurableObjectId");
+__webidlPrototype(DurableObjectId);
 __nativeMethodArities(DurableObjectId);
 // Internal to the runtime: workerd has no such global, and a bundle that
 // catches it sees the message and code, not this class.
@@ -4150,6 +4158,12 @@ class DurableObjectState {
     __primDefineProp(this, "_hibernationTimeout", {
       value: null, enumerable: false, configurable: true, writable: true,
     });
+    // `blockConcurrencyWhile` records nested blocks here; defining the slot
+    // up front keeps that bookkeeping off `Object.keys(ctx)` after the first
+    // nested block (#251).
+    __primDefineProp(this, "_nestedBlocks", {
+      value: undefined, enumerable: false, configurable: true, writable: true,
+    });
     const facet = __cell.facetConfigs[scope];
     __primDefineProp(this, "_facetDepth", {
       value: facet?.depth ?? 0,
@@ -4167,7 +4181,9 @@ class DurableObjectState {
         className, separator < 0 ? scope : scope.slice(separator + 1),
         __cell.idNames[scope])
       : typeof facet.id === "string" ? facet.id : new DurableObjectId(...facet.id);
-    this.props = facet?.props;
+    // workerd's `ctx.props` is a plain object even for a class declared
+    // without props; only a facet's own props replace it.
+    this.props = facet?.props ?? {};
     this.exports = __ctxExports();
   }
   blockConcurrencyWhile(f) {
@@ -4470,6 +4486,10 @@ class DurableObjectState {
     __registerWaitUntil(promise);
   }
 }
+// Workerd's interface tag. The state's prototype members stay non-enumerable
+// and carry Cello's host-internal `_` methods for now; that leftover is
+// separate from this issue and recorded in the Durable Objects page (#251).
+__webidlTag(DurableObjectState, "DurableObjectState");
 __nativeMethodArities(DurableObjectState);
 function _instance(scope) {
   let inst = __cell.instances[scope];
@@ -8009,13 +8029,37 @@ function makeNamespace(className) {
 // `fetch` and `connect`, and a `DurableObject` level above it with no member of
 // its own, whose instances carry `name` and `id` as own, enumerable data
 // properties (#251). A method reads its stub's routing through a private slot
-// and throws "Illegal invocation" for any other receiver, so a detached
-// `fetch` is not a capability.
+// and refuses any other receiver with the interface's own message, so a
+// detached `fetch` is not a capability.
 let __stubRoutes;
 const __stubRoute = (receiver) => {
   const route = __stubRoutes.get(receiver);
-  if (route === undefined) throw new TypeError("Illegal invocation");
+  if (route === undefined)
+    throw new TypeError(
+      "Illegal invocation: function called with incorrect `this` reference. " +
+        "See https://developers.cloudflare.com/workers/observability/" +
+        "errors/#illegal-invocation-errors for details.",
+    );
   return route;
+};
+// workerd's `Fetcher.connect(address)` opens a TCP socket the cell reads and
+// writes. The argument converts as a `SocketAddress` or a `host:port` string,
+// with its own two refusals; Cello has no such transport, so a converted
+// address refuses instead of routing a cell RPC that a class with a method
+// named `connect` would answer by accident (#251).
+const __stubConnect = (address) => {
+  if (address === undefined)
+    throw new TypeError(
+      "Failed to execute 'connect' on 'Fetcher': parameter 1 is not of " +
+        "type 'SocketAddress or string'.");
+  const text = String(address);
+  const colon = text.lastIndexOf(":");
+  const port = colon < 0 ? NaN : Number(text.slice(colon + 1));
+  if (!Number.isInteger(port) || port < 0 || port > 65535)
+    throw new TypeError("Specified address is missing port.");
+  throw new Error(
+    "connect() is not implemented in cello: a Durable Object stub has no " +
+      "TCP transport");
 };
 class Fetcher {
   static {
@@ -8025,17 +8069,16 @@ class Fetcher {
     return __stubRoute(this).fetch(arguments[0], arguments[1]);
   }
   connect() {
-    return __stubRoute(this).connect(arguments[0], arguments[1]);
+    // The receiver check comes first, as a native method's does: a detached
+    // `connect` is not a capability either.
+    __stubRoute(this);
+    return __stubConnect(arguments[0]);
   }
 }
-Object.defineProperty(Fetcher.prototype, Symbol.toStringTag, {
-  value: "Fetcher", configurable: true, writable: true, enumerable: false,
-});
+__webidlTag(Fetcher, "Fetcher");
 __webidlPrototype(Fetcher);
-class DurableObjectStub extends Fetcher {}
-Object.defineProperty(DurableObjectStub.prototype, Symbol.toStringTag, {
-  value: "DurableObject", configurable: true, writable: true, enumerable: false,
-});
+class DurableObject extends Fetcher {}
+__webidlTag(DurableObject, "DurableObject");
 // A named class: SDKs sniff bindings by constructor name (workers-rs
 // EnvBinding requires `constructor.name === "DurableObjectNamespace"`).
 class DurableObjectNamespace {
@@ -8087,10 +8130,15 @@ class DurableObjectNamespace {
         ? nm : undefined;
     if (dispatchName !== undefined) __cell.idNames[scope] = dispatchName;
     // Fetch and native RPC use the same host routing/activation seam.
-    // Never expose `.then`: a DO stub is not itself a promise.
-    const target = new DurableObjectStub();
-    target.name = dispatchName;
-    target.id = id;
+    // Never expose `.then`: a DO stub is not itself a promise. `name` and `id`
+    // are own, enumerable and read-only, as workerd's fields are (#251).
+    const target = new DurableObject();
+    __primDefineProp(target, "name", {
+      value: dispatchName, enumerable: true, configurable: true, writable: false,
+    });
+    __primDefineProp(target, "id", {
+      value: id, enumerable: true, configurable: true, writable: false,
+    });
     const abortMarker = "__CELLO_ACTOR_ABORT__:";
     const processExitMarker = "__CELLO_PROCESS_EXIT__:";
     let brokenReason = null;
@@ -8213,18 +8261,14 @@ class DurableObjectNamespace {
         )),
       );
     }});
-    __stubRoutes.set(target, {
-      fetch: doFetch,
-      connect: (address, options) =>
-        invoke(async () => __rpcDes(await __rpc_call(
-          scope, dispatchName ?? null, "connect", __rpcOut([address, options], "host"),
-        ))),
-    });
+    __stubRoutes.set(target, { fetch: doFetch });
     __stubRoutes.set(stub, __stubRoutes.get(target));
     __do_brand_stub(stub, __idClassName(id), id.toString(), dispatchName ?? null);
     return stub;
   }
 }
+__webidlTag(DurableObjectNamespace, "DurableObjectNamespace");
+__webidlPrototype(DurableObjectNamespace);
 __nativeMethodArities(DurableObjectNamespace);
 const __attachResponseRequestCancellation = (
   response,
