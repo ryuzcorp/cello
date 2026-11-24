@@ -38,6 +38,12 @@ export const cases = [
   { name: "compression-close-cancel-no-write", fixture: "streams", path: "/compression-close-cancel?only=no-write" },
   { name: "compression-close-cancel-cancel-first", fixture: "streams", path: "/compression-close-cancel?only=cancel-first" },
   { name: "compression-queued-write-cancel", fixture: "streams", path: "/compression-queued-write-cancel" },
+  // #269: pipeTo onto a taken or closed destination, pipeThrough onto taken sides.
+  { name: "pipe-to-destination-states", fixture: "streams", path: "/pipe-to-destination-states" },
+  { name: "pipe-through-locked", fixture: "streams", path: "/pipe-through-locked" },
+  // #270: close() racing writer.abort(), and empty DecompressionStream closes.
+  { name: "compression-close-abort", fixture: "streams", path: "/compression-close-abort" },
+  { name: "decompression-empty-close", fixture: "streams", path: "/decompression-empty-close" },
   { name: "compression-encoder-chunks", fixture: "streams", path: "/compression-encoder-chunks" },
   { name: "locked-stream-messages", fixture: "streams", path: "/locked-stream-messages" },
   { name: "writable-ready-queued-close", fixture: "streams", path: "/writable-ready-queued-close" },

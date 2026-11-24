@@ -65,9 +65,18 @@ function make(format, decompress, name, missing) {
   // write it already accepted still runs and its push failure is what the
   // stream keeps. The native state is freed by `flush()` (a later close),
   // by the writable's abort, or by the finalizer (#252, #257).
-  const readableCancelled = () =>
-    ts !== undefined &&
-    __cello.$$writableStreamState(ts.writable).cancelled !== null;
+  //
+  // A pending abort drops the output too: the abort owns the readable from
+  // here on, erroring it with the abort reason, so a flush that still runs
+  // must not enqueue into it (nor close it, see the TransformStream close
+  // path) -- otherwise a read would resolve with bytes workerd rejects
+  // with (#270).
+  const readableCancelled = () => {
+    if (ts === undefined) return false;
+    const wst = __cello.$$writableStreamState(ts.writable);
+    return wst.cancelled !== null ||
+      wst.pendingAbort !== null;
+  };
   const transformer = {
     transform(chunk, controller) {
       let out;

@@ -479,11 +479,11 @@ The `tail` and `email` handlers are unavailable.
 - `CompressionStream` and `DecompressionStream` are capped at 128 live
   streams per isolate; Workerd has no such cap. The 129th constructor call
   throws a `RangeError`. Finish or abort streams you no longer use: a
-  readable `cancel()` releases the native stream at once when no write is
-  pending, and otherwise as soon as the writes it arrived behind have
-  settled, so a bare cancel never holds a slot -- but a stream whose
-  writable is left open and never ended is only released by the collector
-  once neither side is reachable.
+  readable `cancel()` never releases the native stream, so that a `close()`
+  which follows still runs its flush -- reporting the member's true end --
+  and the stream is released by that flush, by an `abort()`, or by the
+  collector once neither side is reachable. A stream whose writable is left
+  open and never ended holds its slot until then.
   Their writable side is an internal stream: once it has closed,
   `releaseLock()` is a no-op and the stream stays locked, as on Workerd. A
   readable `cancel()` records its error on the writable instead of erroring
@@ -496,7 +496,10 @@ The `tail` and `email` handlers are unavailable.
   writable is an ordinary abort: it resolves, `writer.closed` rejects with
   the abort reason, and the writable ends in the closed shape
   (`desiredSize` 0, later `write()` and `close()` report the closed stream)
-  instead of the errored one a JS sink gets. A `close()` already queued or
+  instead of the errored one a JS sink gets. An `abort()` racing a queued
+  or in-flight `close()` wins: the close and `closed` reject with the abort
+  reason and the readable errors with it too. A `close()` or `write()` that
+  follows an `abort()` reports the closed stream. A `close()` already queued or
   in flight when the readable is cancelled resolves too: its flush drops the
   output rather than enqueueing it into the cancelled readable and does not
   close that side a second time, and the compressor is released by that
@@ -509,7 +512,9 @@ The `tail` and `email` handlers are unavailable.
   other non-`ArrayBuffer`/`ArrayBufferView` chunk fails the same way. A
   gzip header CRC (FHCRC) is verified, and the trailer's CRC-32 and ISIZE
   are checked by the push that completes each field; a member whose trailer
-  never arrived reports the incomplete-data error on `close()`, and bytes
+  never arrived -- empty or truncated input -- reports the incomplete-data
+  error on `close()` and `closed`, however the close lines up with a
+  readable `cancel()`, while a complete member still closes cleanly; bytes
   after the member report the trailing-bytes error; a `deflate` or
   `deflate-raw` stream reports the same trailing-bytes error for input past
   its end. The encoders write Workerd's bytes: zlib level 7, gzip with
@@ -527,7 +532,10 @@ The `tail` and `email` handlers are unavailable.
   locked stream reports `This WritableStream is currently locked to a
   writer.` or `This ReadableStream is currently locked to a reader.`, in
   `pipeTo`/`pipeThrough` as well (Workerd's `pipeTo` writable message has
-  no trailing period; `pipeThrough`'s does).
+  no trailing period; `pipeThrough`'s does), and cancelling a locked stream
+  reports the reader message too. A `pipeTo` onto a destination a previous
+  pipe already closed is refused up front with `This destination writable
+  stream is closed.`.
 - Byte streams cross isolate boundaries on the same node as part of
   Durable Object RPC, in both directions: a `ReadableStream` your cell
   returns reads chunk by chunk, and a `WritableStream` it returns accepts
