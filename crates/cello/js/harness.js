@@ -8033,7 +8033,7 @@ function makeNamespace(className) {
 // detached `fetch` is not a capability.
 let __stubRoutes;
 const __stubRoute = (receiver) => {
-  const route = __stubRoutes.get(receiver);
+  const route = __weakGet(__stubRoutes, receiver);
   if (route === undefined)
     throw new TypeError(
       "Illegal invocation: function called with incorrect `this` reference. " +
@@ -8063,7 +8063,9 @@ const __stubConnect = (address) => {
 };
 class Fetcher {
   static {
-    __stubRoutes = new WeakMap();
+    // The captured constructor and primitives: a guest that pollutes
+    // `WeakMap.prototype` must not see or steer the stub registry.
+    __stubRoutes = new __primWeakMap();
   }
   fetch() {
     return __stubRoute(this).fetch(arguments[0], arguments[1]);
@@ -8261,8 +8263,9 @@ class DurableObjectNamespace {
         )),
       );
     }});
-    __stubRoutes.set(target, { fetch: doFetch });
-    __stubRoutes.set(stub, __stubRoutes.get(target));
+    const routes = { fetch: doFetch };
+    __weakSet(__stubRoutes, target, routes);
+    __weakSet(__stubRoutes, stub, routes);
     __do_brand_stub(stub, __idClassName(id), id.toString(), dispatchName ?? null);
     return stub;
   }

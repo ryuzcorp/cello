@@ -378,12 +378,19 @@ fn svc_do_stub_conformance() {
         "{two_hop}"
     );
 
-    // D3: mutating `stub.name` sender-side neither changes the marker's
-    // `n` the receiver revives nor breaks the subsequent dispatch.
+    // D3: `stub.name` is read-only, as workerd's field is, so an assignment
+    // throws instead of changing the marker's `n`, and the subsequent
+    // dispatch still reaches the receiver (#251).
     let mutated = get_json(&node, "/mutated-name");
     assert_eq!(mutated["ok"], true, "{mutated}");
     assert_eq!(mutated["result"]["before"], "r7", "{mutated}");
-    assert_eq!(mutated["result"]["afterSend"], "evil", "{mutated}");
+    assert!(
+        mutated["result"]["mutation"]
+            .as_str()
+            .is_some_and(|mutation| mutation.starts_with("TypeError:")),
+        "{mutated}"
+    );
+    assert_eq!(mutated["result"]["afterSend"], "r7", "{mutated}");
     assert_eq!(mutated["result"]["echoName"], "r7", "{mutated}");
     assert_eq!(
         mutated["result"]["pong"], "pong:via-controller",
