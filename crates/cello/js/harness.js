@@ -3566,12 +3566,59 @@ const __blockLeave = (scope, block, event) => {
 };
 const __durableClassMeta = new WeakMap();
 let __nextFacetOwner = 1;
+// workerd's message for a method whose receiver is not what its interface
+// requires, verbatim. One constant: `Fetcher`, a loopback namespace and a
+// service stub all refuse this way, and a second copy is how they drift
+// (#259).
+const __ILLEGAL_INVOCATION =
+  "Illegal invocation: function called with incorrect `this` reference. " +
+  "See https://developers.cloudflare.com/workers/observability/" +
+  "errors/#illegal-invocation-errors for details.";
+const __illegalInvocation = () => new TypeError(__ILLEGAL_INVOCATION);
+// ---- ctx.exports handle interfaces (#259) -----------------------------------
+// workerd gives each handle kind two prototype levels: one holding only an
+// own non-enumerable `constructor` and the interface's tag, over the level
+// carrying the members. A Worker reflects both, so they are reproduced
+// rather than collapsed onto the handle.
+//
+// Built on first use, because the interfaces they sit over --
+// `DurableObjectNamespace` and `__cf.ServiceStub` -- are defined further down
+// this file.
+const __interfaceConstructor = (name) => ({ [name]: function () {
+  throw new TypeError("Illegal constructor");
+} })[name];
+const __interfaceTag = (proto, tag) =>
+  Object.defineProperty(proto, Symbol.toStringTag, {
+    value: tag, configurable: true, writable: true, enumerable: false,
+  });
+let __handlePrototypes;
+const __handleProto = (kind) => (__handlePrototypes ??= (() => {
+  const specialized = __interfaceConstructor("DurableObjectClass");
+  __interfaceTag(specialized.prototype, "DurableObjectClass");
+  const plainClass = __interfaceConstructor("LoopbackDurableObjectClass");
+  Object.setPrototypeOf(plainClass.prototype, specialized.prototype);
+  __interfaceTag(plainClass.prototype, "LoopbackDurableObjectClass");
+  const namespace = __interfaceConstructor("LoopbackDurableObjectNamespace");
+  Object.setPrototypeOf(namespace.prototype, DurableObjectNamespace.prototype);
+  __interfaceTag(namespace.prototype, "LoopbackDurableObjectNamespace");
+  const service = __interfaceConstructor("LoopbackServiceStub");
+  Object.setPrototypeOf(service.prototype, __cf.ServiceStub.prototype);
+  __interfaceTag(service.prototype, "LoopbackServiceStub");
+  return {
+    namespace: namespace.prototype,
+    class: plainClass.prototype,
+    specialized: specialized.prototype,
+    service: service.prototype,
+  };
+})())[kind];
 // Takes encoded props, not the caller's options bag: an options bag reaching
 // here is a bag nothing validated, and reading one key out of it is how every
 // other key came to be dropped in silence. The loader stub validates the bag
 // and encodes its value before it creates the class.
 const __makeDurableObjectClass = (loadPromise, name, propsSc) => {
-  const value = {};
+  // workerd's specialized handle is a `DurableObjectClass` instance: nothing
+  // of its own, and its tag and `constructor` come from that level.
+  const value = Object.create(__handleProto("specialized"));
   __durableClassMeta.set(value, {
     loadPromise,
     name: name === null || name === undefined ? "default" : String(name),
@@ -3579,31 +3626,44 @@ const __makeDurableObjectClass = (loadPromise, name, propsSc) => {
   });
   return value;
 };
-// Loopback classes are callable; a specialized class is only a handle. Capture
-// props now, so later mutation of the caller's options cannot change startup.
-const __makeLoopbackDurableObjectClass = (name) => {
+// Loopback classes are callable; a specialized class is only a handle. The
+// refusals are workerd's own (`callImpl`'s required `Options` dictionary, then
+// the `props` field's conversion): `null` and `undefined` are the empty
+// dictionary as WebIDL converts them, and `props` is read once. Capture props
+// now, so later mutation of the caller's options cannot change startup.
+const __loopbackOptionsRefusal = (kind) => new TypeError(
+  "Failed to execute '(called as function)' on '" + kind +
+  "': parameter 1 is not of type 'Options'.");
+const __loopbackPropsRefusal = () => new TypeError(
+  "Incorrect type for the 'props' field on 'Options': the provided value " +
+  "is not of type 'Object'.");
+const __makeLoopbackDurableObjectClass = (name, kind) => {
   const loadPromise = Promise.resolve({ id: 0 });
   const specialize = (...args) => {
-    const [options] = args;
-    if (args.length === 0)
-      throw new TypeError("DurableObjectClass requires an options argument.");
+    // A missing argument is refused before the dictionary converts, and
+    // calling a loopback handle is the only way it is ever invoked: `new`
+    // reports the same refusal, as workerd's non-constructor function does.
+    if (args.length === 0) throw __loopbackOptionsRefusal(kind);
+    const options = args[0];
     if (options !== undefined && options !== null &&
         typeof options !== "object" && typeof options !== "function")
-      throw new TypeError("DurableObjectClass options must be an object.");
-    const props = options?.props;
+      throw __loopbackOptionsRefusal(kind);
+    const props = options == null ? undefined : options.props;
     if (props !== undefined &&
-        (props === null || (typeof props !== "object" && typeof props !== "function")))
-      throw new TypeError("DurableObjectClass props must be an object.");
+        (props === null ||
+         (typeof props !== "object" && typeof props !== "function")))
+      throw __loopbackPropsRefusal();
     return __makeDurableObjectClass(
       loadPromise, name, __rpcOut(props === undefined ? {} : props, false));
   };
-  // workerd's loopback handles carry no own `name`/`length` and report the
-  // interface's tag, which comes from the prototype there (#259).
+  // workerd's loopback handles carry no own `name`/`length`/`prototype`, and
+  // the interface's tag comes from the prototype level there (#259). The
+  // namespace's callable keeps `Function.prototype`: the handle above it
+  // carries the level a Worker reflects.
   delete specialize.name;
   delete specialize.length;
-  Object.defineProperty(specialize, Symbol.toStringTag, {
-    value: "LoopbackDurableObjectClass", configurable: true,
-  });
+  if (kind === "LoopbackDurableObjectClass")
+    Object.setPrototypeOf(specialize, __handleProto("class"));
   __durableClassMeta.set(specialize, {
     loadPromise, name, propsSc: __rpcOut({}, false),
   });
@@ -3611,42 +3671,29 @@ const __makeLoopbackDurableObjectClass = (name) => {
 };
 // workerd's `ctx.exports` entry for a Durable Object class is its loopback
 // namespace: callable (calling it specializes the class for a facet, as a
-// DurableObjectClass handle does) and carrying the namespace methods. The
-// namespace's own state lives in private slots, so the methods are bound
-// wrappers on one shared prototype whose level and tag are workerd's (#259).
+// DurableObjectClass handle does) and carrying the namespace methods one level
+// down, on `DurableObjectNamespace.prototype` itself -- the same function
+// objects a real namespace answers with, which is why workerd routes either
+// receiver through either method. The namespace's state stays in private
+// slots, so the shared method reads a loopback handle's namespace out of a
+// WeakMap and lets the class's own brand check accept a genuine one (#259).
 let __loopbackNamespaceHandles;
-let __loopbackNamespacePrototype;
-const __loopbackNamespaceProto = () => {
-  if (__loopbackNamespacePrototype !== undefined)
-    return __loopbackNamespacePrototype;
-  const proto = Object.create(DurableObjectNamespace.prototype);
-  Object.defineProperty(proto, Symbol.toStringTag, {
-    value: "LoopbackDurableObjectNamespace", configurable: true,
-  });
-  for (const method of [
-    "get", "getByName", "idFromName", "idFromString", "newUniqueId",
-    "jurisdiction",
-  ]) {
-    Object.defineProperty(proto, method, {
-      value: function (...args) {
-        const namespace = __weakGet(__loopbackNamespaceHandles, this);
-        if (namespace === undefined) throw new TypeError("Illegal invocation");
-        return namespace[method](...args);
-      },
-      enumerable: true, configurable: true, writable: true,
-    });
-  }
-  __loopbackNamespacePrototype = proto;
-  return proto;
+const __loopbackNamespace = (receiver) => {
+  const handles = __loopbackNamespaceHandles;
+  const namespace = handles === undefined ? undefined : __weakGet(handles, receiver);
+  if (namespace !== undefined) return namespace;
+  if (receiver instanceof DurableObjectNamespace) return receiver;
+  throw __illegalInvocation();
 };
 const __makeLoopbackNamespace = (name) => {
   __loopbackNamespaceHandles ??= new __primWeakMap();
   const namespace = __cell.makeNamespace(name);
-  const specialize = __makeLoopbackDurableObjectClass(name);
+  const specialize = __makeLoopbackDurableObjectClass(
+    name, "LoopbackDurableObjectNamespace");
   const handle = (...args) => specialize(...args);
   delete handle.name;
   delete handle.length;
-  Object.setPrototypeOf(handle, __loopbackNamespaceProto());
+  Object.setPrototypeOf(handle, __handleProto("namespace"));
   __weakSet(__loopbackNamespaceHandles, handle, namespace);
   // A facet accepts this handle where it accepts a specialized class.
   __durableClassMeta.set(handle, __durableClassMeta.get(specialize));
@@ -5289,6 +5336,10 @@ __cello.__makeLoader = () => {
   };
 };
 
+// Each service stub's own `fetch`, keyed by the stub a Worker holds: the
+// interface's `fetch` and `connect` live on `ServiceStub.prototype` and read
+// it, so both stub kinds share one implementation surface (#259).
+const __serviceStubFetchers = new __primWeakMap();
 const __makeServiceBinding = __cello.__makeServiceBinding =
   (script, entrypoint = null, propsSc = undefined) => {
   const target = {
@@ -5440,6 +5491,11 @@ const __makeServiceBinding = __cello.__makeServiceBinding =
     return __makeNode(session, [prop], null);
   }});
   __outboundMeta.set(binding, { script, entrypoint, propsSc });
+  // The interface's own `fetch` reads this, so a Worker that reaches the
+  // member through `ServiceStub.prototype` gets the same request as through
+  // the binding itself (#259).
+  __weakSet(__serviceStubFetchers, binding, (input, init) =>
+    target.fetch(input, init));
   return binding;
 };
 
@@ -7665,11 +7721,37 @@ const __makeStub = (entry, callable, rctx = __ctxAdopt()) => {
   __stubMeta.set(stub, meta);
   return stub;
 };
-// A loopback service stub for one of this worker's own
-// entrypoints -- the ctx.exports surface. Calling the stub itself
-// returns a new stub carrying per-instance props, delivered to
-// the class constructor as ctx.props (Workerd's
-// ctx.exports.Name({ props })).
+// workerd's service-stub members live on `ServiceStub.prototype` (tagged
+// `[object Fetcher]`, with `fetch` and `connect`), and a loopback stub gets a
+// `LoopbackServiceStub` level of its own above it. One WeakMap holds each
+// stub's fetch, so the member a Worker reads off the prototype is the one
+// that serves every stub kind, exactly as workerd's shared method does (#259).
+const __serviceStubFetch = Object.defineProperty(function () {
+  const fetch = __weakGet(__serviceStubFetchers, this);
+  if (fetch === undefined) throw __illegalInvocation();
+  return fetch(arguments[0], arguments[1]);
+}, "name", { value: "fetch", configurable: true });
+const __serviceStubConnect = Object.defineProperty(function () {
+  // The receiver check comes first, as a native method's does: a detached
+  // `connect` is not a capability either.
+  if (!__weakHas(__serviceStubFetchers, this)) throw __illegalInvocation();
+  // WebIDL refuses a missing argument before the union converts, and an
+  // explicit `undefined` is the dictionary's required-members refusal, both
+  // as `Fetcher.connect` reports them.
+  if (arguments.length === 0)
+    throw new TypeError(
+      "Failed to execute 'connect' on 'Fetcher': parameter 1 is not of " +
+        "type 'SocketAddress or string'.");
+  __socketAddress(arguments[0]);
+  __socketOptions(arguments[1]);
+  throw new Error(
+    "connect() is not implemented in cello: a service stub has no TCP " +
+      "transport");
+}, "name", { value: "connect", configurable: true });
+// A loopback service stub for one of this worker's own entrypoints -- the
+// ctx.exports surface. Calling the stub itself returns a new stub carrying
+// per-instance props, delivered to the class constructor as ctx.props
+// (Workerd's ctx.exports.Name({ props })).
 const __svcMeta = new WeakMap();
 const __entrypointStub = (name, props) => {
   let inst;
@@ -7689,28 +7771,29 @@ const __entrypointStub = (name, props) => {
   const session = __entrypointSession(name, true, null, makeInst);
   const bare = () => {};
   // workerd's loopback handles carry no own `name`/`length`, and the service
-  // stub reports its own interface's tag (#259).
+  // stub's tag comes from its prototype level (#259).
   delete bare.name;
   delete bare.length;
   const stub = new Proxy(bare, {
-    getPrototypeOf: () => __cf.ServiceStub.prototype,
+    getPrototypeOf: () => __handleProto("service"),
     get: (_b, prop) => {
-      if (prop === Symbol.toStringTag) return "LoopbackServiceStub";
       if (prop === "then") return undefined;
-      if (typeof prop !== "string") return undefined;
+      if (prop === "fetch") return __serviceStubFetch;
+      if (prop === "connect") return __serviceStubConnect;
+      // A symbol read still belongs to the interface: the tag is the level's.
+      if (typeof prop !== "string") return __handleProto("service")[prop];
       if (prop === "getRpcMethodForTestOnly")
         return (n) => __makeNode(session, [String(n)], null);
-      // A Fetcher's fetch() is an HTTP request, as a service binding's is.
-      if (prop === "fetch")
-        return (input, init) => __makeServiceBinding(
-          __cell.script, name === "default" ? null : name,
-          props === undefined ? undefined : __rpcOut(props, false),
-        ).fetch(input, init);
       return __makeNode(session, [prop], null);
     },
     apply: (_b, _this, args) =>
       __entrypointStub(name, args[0]?.props),
   });
+  // A Fetcher's fetch() is an HTTP request, as a service binding's is.
+  __weakSet(__serviceStubFetchers, stub, (input, init) => __makeServiceBinding(
+    __cell.script, name === "default" ? null : name,
+    props === undefined ? undefined : __rpcOut(props, false),
+  ).fetch(input, init));
   __svcMeta.set(stub, { name, props });
   __outboundMeta.set(stub, {
     script: __cell.script,
@@ -7924,9 +8007,14 @@ const __ctxExports = () => __ctxExportsCache ??= (() => {
   // namespace handle; one without is a loopback class handle.
   const actor = (name) => Object.hasOwn(__cell.namespaceKeys, name)
     ? __makeLoopbackNamespace(name)
-    : __makeLoopbackDurableObjectClass(name);
+    : __makeLoopbackDurableObjectClass(name, "LoopbackDurableObjectClass");
+  // A runtime-supplied class is never a Worker's export, whatever registered
+  // it: the host injects the exact list -- `deploy::is_reserved_class`'s four
+  // fleet classes plus this script's workflow alias, which nothing here could
+  // name by shape without a second copy of that rule (#259).
+  const reserved = (name) => __cell.reservedClasses.includes(name);
   for (const name of Object.keys(__cell.doExports)) {
-    if (__runtimeClasses.has(name)) continue;
+    if (reserved(name)) continue;
     out[name] = actor(name);
   }
   // Every other export is one too: workerd treats a class that inherits no
@@ -7934,7 +8022,7 @@ const __ctxExports = () => __ctxExportsCache ??= (() => {
   // plain function export is a handler, both of which reach `ctx.exports`
   // (#259).
   for (const name of Object.keys(__cell.classes)) {
-    if (__runtimeClasses.has(name) || Object.hasOwn(out, name)) continue;
+    if (reserved(name) || Object.hasOwn(out, name)) continue;
     // A module export name cannot begin with a dot, so the reserved `.cron`
     // cell is the runtime's, never a handle.
     if (name.startsWith(".")) continue;
@@ -8181,12 +8269,7 @@ function makeNamespace(className) {
 let __stubRoutes;
 const __stubRoute = (receiver) => {
   const route = __weakGet(__stubRoutes, receiver);
-  if (route === undefined)
-    throw new TypeError(
-      "Illegal invocation: function called with incorrect `this` reference. " +
-        "See https://developers.cloudflare.com/workers/observability/" +
-        "errors/#illegal-invocation-errors for details.",
-    );
+  if (route === undefined) throw __illegalInvocation();
   return route;
 };
 // workerd's `Fetcher.connect(address)` opens a TCP socket the cell reads and
@@ -8538,8 +8621,28 @@ class DurableObjectNamespace {
   }
 }
 __webidlTag(DurableObjectNamespace, "DurableObjectNamespace");
-__webidlPrototype(DurableObjectNamespace);
-__nativeMethodArities(DurableObjectNamespace);
+// One set of six functions, shared by a real namespace and a loopback handle
+// whose own level sits directly above this one -- which is what makes
+// workerd's `namespace.get === exports.Name.get` true and lets either
+// receiver call either method (#259). Each wrapper resolves the receiver to
+// the namespace behind it, refusing anything else with the interface's own
+// message before the class's own method -- and its private slots -- is
+// reached. `idFromName` first, the class body's definition order, which the
+// reflection a Worker reads keeps.
+for (const name of ["idFromName", "idFromString", "newUniqueId",
+  "jurisdiction", "getByName", "get"]) {
+  const impl = DurableObjectNamespace.prototype[name];
+  const wrapper = { [name]: function () {
+    const namespace = __loopbackNamespace(this);
+    const result = __primReflectApply(impl, namespace, arguments);
+    // `jurisdiction()` answers its own receiver, so a loopback handle gets
+    // the handle back rather than the namespace behind it.
+    return result === namespace ? this : result;
+  } }[name];
+  Object.defineProperty(DurableObjectNamespace.prototype, name, {
+    value: wrapper, enumerable: true, configurable: true, writable: true,
+  });
+}
 const __attachResponseRequestCancellation = (
   response,
   requestController,
@@ -9677,12 +9780,11 @@ const __cell = __cello.__cell = {
 // A class the runtime supplies. RPC on a stub needs `extends DurableObject`
 // or the js_rpc flag; the class is the runtime's own, so grant it here rather
 // than make every user set a flag. It is not the application's export, so it
-// stays out of ctx.exports.
-const __runtimeClasses = new Set();
+// stays out of ctx.exports -- which asks the host's reserved list rather than
+// keeping a second copy of it (#259).
 const __runtimeClass = (name, cls) => {
   __cell.classes[name] = cls;
   __cell.doExports[name] = true;
-  __runtimeClasses.add(name);
 };
 // ---- KV ------------------------------------------------------------------
 // The namespace cell and the binding's client are `services/kv.js`, which the
@@ -13635,6 +13737,18 @@ const __cf = __cello.__cf = {
   exports: {},
   get env() { return __cell.env; },
 };
+// workerd's service stub is a `Fetcher` whose members sit on its own level,
+// and the interface's constructor is `ServiceStub`: the tag, `fetch` and
+// `connect` go on the prototype rather than on each stub proxy, so a loopback
+// stub's extra level can sit above exactly that shape (#259).
+__interfaceTag(__cf.ServiceStub.prototype, "Fetcher");
+Object.defineProperty(__cf.ServiceStub.prototype, "fetch", {
+  value: __serviceStubFetch, enumerable: true, configurable: true, writable: true,
+});
+Object.defineProperty(__cf.ServiceStub.prototype, "connect", {
+  value: __serviceStubConnect, enumerable: true, configurable: true,
+  writable: true,
+});
 // Proxy standing in for unsupported node:*/cloudflare:* builtins. Property
 // walks stay inert -- real bundles reference these at module scope, and
 // evaluation must not crash on a builtin the fetch path never exercises --

@@ -892,6 +892,40 @@ export class Probe {
         const state = this.state;
         const exports = state.exports;
         const names = Object.keys(exports).sort();
+        // Each handle kind keeps workerd's two prototype levels: one holding
+        // only an own `constructor` and the interface's tag, over the level
+        // carrying the members. Both are reflected here, with each member's
+        // enumerability, because that is what a Worker reads.
+        //
+        // One name is deliberately left out: workerd names the service stub's
+        // `Fetcher` level from whichever of its `Fetcher`/`ServiceStub`
+        // interfaces the isolate instantiates first, so this deployment's D1
+        // binding makes it `Fetcher` here and a deployment without one reports
+        // `ServiceStub` (measured on 1.20261121.1, same class otherwise). Only
+        // that level's descriptor is compared; its tag is the stable identity.
+        const chain = (value) => {
+          const out = [];
+          for (let proto = Object.getPrototypeOf(value);
+               proto !== null && proto !== Object.prototype;
+               proto = Object.getPrototypeOf(proto)) {
+            const tag = Object.prototype.toString.call(proto);
+            const ctor = Object.getOwnPropertyDescriptor(proto, "constructor");
+            out.push({
+              tag,
+              ctor: ctor
+                ? [tag === "[object Fetcher]" ? null : ctor.value?.name ?? null,
+                  ctor.enumerable]
+                : null,
+              own: Object.getOwnPropertyNames(proto).sort().map((name) => {
+                const descriptor = Object.getOwnPropertyDescriptor(proto, name);
+                return [name, descriptor.get ? "getter" : typeof descriptor.value,
+                  descriptor.enumerable, descriptor.writable ?? null,
+                  descriptor.configurable];
+              }),
+            });
+          }
+          return out;
+        };
         const entry = (name) => {
           const value = exports[name];
           return {
@@ -899,6 +933,7 @@ export class Probe {
             keys: Object.keys(value),
             own: Object.getOwnPropertyNames(value).sort(),
             tag: Object.prototype.toString.call(value),
+            chain: chain(value),
             get: typeof value?.get,
             idFromName: typeof value?.idFromName,
             fetch: typeof value?.fetch,
@@ -932,8 +967,46 @@ export class Probe {
         });
         out.specialize = await attempt(() => {
           const specialized = exports.Probe({ props: { a: 1 } });
-          return [typeof specialized, Object.getOwnPropertyNames(specialized).sort()];
+          return [typeof specialized, Object.getOwnPropertyNames(specialized).sort(),
+            Object.prototype.toString.call(specialized),
+            specialized.constructor?.name ?? null, chain(specialized)];
         });
+        // A loopback class handle specializes the same way, without a
+        // namespace behind it.
+        out.classSpecialize = await attempt(() => {
+          const specialized = exports.NoNamespace({ props: { a: 1 } });
+          return [typeof specialized, Object.prototype.toString.call(specialized),
+            specialized.constructor?.name ?? null];
+        });
+        // Calling a handle converts workerd's required `Options` dictionary:
+        // a missing or non-object argument is the interface's own refusal,
+        // `null` and `undefined` are the empty dictionary, and the `props`
+        // field has its own refusal. A loopback class handle names itself in
+        // both.
+        const refusal = (fn) => attempt(fn);
+        out.calls = {
+          noArgs: await refusal(() => exports.Probe()),
+          number: await refusal(() => exports.Probe(5)),
+          badProps: await refusal(() => exports.Probe({ props: 5 })),
+          nullArg: await refusal(() => typeof exports.Probe(null)),
+          undefinedArg: await refusal(() => typeof exports.Probe(undefined)),
+          classNoArgs: await refusal(() => exports.NoNamespace()),
+          classNumber: await refusal(() => exports.NoNamespace(5)),
+          classBadProps: await refusal(() => exports.NoNamespace({ props: 5 })),
+          handlerNoArgs: await refusal(() => exports.helper()),
+          handlerBadProps: await refusal(() => exports.helper({ props: 5 })),
+        };
+        // A namespace method reached off its handle is not a capability of
+        // its own, and refuses with workerd's full message.
+        out.detached = {};
+        for (const name of ["get", "getByName", "idFromName", "idFromString",
+          "newUniqueId", "jurisdiction"]) {
+          const method = exports.Probe[name];
+          out.detached[name] = [
+            await refusal(() => method.call({})),
+            await refusal(() => method()),
+          ];
+        }
         return report(out);
       },
       async "/transaction"() {
@@ -1013,6 +1086,20 @@ export class Probe {
       return new Response(JSON.stringify(canonical({ uncaught: errorInfo(error) })), { status: 500 });
     }
   }
+}
+
+// #259: an exported class the config declares no namespace for, and a plain
+// function export. workerd reads both as `ctx.exports` handles: a loopback
+// class handle and, for the function, the same (it is a handler with no
+// entrypoint base). Neither is a Durable Object binding.
+export class NoNamespace {
+  async fetch() {
+    return new Response("no namespace", { status: 404 });
+  }
+}
+
+export function helper() {
+  return "helper";
 }
 
 const routes = {

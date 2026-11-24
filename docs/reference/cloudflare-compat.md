@@ -350,8 +350,28 @@ the union of the main module's and every sibling's imports.
   the class for a facet); a class with no namespace is a callable
   `[object LoopbackDurableObjectClass]`; and a plain handler is an
   `[object LoopbackServiceStub]` whose `fetch` reaches that entrypoint. A
-  handle carries no own `name`, `length` or `prototype`. A non-function,
-  non-object export fails the deployment's load, as it does on workerd.
+  handle carries no own `name`, `length` or `prototype`.
+- Each handle keeps workerd's prototype levels: one holding only an own
+  non-enumerable `constructor` and the interface's tag, over the level that
+  carries the members -- `DurableObjectNamespace.prototype` for a namespace
+  (the same function objects `env.NS` answers with, so `handle.get` and
+  `env.NS.get` are one function and either receiver works), a
+  `Fetcher`-tagged `ServiceStub.prototype` holding `fetch` and `connect` for
+  a service stub, and `DurableObjectClass.prototype` for a class handle and
+  for the object a handle specializes into. The runtime's own classes and
+  the script-scoped workflow alias (`__Workflow.<script>`) are never handles:
+  `ctx.exports` asks the host for its reserved-class list rather than
+  guessing from the name.
+- Cello is stricter than workerd in one place: an ID minted by another class
+  is refused rather than resolved. `exports.Probe.get(exports.Thrower.idFromName("x"))`
+  throws `Durable Object ID is not valid for this namespace`, and so does
+  `env.NS.get(otherClassId)`; workerd accepts either, since its ID carries no
+  class. The same rule on both paths means a Worker cannot reach a class it
+  was not given an ID for, which matters because a cell's whole surface is an
+  operator protocol. Everything else about a handle follows workerd: the
+  interface's refusals, the tags, the prototype levels, and the specialized
+  class handle. A non-function, non-object export fails the deployment's
+  load, as it does on workerd.
 
 ### [Handlers](https://developers.cloudflare.com/workers/runtime-apis/handlers/)
 
