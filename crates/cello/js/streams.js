@@ -989,6 +989,11 @@ class ReadableStream {
     // The pipe's own close failure on source-done (#272): the closed
     // watcher below turns it into the pipe's rejection.
     let closeError;
+    // Writes that ran to completion. A destination that errors before the
+    // pipe completed any write -- piping onto an already-errored
+    // destination, for example -- rejects with the destination's error
+    // instead of fulfilling (#269).
+    let writesCompleted = 0;
     return new Promise((resolve, reject) => {
       let abortListener;
       if (signal) {
@@ -1083,8 +1088,10 @@ class ReadableStream {
           shutdownWith(closeError, false, !preventCancel);
         else if (writeError !== undefined)
           shutdownWithWrite(we, writeError, !preventCancel);
-        else
+        else if (writesCompleted > 0)
           shutdownFulfill(we, !preventCancel);
+        else
+          shutdownWith(we, false, !preventCancel);
       });
       function waitForReady() {
         if (shuttingDown) return;
@@ -1113,7 +1120,7 @@ class ReadableStream {
           // failure is recorded, so the pipe reports the write that the
           // destination failed first.
           const writeP = writer.write(value).then(
-            () => {},
+            () => { writesCompleted += 1; },
             e => { if (writeError === undefined) writeError = e; });
           currentWrite = writeP;
           writeP.then(() => {
