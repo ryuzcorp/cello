@@ -8093,8 +8093,9 @@ const __socketAddress = (address) => {
       "Cannot initialize SocketAddress with required members from an " +
         "undefined or null value.");
   if (typeof address === "object" || typeof address === "function") {
-    const hostname = address.hostname === undefined
-      ? "" : __jsString(address.hostname);
+    // One read per member, in workerd's order, so a getter runs once.
+    const rawHost = address.hostname;
+    const hostname = rawHost === undefined ? "" : __jsString(rawHost);
     const raw = address.port;
     if (typeof raw === "bigint")
       throw new TypeError("Cannot convert a BigInt value to a number");
@@ -8128,8 +8129,9 @@ const __socketAddress = (address) => {
 };
 // workerd's `SocketOptions` conversion: a primitive is the WebIDL refusal and
 // `null` or an object is the dictionary, whose unknown members are ignored.
-// The members only reach the transport, except `secureTransport`, whose three
-// names the transport validates before it dials (#251).
+// Members are read and converted in workerd's order (`secureTransport`,
+// `allowHalfOpen`, `highWaterMark`) before the transport checks
+// `secureTransport`'s three names (#251).
 const __socketOptions = (options) => {
   if (options === undefined) return;
   if (options === null)
@@ -8141,9 +8143,35 @@ const __socketOptions = (options) => {
       "Failed to execute 'connect' on 'Fetcher': parameter 2 is not of " +
         "type 'SocketOptions'.");
   const secure = options.secureTransport;
-  if (secure === undefined) return;
-  const name = __jsString(secure);
-  if (name !== "off" && name !== "starttls" && name !== "on")
+  const name = secure === undefined ? undefined : __jsString(secure);
+  void options.allowHalfOpen;
+  const highWaterMark = options.highWaterMark;
+  if (highWaterMark !== undefined) {
+    // A `uint64_t`: a BigInt must fit losslessly, and any negative number,
+    // a fraction above -1 included, is refused before truncation.
+    if (typeof highWaterMark === "bigint") {
+      if (highWaterMark < 0n || highWaterMark >= 2n ** 64n)
+        throw new TypeError(
+          "The value cannot be converted because it is either negative and " +
+            "this API expects a positive bigint, or the value would be " +
+            "truncated.");
+    } else {
+      const number = Number(highWaterMark);
+      if (!Number.isFinite(number))
+        throw new TypeError(
+          "The value cannot be converted because it is not an integer.");
+      if (number < 0)
+        throw new TypeError(
+          "The value cannot be converted because it is negative and this " +
+            "API expects a positive bigint.");
+      if (number >= 2 ** 64)
+        throw new TypeError(
+          "Value out of range. Must be less than or equal to " +
+            "18446744073709551615.");
+    }
+  }
+  if (name !== undefined && name !== "off" && name !== "starttls" &&
+      name !== "on")
     throw new TypeError(
       "Unsupported value in secureTransport socket option: " + name);
 };

@@ -988,6 +988,17 @@ const routes = {
       functionArg: () => 1,
     })) out["connect:object:" + name] = await connect(value);
     out.connectSymbol = await connect(Symbol("s"));
+    // Each member is read once, in workerd's order, so a getter's reads show.
+    const reads = [];
+    let hostReads = 0;
+    out.connectGetterHost = await connect({
+      get hostname() {
+        reads.push("hostname");
+        return ++hostReads === 1 ? "127.0.0.1" : "bad host";
+      },
+      get port() { reads.push("port"); return 80; },
+    });
+    out.connectGetterReads = reads.join(",");
     // The options dictionary converts too: a primitive is the WebIDL refusal,
     // an object is a dictionary whose unknown members are ignored, and only
     // `secureTransport` has values the transport validates.
@@ -1010,6 +1021,23 @@ const routes = {
     out.connectOptionsSecureOff = await connectOptions({ secureTransport: "off" });
     out.connectOptionsHalfOpen = await connectOptions({ allowHalfOpen: "yes" });
     out.connectOptionsHighWater = await connectOptions({ highWaterMark: "9" });
+    for (const [name, value] of Object.entries({
+      nan: NaN, object: {}, negative: -1, symbol: Symbol("h"), bigint: 9n,
+      infinite: Infinity, fraction: 1.5, nullValue: null, big: 2 ** 31,
+      negativeFraction: -0.5, negativeBigint: -1n, hugeBigint: 2n ** 70n,
+      negativeZero: -0, maxBigint: 2n ** 64n - 1n, edgeBigint: 2n ** 64n,
+      hugeNumber: 2 ** 70, edgeNumber: 2 ** 64, belowEdgeNumber: 2 ** 63,
+    })) {
+      out["connectOptionsHighWater:" + name] =
+        await connectOptions({ highWaterMark: value });
+    }
+    const optionReads = [];
+    out.connectOptionsOrder = await connectOptions({
+      get secureTransport() { optionReads.push("secureTransport"); return "bogus"; },
+      get allowHalfOpen() { optionReads.push("allowHalfOpen"); return true; },
+      get highWaterMark() { optionReads.push("highWaterMark"); return NaN; },
+    });
+    out.connectOptionsReads = optionReads.join(",");
     return report(out);
   },
   async "/stub-errors"() {
