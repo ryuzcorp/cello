@@ -366,6 +366,7 @@ dependencies = [
 name = "cello"
 version = "0.2.9"
 dependencies = [
+ "adler2",
  "aes",
  "aes-gcm",
  "anyhow",

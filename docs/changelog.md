@@ -206,6 +206,27 @@ workerd 1.20261121.1).
   `releaseLock()` on a compression writable that has already closed is a
   no-op, as on workerd's internal streams: the stream stays locked and
   `desiredSize` stays 0. The differential gate gained nine cases.
+- **The remaining stream leftovers match workerd** (#245).
+  `CompressionStream` now writes workerd's bytes: zlib level 7 (its output is
+  bit-identical to the encoder workerd embeds), a gzip header with mtime 0,
+  XFL 0 and the OS byte 3, and a `deflate` stream whose zlib header is
+  `78 9c` even though the body is level 7. flate2 runs on the `zlib-rs`
+  backend instead of `miniz_oxide`, whose deflate stream differs, and the
+  encoder settings and framing are pinned by a Rust test. A gzip member's
+  `FNAME` field behaves as workerd's: a terminated name is a valid member,
+  a name whose NUL only appears inside the body fails that push with
+  "Decompression failed.", and a name that never terminates waits and
+  reports the incomplete-data error on `close()`. A locked stream names its
+  interface and holder (`This WritableStream is currently locked to a
+  writer.`, `This ReadableStream is currently locked to a reader.`), in
+  `pipeTo`/`pipeThrough` too — including workerd's period-less writable
+  text in `pipeTo`. `releaseLock()` keeps the dispatched write's size in the
+  queue total, so a fresh writer's `desiredSize` and `ready` still see that
+  reservation, and `ready` follows backpressure alone: it stays pending
+  behind a queued close while the stream is over its high-water mark and
+  resolves when the close lands. Bytes past a `deflate` or `deflate-raw`
+  stream now report "Trailing bytes after end of compressed data" rather
+  than a generic failure. The differential gate gained five cases.
 
 ## v0.2.9
 

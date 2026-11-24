@@ -802,6 +802,170 @@ const routes = {
     return report({ write: await write, cancel: await cancel, closed: await closed });
   },
 
+  async "/locked-stream-messages"() {
+    // Issue #245: workerd names the interface and the holder when a stream
+    // is already locked.
+    const out = {};
+    const writable = new WritableStream({});
+    writable.getWriter();
+    out.lockedWriter = attempt(() => writable.getWriter());
+    const compress = new CompressionStream("gzip");
+    const compressWriter = compress.writable.getWriter();
+    out.lockedCompression = attempt(() => compress.writable.getWriter());
+    compressWriter.releaseLock();
+    out.compressionReacquired = (() => {
+      try { return typeof compress.writable.getWriter(); } catch (error) { return errorInfo(error); }
+    })();
+    compress.readable.cancel("done").catch(() => {});
+    const readable = new ReadableStream({});
+    readable.getReader();
+    out.lockedReader = attempt(() => readable.getReader());
+    // pipeTo rejects and pipeThrough throws; workerd's writable text has no
+    // trailing period in pipeTo but does in pipeThrough.
+    out.pipeToLockedSource = await readable.pipeTo(new WritableStream({})).then(() => "ok", errorInfo);
+    const lockedDestination = new WritableStream({});
+    lockedDestination.getWriter();
+    out.pipeToLockedDestination = await new ReadableStream({ start: (controller) => controller.close() })
+      .pipeTo(lockedDestination).then(() => "ok", errorInfo);
+    const throughSource = new ReadableStream({});
+    throughSource.getReader();
+    out.pipeThroughLockedSource = attempt(() => {
+      throughSource.pipeThrough(new TransformStream());
+      return "ok";
+    });
+    const lockedTransform = new TransformStream();
+    lockedTransform.writable.getWriter();
+    out.pipeThroughLockedWritable = attempt(() => {
+      new ReadableStream({ start: (controller) => controller.close() }).pipeThrough(lockedTransform);
+      return "ok";
+    });
+    return report(out);
+  },
+
+  async "/writable-ready-queued-close"() {
+    // Issue #245: a release leaves the dispatched write's size in the queue,
+    // and a queued close does not resolve a fresh writer's ready while the
+    // stream is over its high-water mark. Workerd resolves it when the close
+    // lands.
+    let releaseWrite, releaseClose;
+    const ws = new WritableStream({
+      write() { return new Promise((resolve) => (releaseWrite = resolve)); },
+      close() { return new Promise((resolve) => (releaseClose = resolve)); },
+    }, { highWaterMark: 1 });
+    const writer = ws.getWriter();
+    const write = writer.write("a").then(() => "ok", errorInfo);
+    for (let index = 0; index < 4; index += 1) await null;
+    const close = writer.close().then(() => "ok", errorInfo);
+    const released = writer.desiredSize;
+    writer.releaseLock();
+    const next = ws.getWriter();
+    let ready = "pending";
+    next.ready.then(() => (ready = "resolved"), (error) => (ready = `rejected ${errorInfo(error).message}`));
+    for (let index = 0; index < 4; index += 1) await null;
+    const out = { released, atRelease: { ready, desiredSize: next.desiredSize } };
+    releaseWrite();
+    out.write = await write;
+    for (let index = 0; index < 4; index += 1) await null;
+    out.afterWrite = { ready, desiredSize: next.desiredSize };
+    releaseClose();
+    out.close = await close;
+    for (let index = 0; index < 4; index += 1) await null;
+    out.afterClose = { ready, desiredSize: next.desiredSize, locked: ws.locked };
+    return report(out);
+  },
+
+  async "/compression-encoder-bytes"() {
+    // Issue #245: workerd's gzip/deflate bytes are zlib's level 7 with mtime
+    // 0 and OS 3, and the deflate stream's header is 78 9c (FLEVEL 2) even
+    // though the body is level 7. The chunked case is the one that splits a
+    // write inside flate2's 32 KiB output buffer, where the Adler-32 must
+    // count only the bytes the encoder consumed.
+    const payload = encoder.encode("the quick brown fox jumps over the lazy dog. ".repeat(50));
+    const hex = (bytes) => [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+    const out = {};
+    for (const format of ["gzip", "deflate", "deflate-raw"]) {
+      out[format] = hex(new Uint8Array(await new Response(new Response(payload).body.pipeThrough(new CompressionStream(format))).arrayBuffer()));
+    }
+    const random = new Uint8Array(100 * 1024);
+    let state = 123456789;
+    for (let index = 0; index < random.length; index += 1) {
+      state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+      random[index] = (state >>> 24) & 0xff;
+    }
+    const stream = new CompressionStream("deflate");
+    const writer = stream.writable.getWriter();
+    const read = readAll(stream.readable);
+    for (let offset = 0; offset < random.length; offset += 65536) {
+      await writer.write(random.subarray(offset, offset + 65536));
+    }
+    await writer.close();
+    const parts = await read;
+    const total = parts.reduce((sum, part) => sum + part.byteLength, 0);
+    const joined = new Uint8Array(total);
+    let at = 0;
+    for (const part of parts) { joined.set(part, at); at += part.byteLength; }
+    out.deflateChunked64k = hex(joined);
+    out.deflateChunkedLength = total;
+    return report(out);
+  },
+
+  async "/gzip-member-names"() {
+    // Issue #245: the header's optional FNAME field. A terminated name is a
+    // valid member; a name whose NUL only appears inside the body re-aligns
+    // the parse and fails that push; a name that never terminates waits and
+    // reports incomplete data at close.
+    const header = (flags) => [0x1f, 0x8b, 8, flags, 0, 0, 0, 0, 0, 0xff];
+    const decoder = new TextDecoder();
+    const through = async (pieces) => {
+      const stream = new DecompressionStream("gzip");
+      const writer = stream.writable.getWriter();
+      const read = new Response(stream.readable).arrayBuffer()
+        .then((buffer) => `ok ${decoder.decode(buffer)}`, errorInfo);
+      const writes = [];
+      for (const piece of pieces) writes.push(await writer.write(piece).then(() => "ok", errorInfo));
+      return { writes, close: await writer.close().then(() => "ok", errorInfo), read: await read };
+    };
+    const payload = encoder.encode("fname payload");
+    const body = await rawDeflate(payload);
+    const trailer = new Uint8Array(new Uint32Array([crc32(payload), payload.length]).buffer);
+    const name = new Uint8Array(4096).fill(0x61);
+    // A stored deflate block of 64 "a"s, built by hand so both runtimes see
+    // the same bytes: its LEN high byte is the first NUL after a short name.
+    const stored = new Uint8Array([0x01, 0x40, 0x00, 0xbf, 0xff, ...new Uint8Array(64).fill(0x61)]);
+    return report({
+      terminated: await through([new Uint8Array([...header(8), ...name, 0x00, ...body, ...trailer])]),
+      terminatedNoTrailer: await through([new Uint8Array([...header(8), ...name, 0x00, ...body])]),
+      nameIntoBody: await through([new Uint8Array([...header(8), 0x61, 0x62, 0x63, ...stored])]),
+      unterminated: await through([new Uint8Array([...header(8), ...name])]),
+      unterminatedSplit: await through([new Uint8Array([...header(8), ...name.slice(0, 2048)]), name.slice(2048)]),
+    });
+  },
+
+  async "/compression-trailing-bytes"() {
+    // Issue #245 review: bytes past the end of a deflate or deflate-raw
+    // stream are their own error, whichever push carries them.
+    const payload = encoder.encode("trailing payload trailing payload");
+    const out = {};
+    for (const format of ["deflate", "deflate-raw"]) {
+      const packed = new Uint8Array(await new Response(new Response(payload).body.pipeThrough(new CompressionStream(format))).arrayBuffer());
+      const feed = async (pieces) => {
+        const stream = new DecompressionStream(format);
+        const writer = stream.writable.getWriter();
+        const read = new Response(stream.readable).arrayBuffer().then((buffer) => `ok ${buffer.byteLength}`, errorInfo);
+        const writes = [];
+        for (const piece of pieces) writes.push(await writer.write(piece).then(() => "ok", errorInfo));
+        return { writes, close: await writer.close().then(() => "ok", errorInfo), read: await read };
+      };
+      out[format] = {
+        samePush: await feed([new Uint8Array([...packed, 1, 2, 3])]),
+        later: await feed([packed, new Uint8Array([1, 2, 3])]),
+        secondStream: await feed([new Uint8Array([...packed, ...packed])]),
+        clean: await feed([packed]),
+      };
+    }
+    return report(out);
+  },
+
   async "/writable-backpressure"() {
     const order = [];
     let release;

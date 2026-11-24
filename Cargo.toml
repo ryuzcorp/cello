@@ -71,7 +71,11 @@ encoding_rs = "0.8"
 # Land maintains fastwebsockets, so cello carries that risk knowingly; the
 # version is exact to keep the upgrade a decision rather than a surprise.
 fastwebsockets = { version = "=0.8.1", default-features = false, features = ["upgrade", "with_axum", "unstable-split"] }
-flate2 = "1"
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+# Adler-32 for the zlib framing the `deflate` stream writes; the rolling
+# implementation is the one miniz_oxide already brings into the build, and
+# the per-byte modulo loop it replaces doubled `deflate` encode time.
+adler2 = "2"
 # Brotli, for CompressionStream/DecompressionStream("brotli"). Pure Rust, and
 # it already reaches the build through nothing else, so the lock gains one
 # dependency edge (the crate and its decompressor).
