@@ -501,7 +501,7 @@ The `tail` and `email` handlers are unavailable.
   readable `cancel()` records its error on the writable instead of erroring
   it, so every write it already accepted still runs -- a queued one
   included, and a failed push is the error the stream keeps -- and a write
-  accepted afterwards fails with the closed-stream error. A pending `read()`
+  accepted afterwards fails with the cancel reason. A pending `read()`
   rejects with an `Error` built from the cancel reason, and it settles after
   the isolate's microtask drain, so a `cancel()` or `abort()` in the same
   turn as the producing write wins over the chunk. `abort()` on that
@@ -524,7 +524,8 @@ The `tail` and `email` handlers are unavailable.
   `deflate-raw` and `brotli` stay silent until `close()` -- as Workerd does,
   so chunk boundaries match too, not only the bytes. A
   string chunk is UTF-8 encoded and `undefined` is an empty chunk; any
-  other non-`ArrayBuffer`/`ArrayBufferView` chunk fails the same way. A
+  other non-`ArrayBuffer`/`ArrayBufferView` chunk rejects only that write
+  with a `TypeError`, leaving both sides usable. A
   gzip header CRC (FHCRC) is verified, and the trailer's CRC-32 and ISIZE
   are checked by the push that completes each field; a member whose trailer
   never arrived -- empty or truncated input -- reports the incomplete-data
