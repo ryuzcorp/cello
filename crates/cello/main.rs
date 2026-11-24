@@ -1521,7 +1521,30 @@ async fn dispatch_rpc_call(app: AppHandle, call: RpcCallReq) {
                                 .await
                         })
                         .await;
-                    return Ok(completed.result.map_err(local_request_error)?.data);
+                    // A handler exception is not a transport failure: like the
+                    // fetch path, it answers as a marked body the harness turns
+                    // back into the value the handler threw, class intact, so
+                    // a broken object breaks the stub that saw it (#271 P2).
+                    return Ok(match completed.result {
+                        Ok(outcome) => outcome.data,
+                        Err(LocalRequestFailure::Handler(error)) => {
+                            match cello::engine_api::cell_handler_error(&error) {
+                                Some(handler) => cello::js::RpcData::V8(
+                                    cello::engine_api::rpc_failure_bytes(
+                                        handler,
+                                        cello::engine_api::cell_aborted(&error),
+                                    )
+                                    .into(),
+                                ),
+                                None => {
+                                    return Err(local_request_error(
+                                        LocalRequestFailure::Handler(error),
+                                    ))
+                                }
+                            }
+                        }
+                        Err(failure) => return Err(local_request_error(failure)),
+                    });
                 }
                 Route::Remote {
                     node,
@@ -2670,10 +2693,34 @@ pub(crate) async fn dispatch_forwarded_rpc(
                 .expect("RPC clone response"),
         ),
         Err(error) if cell_overload_error(&error) => peer_response(cell_overload_response()),
-        Err(error) => peer_response(response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("RPC failed: {error:#}"),
-        )),
+        // A handler exception is not a transport failure: answer 200 with the
+        // same marked body the local path sends, so the caller's stub rejects
+        // with the value the handler threw, class intact, whichever node owns
+        // the object. An old caller reads the marker as undecodable bytes and
+        // still fails the call.
+        Err(error) => match cello::engine_api::cell_handler_error(&error) {
+            Some(handler) => peer_response(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/octet-stream")
+                    .body(
+                        Full::new(
+                            cello::engine_api::rpc_failure_bytes(
+                                handler,
+                                cello::engine_api::cell_aborted(&error),
+                            )
+                            .into(),
+                        )
+                        .map_err(|never| match never {})
+                        .boxed_unsync(),
+                    )
+                    .expect("RPC failure response"),
+            ),
+            None => peer_response(response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("RPC failed: {error:#}"),
+            )),
+        },
     }
 }
 

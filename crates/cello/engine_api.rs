@@ -497,6 +497,35 @@ impl std::fmt::Display for CellHandlerError {
 
 impl std::error::Error for CellHandlerError {}
 
+/// The JSON a stub caller rebuilds into the value the handler threw: the
+/// shape `__cellHandlerThrow` reads, plus whether the object was aborted.
+/// Fetch and RPC share it, so a thrown `TypeError` crosses both paths with
+/// its class intact; the harness decides the `remote` marker per path.
+pub fn cell_failure_json(handler: &CellHandlerError, aborted: bool) -> serde_json::Value {
+    serde_json::json!({
+        "kind": handler.kind.as_str(),
+        "name": handler.name,
+        "message": handler.message,
+        "value": handler.value,
+        "aborted": aborted,
+    })
+}
+
+/// The marker prefix of an RPC reply that carries a handler failure instead
+/// of a result. The harness answers `__rpc_call` with structured-clone
+/// bytes, which have no envelope for a failure, so the callee prefixes the
+/// same JSON the fetch path sends and the caller strips it before decoding.
+pub const RPC_FAILURE_PREFIX: &str = "__celloRpcFailure:";
+
+/// An RPC reply body for a handler failure: the marker plus the failure JSON.
+/// Uncapped like the fetch path -- truncating the clone here would change
+/// the value a big throw carries on RPC but not on fetch.
+pub fn rpc_failure_bytes(handler: &CellHandlerError, aborted: bool) -> Vec<u8> {
+    let mut body = RPC_FAILURE_PREFIX.as_bytes().to_vec();
+    body.extend_from_slice(cell_failure_json(handler, aborted).to_string().as_bytes());
+    body
+}
+
 /// A cell event that was aborted because a `blockConcurrencyWhile` body threw
 /// or its limit expired (#267).
 ///

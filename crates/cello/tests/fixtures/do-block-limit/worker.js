@@ -67,6 +67,31 @@ export class Holder extends DurableObject {
       });
       return Response.json({ outer, depth: this.ctx._blockDepth });
     }
+    if (url.pathname === "/hold-open-tx") {
+      // A transaction the block leaves open when the limit fires. The block
+      // failure breaks the event, so the transaction's own catch -- the code
+      // that would roll the savepoint back -- never runs. The host rolls it
+      // back on the abort instead (#271 P1); without that the uncommitted
+      // write stays visible and the next transaction refuses to start.
+      const outcome = await this.ctx.blockConcurrencyWhile(async () => {
+        await this.ctx.storage.transaction(async (tx) => {
+          tx.put("tk", "held");
+          await new Promise(() => {});
+        });
+      }).then(() => ({ value: "settled" }), (error) => ({ message: error.message }));
+      return Response.json({ message: outcome.message ?? null });
+    }
+    if (url.pathname === "/tx-state") {
+      const tk = await this.ctx.storage.get("tk");
+      let txOk = false;
+      try {
+        await this.ctx.storage.transaction(async (tx) => { tx.put("tk2", "v"); });
+        txOk = true;
+      } catch {
+        txOk = false;
+      }
+      return Response.json({ tk: tk ?? null, txOk, instance: this.instance });
+    }
     return Response.json({ instance: this.instance, events: this.events });
   }
 }

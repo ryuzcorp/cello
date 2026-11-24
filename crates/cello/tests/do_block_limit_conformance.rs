@@ -256,3 +256,24 @@ fn a_cancelled_nested_start_gives_its_depth_back() {
         "the cancelled section's depth comes back: {cancelled}"
     );
 }
+
+#[test]
+fn a_limit_over_an_open_transaction_rolls_it_back() {
+    // The block leaves a storage transaction open when the limit fires. The
+    // failure breaks the event, so the transaction's own catch -- the code
+    // that would roll the savepoint back -- never runs; the host rolls it
+    // back on the abort instead (#271 P1). Without that, the uncommitted
+    // write stays visible and the next transaction refuses to start.
+    let fixture = fixture_dir();
+    let project = fixture_tempdir("cello-do-block-tx-");
+    copy_dir(&fixture, project.path());
+    let node = TestNode::boot(project.path());
+
+    let (status, _) = get(&node.public, "/hold-open-tx").expect("GET /hold-open-tx");
+    assert_eq!(status, 500, "the limit breaks the event over an open transaction");
+
+    let state = body_json(&node.public, "/tx-state");
+    assert_eq!(state["tk"], serde_json::Value::Null, "{state}");
+    assert_eq!(state["txOk"], true, "{state}");
+    assert_eq!(state["instance"], 2, "{state}");
+}

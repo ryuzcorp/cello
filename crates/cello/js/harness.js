@@ -3479,7 +3479,14 @@ const __callerFrames = () => {
     .filter((line) => !line.includes("<anonymous>"));
   return frames.length === 0 ? "" : "\n" + frames.join("\n");
 };
-const __cellHandlerThrow = (details) => {
+// Rebuild the value a stub call failed with. The first failure of an event
+// crosses as the handler's own error with workerd's `remote` marker; a
+// broken stub replays the same class and message for later calls without
+// the marker, and an RPC failure never carries it -- that is what workerd
+// reports for both.
+const __cellHandlerThrow = (details) => __cellHandlerBuild(details, true);
+const __cellHandlerReplay = (details) => __cellHandlerBuild(details, false);
+const __cellHandlerBuild = (details, remote) => {
   const name = String(details?.name ?? "Error");
   const message = details?.message === undefined ? "" : String(details.message);
   let value;
@@ -3509,7 +3516,7 @@ const __cellHandlerThrow = (details) => {
       }
     }
   }
-  if (value !== null && typeof value === "object") {
+  if (remote && value !== null && typeof value === "object") {
     __primDefineProp(value, "remote", {
       value: true, enumerable: true, configurable: true, writable: true,
     });
@@ -3517,6 +3524,25 @@ const __cellHandlerThrow = (details) => {
       value.stack = __remoteStackLine(value.name, value.message);
   }
   return value;
+};
+// The marked RPC reply the callee sends instead of a result when the handler
+// failed: the same JSON the fetch path sends, prefixed so the caller can
+// tell it apart from structured-clone bytes. Must match
+// `engine_api::RPC_FAILURE_PREFIX`.
+const __rpcFailure = (raw) => {
+  let text;
+  try {
+    text = typeof raw === "string" ? raw : new TextDecoder().decode(raw);
+  } catch {
+    return undefined;
+  }
+  const prefix = "__celloRpcFailure:";
+  if (!text.startsWith(prefix)) return undefined;
+  try {
+    return JSON.parse(text.slice(prefix.length));
+  } catch {
+    return undefined;
+  }
 };
 // A cell's input gate as the isolate sees it, for the one delivery
 // point that is inside the isolate rather than in front of it: an
@@ -8559,9 +8585,13 @@ class DurableObjectNamespace {
     });
     const abortMarker = "__CELLO_ACTOR_ABORT__:";
     const processExitMarker = "__CELLO_PROCESS_EXIT__:";
-    let brokenReason = null;
+    // The details of the abort a call observed, so every later call on this
+    // handle replays the same class and message. The replay carries no
+    // `remote` marker, and an RPC failure never does either -- that is what
+    // workerd reports for both (#271 P2, P3).
+    let brokenFailure = null;
     const invoke = async (operation) => {
-      if (brokenReason !== null) throw new Error(brokenReason);
+      if (brokenFailure !== null) throw __cellHandlerReplay(brokenFailure);
       try {
         return await operation();
       } catch (error) {
@@ -8571,8 +8601,12 @@ class DurableObjectNamespace {
         const marker = [abortMarker, processExitMarker]
           .find((candidate) => message.includes(candidate));
         if (!marker) throw error;
-        brokenReason = message.slice(message.indexOf(marker) + marker.length);
-        throw new Error(brokenReason);
+        brokenFailure = {
+          kind: "primitive",
+          name: "Error",
+          message: message.slice(message.indexOf(marker) + marker.length),
+        };
+        throw __cellHandlerReplay(brokenFailure);
       }
     };
     const doFetch = async (input, init) => {
@@ -8643,10 +8677,10 @@ class DurableObjectNamespace {
           const failure = __cellHandlerThrow(r.__celloCellError);
           // An aborted object is not one that merely failed an event: workerd
           // keeps this handle broken and answers every later call with the
-          // failure, while a handler exception leaves the next call working.
+          // same class and message (but no `remote` marker), while a handler
+          // exception leaves the next call working.
           if (r.__celloCellError.aborted === true)
-            brokenReason = failure && failure.message !== undefined
-              ? String(failure.message) : String(failure);
+            brokenFailure = r.__celloCellError;
           throw failure;
         }
         const body = __hostReplyBody(r.status, r);
@@ -8681,11 +8715,22 @@ class DurableObjectNamespace {
       // abort and exit markers revive. Arguments lift with host ids where
       // a cell owns them; anything else keeps a same-isolate marker and
       // fails on use across isolates, as before.
-      return async (...args) => invoke(
-        async () => __rpcDes(await __rpc_call(
+      return async (...args) => invoke(async () => {
+        const raw = await __rpc_call(
           scope, dispatchName ?? null, prop, __rpcOut(args, "host"),
-        )),
-      );
+        );
+        // The callee answers a handler failure as marked bytes instead of a
+        // result, the same JSON the fetch path sends. It rebuilds to the
+        // value the handler threw with no `remote` marker, and an abort
+        // breaks this handle for later calls, exactly as workerd reports
+        // both (#271 P2).
+        const failure = __rpcFailure(raw);
+        if (failure !== undefined) {
+          if (failure.aborted === true) brokenFailure = failure;
+          throw __cellHandlerReplay(failure);
+        }
+        return __rpcDes(raw);
+      });
     }});
     const routes = { fetch: doFetch };
     __weakSet(__stubRoutes, target, routes);
