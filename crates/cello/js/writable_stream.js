@@ -397,14 +397,6 @@ function __write(st, chunk) {
       __errorStream(st, e);
     }
   }
-  // A byte transform validates the chunk when the write is accepted, not
-  // when the transform runs (#276): an invalid chunk rejects only that
-  // write, leaving both sides usable. Only compression streams opt in.
-  if (st.validateChunk !== null && st.validateChunk !== undefined) {
-    try { st.validateChunk(chunk); }
-    catch (e) { return Promise.reject(e); }
-  }
-
   if (st.state === 'errored')
     return Promise.reject(st.storedError);
   // Workerd names each state separately here (#132), and its message
@@ -421,11 +413,29 @@ function __write(st, chunk) {
   if (st.closesOnError && st.pendingAbort !== null)
     return Promise.reject(new TypeError(
       "This WritableStream has been closed."));
-  if (__closing(st))
+  // Workerd's internal (compression/identity/fixed) streams report a
+  // pending close as the closed stream for every later write (#281): once
+  // close() was called the writable is already closing, whether the close
+  // has dispatched or is still queued. Plain streams keep the
+  // "ReadableStream is closed" message in both positions, as on workerd.
+  if (__closing(st)) {
+    if (st.closesOnError)
+      return Promise.reject(new TypeError(
+        "This WritableStream has been closed."));
     return Promise.reject(new TypeError(
       "This ReadableStream is closed."));
+  }
   if (st.state === 'erroring')
     return Promise.reject(st.storedError);
+  // A byte transform validates the chunk when the write is accepted, not
+  // when the transform runs: an invalid chunk rejects only that write,
+  // leaving both sides usable (#276, #280). The state errors above win,
+  // so a write to a dead stream reports the state error, as on Workerd.
+  if (st.validateChunk !== null && st.validateChunk !== undefined) {
+    try { st.validateChunk(chunk); }
+    catch (e) { return Promise.reject(e); }
+  }
+
   return new Promise((resolve, reject) => {
     // `cancelled` is the readable-cancel error live when the write was
     // accepted. Workerd's internal (compression) writable completes a write
@@ -575,8 +585,19 @@ function __finishErroring(st) {
       abortReq.resolve();
       // Workerd's internal streams end an aborted writable in the closed
       // shape (desiredSize 0, later write()/close() report "has been
-      // closed"), not the errored shape a JS sink gets (#252).
-      if (st.closesOnError) st.state = 'closed';
+      // closed"), not the errored shape a JS sink gets (#252). Aborting
+      // is not backpressure, so the pending ready fulfills with it: the
+      // erroring path already rejected it above, so install a resolved
+      // promise rather than resolving the spent deferred (#281).
+      if (st.closesOnError) {
+        st.state = 'closed';
+        if (st.writer) {
+          const writerState = __wtrState(st.writer);
+          writerState.readyPromise = Promise.resolve();
+          writerState.readyResolve = null;
+          writerState.readyReject = null;
+        }
+      }
       __rejectCloseAndClosed(st);
     },
     (e) => {
@@ -1119,8 +1140,15 @@ class TransformStream {
               target.writeError = new TypeError(
                 "The readable side of this TransformStream is no longer " +
                 "readable.");
-              if (target.writer)
-                __rejectReady(__wtrState(target.writer), target.writeError);
+              // The erroring path below would reject the pending ready
+              // with the stored error; detach it first so it stays
+              // fulfilled, as on Workerd (like the running branch above).
+              if (target.writer) {
+                const ws = __wtrState(target.writer);
+                if (ws.readyResolve) ws.readyResolve();
+                ws.readyResolve = null;
+                ws.readyReject = null;
+              }
             }
           }
           __errorStream(target, reason);

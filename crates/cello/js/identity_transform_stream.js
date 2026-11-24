@@ -29,7 +29,12 @@ const __rsState = (stream) => __cello.$$readableState(stream);
 
 // No copy: a write is only observable once it has been read, so the
 // writer cannot safely reuse the buffer before then either.
+// Workerd's byte transforms also take a string (encoded as UTF-8) and
+// treat undefined as an empty chunk, like compression does (#230, #281).
+const utf8 = new TextEncoder();
 function bytes(chunk) {
+  if (typeof chunk === 'string') return utf8.encode(chunk);
+  if (chunk === undefined) return new Uint8Array(0);
   if (ArrayBuffer.isView(chunk))
     return new Uint8Array(chunk.buffer, chunk.byteOffset,
                           chunk.byteLength);
@@ -417,6 +422,14 @@ class IdentityTransformStream {
     // the conversion throws before any delivery or length accounting, as
     // on Workerd (#280). Validated when the write is accepted (#276).
     __cello.$$writableStreamState(writable).validateChunk = bytes;
+    // Workerd's identity/fixed streams are internal streams like
+    // compression: a failed push or flush settles the writable as closed
+    // (later writes report the closed stream, closed rejects with the
+    // failure), and abort() ends in the closed shape too (#281). In
+    // particular a FixedLength overflow keeps rejecting the write that
+    // trips it with the overflow error, while a close or a later write
+    // reports the closed stream.
+    __cello.$$writableStreamState(writable).closesOnError = true;
     // abort() must not deadlock behind a write parked in _deliver: the
     // writable machinery waits for the in-flight write before running
     // the sink abort, so unpark it with the abort reason.

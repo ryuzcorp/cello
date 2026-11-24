@@ -4,6 +4,32 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
 ---
 ## Unreleased
 
+  - **Transform pipe-cancel and internal-stream writes match Workerd in the
+  round-2 shapes (#272, #276, #280).** A `pipeTo` whose source is done and
+  whose destination `close()` fails rejects with the close error instead of
+  hanging on the closed promise, and never cancels the source with it. An
+  invalid chunk written to a closed, closing, or aborted compression,
+  identity, or fixed stream reports the state error instead of the chunk
+  `TypeError`. A readable cancel landing on parked plain-transform writes
+  still rejects them with the readable-side `TypeError`, but `writer.ready`
+  stays fulfilled while `closed` keeps the cancel reason. Once `close()` was
+  called on an internal (compression/identity/fixed) stream, every later
+  write reports the closed stream -- dispatched or still queued -- while
+  plain streams keep `This ReadableStream is closed.` in both positions. A
+  `FixedLengthStream` overflow resolves the write that trips it and errors
+  the readable; a further write keeps the overflow error, the `close` and
+  any write after it report the closed stream, and `closed` rejects with
+  the overflow error. `IdentityTransformStream` takes a string chunk
+  (UTF-8) and treats `undefined` as an empty chunk, and `abort()` on an
+  identity or fixed stream ends the writable in the closed shape: the abort
+  resolves, `ready` fulfills, `closed` rejects with the abort reason, and
+  later writes and closes report the closed stream. The differential gate
+  gained seven cases (`pipe-close-error-no-cancel`,
+  `byte-transform-invalid-on-dead`, `transform-parked-cancel-ready`,
+  `internal-stream-write-while-closing`, `fixed-length-overflow-write-close`,
+  `identity-string-chunks`, `identity-fixed-abort-shape`), all failing
+  before this change and agreeing after.
+
 - **An invalid chunk rejects only its own write on internal byte streams, as
   Workerd does (#280).** The accept-time validation from #276 now also covers
   `IdentityTransformStream` and `FixedLengthStream`: a non-`BufferSource`
