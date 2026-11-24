@@ -13,6 +13,10 @@
 //! > A call to blockConcurrencyWhile() in a Durable Object waited for too
 //! > long. The call was canceled and the Durable Object was reset.
 //!
+//! #267: the limit breaks the whole event the way a throw in the block does:
+//! the `catch` around the block never runs, so the stub caller receives the
+//! rejection and the object it belonged to is gone.
+//!
 //! The limit is workerd's 30 s, which no test can wait out, so the node takes
 //! a shortened one from `CELLO_TEST_BLOCK_LIMIT_MS` when `CELLO_TEST_WAIT=1`
 //! is set -- the same seam every other test-only knob uses, absent on a
@@ -67,25 +71,36 @@ struct TestNode {
 
 impl TestNode {
     fn boot(app_project: &Path) -> Self {
+        Self::boot_with_env(app_project, [])
+    }
+
+    fn boot_with_env(
+        app_project: &Path,
+        extra_env: impl IntoIterator<Item = (&'static str, &'static str)>,
+    ) -> Self {
         let limit = LIMIT_MS.to_string();
-        let mut child = cello_command(
+        let mut command = cello_command(
             app_project,
             [
                 ("NO_COLOR", "1"),
                 ("CELLO_TEST_WAIT", "1"),
                 ("CELLO_TEST_BLOCK_LIMIT_MS", &limit),
             ],
-        )
-        .arg("dev")
-        .arg(app_project)
-        .arg("--port")
-        .arg("0")
-        .arg("--no-watch")
-        .arg("--logs")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn cello dev");
+        );
+        for (name, value) in extra_env {
+            command.env(name, value);
+        }
+        let mut child = command
+            .arg("dev")
+            .arg(app_project)
+            .arg("--port")
+            .arg("0")
+            .arg("--no-watch")
+            .arg("--logs")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn cello dev");
         let mut stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         std::thread::spawn(move || {
@@ -192,18 +207,17 @@ fn a_block_past_the_limit_resets_the_object() {
         "a block under the limit settles at once: {fast}"
     );
 
-    // Past it: the body never settles, so only the limit ends the block. The
-    // rejection is the promise's, not a throw, and it carries workerd's
-    // message.
+    // Past it: only the limit ends the block, and the event breaks the way a
+    // throw in the block breaks it (#267). The `catch` around the block never
+    // runs, so the stub caller receives the rejection -- carrying workerd's
+    // message -- instead of the JSON the catch would have answered.
     let started = Instant::now();
-    let held = body_json(&node.public, "/hold");
+    let (status, body) = get(&node.public, "/hold").expect("GET /hold");
     let waited = started.elapsed();
-    assert_eq!(held["message"], LIMIT_MESSAGE, "{held}");
-    assert_eq!(held["instance"], 1, "{held}");
-    assert_eq!(held["events"], 2, "{held}");
+    assert_eq!(status, 500, "the limit breaks the event: {body}");
     assert!(
-        held["elapsed"].as_u64().expect("elapsed") >= LIMIT_MS - 1,
-        "the block ended no earlier than the limit: {held}"
+        body.contains(LIMIT_MESSAGE),
+        "the stub caller receives the limit rejection: {body}"
     );
     assert!(
         waited >= Duration::from_millis(LIMIT_MS - 1),
@@ -215,4 +229,30 @@ fn a_block_past_the_limit_resets_the_object() {
     let after = body_json(&node.public, "/state");
     assert_eq!(after["instance"], 2, "{after}");
     assert_eq!(after["events"], 1, "{after}");
+}
+
+#[test]
+fn a_cancelled_nested_start_gives_its_depth_back() {
+    // `#scheduleConcurrencyBlock` reserves the nested section's depth before
+    // its deferred start runs. A disconnect in that sub-turn window rejects
+    // the turn (`reject_pending_ops`), which no black-box test can time, so
+    // the node rejects the turn outright instead (#267). The body never ran,
+    // so nothing resets and the event answers -- with the depth restored.
+    let fixture = fixture_dir();
+    let project = fixture_tempdir("cello-do-block-depth-");
+    copy_dir(&fixture, project.path());
+    let node = TestNode::boot_with_env(project.path(), [("CELLO_TEST_FAIL_BLOCK_TURN", "1")]);
+
+    let cancelled = body_json(&node.public, "/depth-cancel");
+    assert!(
+        cancelled["outer"]
+            .as_str()
+            .expect("outer")
+            .starts_with("outer:rejected:"),
+        "the cancelled start rejects the nested promise: {cancelled}"
+    );
+    assert_eq!(
+        cancelled["depth"], 0,
+        "the cancelled section's depth comes back: {cancelled}"
+    );
 }

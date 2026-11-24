@@ -21,8 +21,11 @@ export class Holder extends DurableObject {
     this.events += 1;
     if (url.pathname === "/hold") {
       const started = Date.now();
-      // A body that never settles: only the limit ends it, and the caller
-      // learns about it through the promise rather than a throw.
+      // A body that never settles: only the limit ends it. The rejection
+      // below is what the old code answered with -- the event carried on and
+      // the caller saw the message. The fixed code never reaches it: the
+      // limit breaks the event (#267), so the stub caller receives the
+      // rejection carrying workerd's message instead.
       const outcome = await this.ctx.blockConcurrencyWhile(async () => {
         await new Promise(() => {});
       }).then(() => ({ value: "settled" }), (error) => ({ message: error.message }));
@@ -46,6 +49,23 @@ export class Holder extends DurableObject {
         events: this.events,
         elapsed: Date.now() - started,
       });
+    }
+    if (url.pathname === "/depth-cancel") {
+      // The test node rejects every `__block_turn` outright
+      // (`CELLO_TEST_FAIL_BLOCK_TURN`), so the nested section's deferred
+      // start is cancelled and its promise rejects without running the body.
+      // The depth that section reserved must come back: without the fix the
+      // response still reports it elevated (#267). The rejection is handled,
+      // so nothing resets and the event answers.
+      const outer = await this.ctx.blockConcurrencyWhile(async () => {
+        const nested = this.ctx.blockConcurrencyWhile(() => "inner");
+        const settled = await nested.then(
+          () => "resolved",
+          (error) => `rejected:${error?.message ?? error}`,
+        );
+        return `outer:${settled}`;
+      });
+      return Response.json({ outer, depth: this.ctx._blockDepth });
     }
     return Response.json({ instance: this.instance, events: this.events });
   }

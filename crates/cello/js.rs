@@ -2252,6 +2252,18 @@ fn handler_rejection(
     tc: &mut v8::PinScope,
     p: v8::Local<v8::Promise>,
 ) -> crate::engine_api::CellHandlerError {
+    rejection_value(tc, p.result(tc))
+}
+
+/// One thrown value as workerd crosses it to a stub caller (#254, #267).
+///
+/// A `blockConcurrencyWhile` failure takes this path too: workerd hands the
+/// caller the value the block threw, with the same shape a handler exception
+/// has, so one reader serves both.
+fn rejection_value(
+    tc: &mut v8::PinScope,
+    r: v8::Local<v8::Value>,
+) -> crate::engine_api::CellHandlerError {
     use crate::engine_api::{CellHandlerError, CellHandlerKind};
     // An empty message is a real message: workerd preserves it.
     fn text_field(
@@ -2266,7 +2278,6 @@ fn handler_rejection(
         }
         Some(value.to_rust_string_lossy(tc))
     }
-    let r = p.result(tc);
     // The harness class, not the live global: a Worker that replaces
     // `globalThis.DOMException` must not change what class its caller sees.
     // Workerd treats such an instance as a plain `Error`.
@@ -3253,6 +3264,11 @@ struct ExecutionTermination {
     error: String,
     actor_scope: Option<String>,
     context_id: Option<u64>,
+    /// The value a `blockConcurrencyWhile` body threw (#267), when the
+    /// termination is a critical section failing. workerd breaks the whole
+    /// event *and* hands the stub caller the value the block threw, so the
+    /// failure must cross as that value rather than the host's marker text.
+    handler: Option<crate::engine_api::CellHandlerError>,
 }
 
 #[cfg(all(test, cello_internal_tests))]
@@ -3294,6 +3310,7 @@ fn inject_cpu_finish_termination_for_test(
         error: error.clone(),
         actor_scope: None,
         context_id: None,
+        handler: None,
     });
     tc.terminate_execution();
     Some(error)
@@ -3459,6 +3476,7 @@ fn run_cpu_watchdog_service(shared: &Arc<(Mutex<CpuWatchdogState>, std::sync::Co
                     error: format!("Worker exceeded CPU limit of {} ms", watch.declared_ms),
                     actor_scope: None,
                     context_id: None,
+                    handler: None,
                 });
                 drop(termination);
                 watch.isolate.terminate_execution();
@@ -3568,7 +3586,12 @@ fn take_execution_termination_in_context(
                 finish_terminated_actor_event(scope, &current_context());
             }
         }
-        return Some(anyhow!(termination.error));
+        return Some(match termination.handler {
+            // A critical section failed: the caller of the aborted event gets
+            // the value the block threw, not the host's marker (#267).
+            Some(handler) => anyhow::Error::new(crate::engine_api::CellAbort(handler)),
+            None => anyhow!(termination.error),
+        });
     }
     is_terminating.then(|| anyhow!("JavaScript execution was terminated"))
 }
@@ -6747,6 +6770,7 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
                         error: "synchronous V8 termination sentinel".to_string(),
                         actor_scope: None,
                         context_id: None,
+                        handler: None,
                     });
                 tc.terminate_execution();
                 Err(anyhow!("generic synchronous dispatch failure"))
@@ -8197,6 +8221,7 @@ ops! { OP_NAMES, install_op_functions,
         "__storage_drop_pending_puts_own" => storage_ops::op_storage_drop_pending_puts_own,
         "__storage_drop_pending_puts_reset" => storage_ops::op_storage_drop_pending_puts_reset,
         "__actor_abort" => op_actor_abort,
+        "__actor_fail" => op_actor_fail,
         "__cron_plan" => op_cron_plan,
         "__kv_blob" => op_kv_blob,
         "__process_exit" => op_process_exit,
@@ -10363,6 +10388,10 @@ fn op_do_call_impl(
                         "name": handler.name,
                         "message": handler.message,
                         "value": handler.value,
+                        // The object was aborted, not only its event: workerd
+                        // leaves the handle that saw it broken, while one that
+                        // saw a plain handler failure revives with the object.
+                        "aborted": crate::engine_api::cell_aborted(&e),
                     },
                 })
                 .to_string()),
@@ -12222,6 +12251,16 @@ fn op_gate_wait(
     rv.set(promise_for(scope, id));
 }
 
+/// Whether the deferred start of a nested `blockConcurrencyWhile` is
+/// cancelled at once (#267). A real cancellation needs a client disconnect
+/// to land inside the sub-turn window between the call and the turn's
+/// delivery, which no black-box test can hit deterministically, so the node
+/// rejects the turn outright when `CELLO_TEST_FAIL_BLOCK_TURN=1` is set --
+/// behind `CELLO_TEST_WAIT=1` like every other test-only knob, absent on a
+/// shipping node.
+fn block_turn_rejected_for_test() -> bool {
+    test_wait_enabled() && std::env::var("CELLO_TEST_FAIL_BLOCK_TURN").as_deref() == Ok("1")
+}
 /// `__block_turn()` — settle on a later turn of this event's driver.
 ///
 /// A nested `blockConcurrencyWhile` opens its section at the call, but
@@ -12234,6 +12273,13 @@ fn op_block_turn(
     _args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
+    if block_turn_rejected_for_test() {
+        rv.set(rejected_promise(
+            scope,
+            "CELLO_TEST_FAIL_BLOCK_TURN rejected the deferred block turn",
+        ));
+        return;
+    }
     let id = asyncrt::enqueue(async move { Ok(String::new()) });
     rv.set(promise_for(scope, id));
 }
@@ -12562,6 +12608,51 @@ fn op_actor_abort(
         error: format!("__CELLO_ACTOR_ABORT__:{reason}"),
         actor_scope: Some(cell),
         context_id: context.continuation_id(),
+        handler: None,
+    });
+    scope.terminate_execution();
+}
+
+/// `__actor_fail(scope, error)` — a `blockConcurrencyWhile` body threw, or its
+/// limit expired (#267).
+///
+/// workerd does not hand the failure to the calling code: the block's
+/// rejection is never catchable, because the whole event is broken and the
+/// object reset. Every continuation in the cell stops, including a `catch`
+/// around the block, so terminating execution is the only faithful answer.
+///
+/// The value the block threw still crosses to the stub caller, which is what
+/// the termination's `handler` carries: `abort()` answers a host message here,
+/// but a block failure is a handler exception and workerd rethrows it whole.
+fn op_actor_fail(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let Some(context) = current_reaction_io_context(scope) else {
+        return;
+    };
+    // The failing cell is the executing cell, never a JS-passed scope: a
+    // mutated `ctx._scope` must not break another cell (H6).
+    let Some(event) = event_context(scope) else {
+        return;
+    };
+    let Some(frame) = current_cell_event(&event) else {
+        return;
+    };
+    let cell = frame.storage;
+    let handler = rejection_value(scope, args.get(1));
+    let state = actor_runtime_state(scope);
+    state
+        .pending_puts
+        .lock()
+        .expect("pending puts lock poisoned")
+        .remove(&cell);
+    *state.termination.lock().expect("termination lock poisoned") = Some(ExecutionTermination {
+        error: handler.message.clone(),
+        actor_scope: Some(cell),
+        context_id: context.continuation_id(),
+        handler: Some(handler),
     });
     scope.terminate_execution();
 }
@@ -12602,6 +12693,7 @@ fn op_process_exit(
         error: format!("__CELLO_PROCESS_EXIT__:The Node.js process.exit({code}) API was called."),
         actor_scope,
         context_id: context.continuation_id(),
+        handler: None,
     });
     scope.terminate_execution();
 }
