@@ -3,6 +3,26 @@ title: Changelog
 description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.9.
 ---
 ## Unreleased
+- **Sibling nested `blockConcurrencyWhile` sections run one at a time, in
+   schedule order, the way workerd runs them (#278).** Two nested sections
+   the same body starts used to run concurrently; on workerd the second
+   waits until the first has fully settled, body and descendants alike.
+   Cello now parents every nested section under the section whose body
+   scheduled it -- a section scheduled from inside a sibling's body is that
+   sibling's child, not a sibling -- and each child starts only after the
+   sibling ahead of it has fully settled. A body that failed resets the
+   object, so the sibling behind it never runs and carries that failure
+   instead; a sibling awaiting another breaks the event through the running
+   sibling's limit rather than wedging, exactly as workerd's 30-second limit
+   does. The #268 hold follows the same tree: a section's own timers and
+   subrequests wait only for the sections nested inside it, so the first
+   sibling's timer fires while the second still waits. The differential gate
+   gained eight cases (`do/nested-siblings`,
+   `do/nested-siblings-await`, `do/nested-siblings-await-second`,
+   `do/nested-siblings-child`, `do/nested-siblings-inner-timer`,
+   `do/nested-siblings-inner-fetch`, `do/nested-siblings-storage`,
+   `do/nested-siblings-fail`) that fail before this change and every case
+   agrees.
 
   - **Transform pipe-cancel and internal-stream writes match Workerd in the
   round-2 shapes (#272, #276, #280).** A `pipeTo` whose source is done and
@@ -49,6 +69,21 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
   gate gained `compression-invalid-chunk` and `decompression-invalid-chunk`,
   each in both read/write orderings, all failing before this change.
 
+- **An open nested `blockConcurrencyWhile` section holds the enclosing
+  body's timers and subrequests the way workerd holds them (#268).** While
+  a nested section is open, a timer the enclosing body scheduled -- before
+  or after the section opened, at the handler level, or past the body's
+  return through the drain -- fires only after the section drains, and a
+  subrequest or stub call the body started completes only then too. Microtasks
+  and storage complete freely, and the section owner's own timers run, so a
+  nested body awaiting its own timer never waits for itself. Each nested
+  section is parented under the section whose body scheduled it, so the hold
+  waits only for the sections nested inside the scheduler's own section --
+  never the section itself, and never a sibling or nephew -- and the frame
+  record rides the body's continuations so a schedule after an `await` still
+   (`do/nested-hold-timers`, `do/nested-hold-fetch` and
+   `do/nested-hold-prearmed-after-fail`) that fail before this change and
+   every case agrees.
 - **A throw, the 64-level limit or the 30 s limit in
   `blockConcurrencyWhile` breaks the event the way workerd breaks it
   (#267).** A body that throws or rejects -- top-level or nested -- used to

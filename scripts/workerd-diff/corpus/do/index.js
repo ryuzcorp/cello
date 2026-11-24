@@ -897,6 +897,365 @@ export class Probe {
         deep.push("d0-awaited");
         return report({ order, deep });
       },
+      // #268: while a nested section is open, workerd holds the enclosing
+      // body's own task continuations. A timer the body scheduled -- before
+      // or after the section opened, at the handler level or past the body's
+      // return through the drain -- fires only after the section closes, as
+      // does a subrequest or stub call the body started. Microtasks and
+      // storage complete freely, and the section owner's own timers run.
+      // The logs below carry order only, never timings.
+      async "/nested-hold"() {
+        const log = [];
+        await this.state.blockConcurrencyWhile(async () => {
+          log.push("outer-body");
+          this.state.blockConcurrencyWhile(async () => {
+            log.push("inner-body");
+            await new Promise((resolve) => setTimeout(resolve, 200));
+            log.push("inner-done");
+          });
+          Promise.resolve().then(() => log.push("mt-after-nested"));
+          await new Promise((resolve) => setTimeout(resolve, 1));
+          log.push("timer-after-nested");
+          await this.state.storage.put("hold-key", "hold-value");
+          log.push("put-done");
+          log.push(`get:${await this.state.storage.get("hold-key")}`);
+          return "outer-value";
+        });
+        log.push("outer-awaited");
+        return report({ log });
+      },
+      async "/nested-hold-mid"() {
+        const log = [];
+        await this.state.blockConcurrencyWhile(async () => {
+          log.push("outer-body");
+          const pending = new Promise((resolve) => setTimeout(() => {
+            log.push("timer-100ms");
+            resolve();
+          }, 100));
+          this.state.blockConcurrencyWhile(async () => {
+            log.push("inner-body");
+            await new Promise((resolve) => setTimeout(resolve, 200));
+            log.push("inner-done");
+          });
+          await pending;
+          log.push("after-timer");
+          return "outer-value";
+        });
+        log.push("outer-awaited");
+        return report({ log });
+      },
+      async "/nested-hold-handler"() {
+        const log = [];
+        const gate = this.state.blockConcurrencyWhile(async () => {
+          log.push("outer-body");
+          await this.state.blockConcurrencyWhile(async () => {
+            log.push("inner-body");
+            await new Promise((resolve) => setTimeout(resolve, 200));
+            log.push("inner-done");
+          });
+          log.push("outer-after-nested");
+          return "outer-value";
+        });
+        // Let the section open, then schedule a timer at the handler level.
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        log.push("handler-50ms");
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        log.push("handler-timer");
+        await gate;
+        log.push("outer-awaited");
+        return report({ log });
+      },
+      async "/nested-hold-early"() {
+        const log = [];
+        const early = new Promise((resolve) => setTimeout(() => {
+          log.push("timer-100ms");
+          resolve();
+        }, 100));
+        await this.state.blockConcurrencyWhile(async () => {
+          log.push("outer-body");
+          await this.state.blockConcurrencyWhile(async () => {
+            log.push("inner-body");
+            await new Promise((resolve) => setTimeout(resolve, 200));
+            log.push("inner-done");
+          });
+          log.push("outer-after-nested");
+          return "outer-value";
+        });
+        await early;
+        log.push("after-early");
+        return report({ log });
+      },
+      async "/nested-hold-returned"() {
+        const log = [];
+        await this.state.blockConcurrencyWhile(async () => {
+          log.push("outer-body");
+          this.state.blockConcurrencyWhile(async () => {
+            log.push("inner-body");
+            await new Promise((resolve) => setTimeout(resolve, 200));
+            log.push("inner-done");
+          });
+          new Promise((resolve) => setTimeout(resolve, 150))
+            .then(() => log.push("timer-150ms"));
+          log.push("outer-returned");
+          return "outer-value";
+        });
+        log.push("outer-awaited");
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        log.push("handler-300ms");
+        return report({ log });
+      },
+      async "/nested-hold-subfetch"() {
+        const log = [];
+        await this.state.blockConcurrencyWhile(async () => {
+          log.push("outer-body");
+          this.state.blockConcurrencyWhile(async () => {
+            log.push("inner-body");
+            await new Promise((resolve) => setTimeout(resolve, 200));
+            log.push("inner-done");
+          });
+          // A data: URL has no network behind it, and workerd still holds
+          // its completion until the section drains. A loopback target would
+          // prove the same for network fetches, but workerd's `serve`
+          // refuses DO-to-loopback egress, so no hermetic gate case can
+          // carry one; network fetches are probe-verified instead.
+          const text = await (await fetch("data:text/plain,target-body")).text();
+          log.push(`fetch-done:${text}`);
+          return "outer-value";
+        });
+        log.push("outer-awaited");
+        return report({ log });
+      },
+      async "/nested-hold-stubfetch"() {
+        const log = [];
+        await this.state.blockConcurrencyWhile(async () => {
+          log.push("outer-body");
+          this.state.blockConcurrencyWhile(async () => {
+            log.push("inner-body");
+            await new Promise((resolve) => setTimeout(resolve, 200));
+            log.push("inner-done");
+          });
+          const target = this.env.OBJ.getByName("nested-hold-stub-target");
+          const text = await (await target.fetch("https://do.test/nested-hold-pong")).text();
+          log.push(`stub-done:${text}`);
+          return "outer-value";
+        });
+        log.push("outer-awaited");
+        return report({ log });
+      },
+      async "/nested-hold-pong"() {
+        return report({ pong: true });
+      },
+      // #268 P1b: a nested failure breaks the event and resets the object;
+      // the next event on the same stub must see no trace of the failed
+      // sections' records. The orchestration below fails here first, then
+      // runs the pre-armed shapes on the same stub.
+      async "/nested-hold-boom"() {
+        await this.state.blockConcurrencyWhile(async () => {
+          await this.state.blockConcurrencyWhile(() => { throw new Error("prearmed-boom"); });
+        });
+        return report({ unreachable: true });
+      },
+      // #278: sibling nested sections in one body run one at a time, in
+      // schedule order: the second starts only after the first has fully
+      // settled, body and descendants alike. Each log below carries order
+      // only, never timings.
+      async "/nested-siblings"() {
+        const log = [];
+        await this.state.blockConcurrencyWhile(async () => {
+          log.push("outer-body");
+          this.state.blockConcurrencyWhile(async () => {
+            log.push("s1-body");
+            await new Promise((resolve) => setTimeout(resolve, 100));
+            log.push("s1-done");
+          });
+          this.state.blockConcurrencyWhile(async () => {
+            log.push("s2-body");
+            await new Promise((resolve) => setTimeout(resolve, 50));
+            log.push("s2-done");
+          });
+          log.push("outer-returned");
+          await new Promise((resolve) => setTimeout(resolve, 300));
+          log.push("outer-after-sleep");
+          return "outer-value";
+        });
+        log.push("outer-awaited");
+        return report({ log });
+      },
+      async "/nested-siblings-await"() {
+        const log = [];
+        await this.state.blockConcurrencyWhile(async () => {
+          log.push("outer-body");
+          const s1 = this.state.blockConcurrencyWhile(async () => {
+            log.push("s1-body");
+            await new Promise((resolve) => setTimeout(resolve, 100));
+            log.push("s1-done");
+            return "s1v";
+          });
+          const s2 = this.state.blockConcurrencyWhile(async () => {
+            log.push("s2-body");
+            await new Promise((resolve) => setTimeout(resolve, 10));
+            log.push("s2-done");
+            return "s2v";
+          });
+          log.push(`s1-val:${await s1}`);
+          log.push(`s2-val:${await s2}`);
+          log.push("outer-returned");
+          return "outer-value";
+        });
+        log.push("outer-awaited");
+        return report({ log });
+      },
+      async "/nested-siblings-await-second"() {
+        const log = [];
+        await this.state.blockConcurrencyWhile(async () => {
+          log.push("outer-body");
+          const s1 = this.state.blockConcurrencyWhile(async () => {
+            log.push("s1-body");
+            await new Promise((resolve) => setTimeout(resolve, 100));
+            log.push("s1-done");
+            return "s1v";
+          });
+          const s2 = this.state.blockConcurrencyWhile(async () => {
+            log.push("s2-body");
+            await new Promise((resolve) => setTimeout(resolve, 10));
+            log.push("s2-done");
+            return "s2v";
+          });
+          log.push(`s2-val:${await s2}`);
+          log.push(`s1-val:${await s1}`);
+          log.push("outer-returned");
+          return "outer-value";
+        });
+        log.push("outer-awaited");
+        return report({ log });
+      },
+      // A section scheduled from inside a sibling's body is that sibling's
+      // child: it runs inside the sibling's section, before the next
+      // sibling starts.
+      async "/nested-siblings-child"() {
+        const log = [];
+        await this.state.blockConcurrencyWhile(async () => {
+          log.push("outer-body");
+          this.state.blockConcurrencyWhile(async () => {
+            log.push("s1-body");
+            this.state.blockConcurrencyWhile(async () => {
+              log.push("sx-body");
+              await new Promise((resolve) => setTimeout(resolve, 30));
+              log.push("sx-done");
+            });
+            log.push("s1-after-sx-call");
+            await new Promise((resolve) => setTimeout(resolve, 80));
+            log.push("s1-done");
+          });
+          this.state.blockConcurrencyWhile(async () => {
+            log.push("s2-body");
+            await new Promise((resolve) => setTimeout(resolve, 10));
+            log.push("s2-done");
+          });
+          log.push("outer-returned");
+          await new Promise((resolve) => setTimeout(resolve, 400));
+          log.push("outer-after-sleep");
+          return "outer-value";
+        });
+        log.push("outer-awaited");
+        return report({ log });
+      },
+      // A section's own timer and fetch are not held by a later sibling:
+      // only the sections nested inside the scheduling section hold it.
+      async "/nested-siblings-inner-timer"() {
+        const log = [];
+        await this.state.blockConcurrencyWhile(async () => {
+          log.push("outer-body");
+          this.state.blockConcurrencyWhile(async () => {
+            log.push("s1-body");
+            await new Promise((resolve) => setTimeout(resolve, 50));
+            log.push("s1-timer-done");
+            await new Promise((resolve) => setTimeout(resolve, 50));
+            log.push("s1-done");
+          });
+          this.state.blockConcurrencyWhile(async () => {
+            log.push("s2-body");
+            await new Promise((resolve) => setTimeout(resolve, 200));
+            log.push("s2-done");
+          });
+          log.push("outer-returned");
+          await new Promise((resolve) => setTimeout(resolve, 400));
+          log.push("outer-after-sleep");
+          return "outer-value";
+        });
+        log.push("outer-awaited");
+        return report({ log });
+      },
+      async "/nested-siblings-inner-fetch"() {
+        const log = [];
+        await this.state.blockConcurrencyWhile(async () => {
+          log.push("outer-body");
+          this.state.blockConcurrencyWhile(async () => {
+            log.push("s1-body");
+            const text = await (await fetch("data:text/plain,s1data")).text();
+            log.push(`s1-fetch-done:${text}`);
+            await new Promise((resolve) => setTimeout(resolve, 50));
+            log.push("s1-done");
+          });
+          this.state.blockConcurrencyWhile(async () => {
+            log.push("s2-body");
+            await new Promise((resolve) => setTimeout(resolve, 200));
+            log.push("s2-done");
+          });
+          log.push("outer-returned");
+          await new Promise((resolve) => setTimeout(resolve, 400));
+          log.push("outer-after-sleep");
+          return "outer-value";
+        });
+        log.push("outer-awaited");
+        return report({ log });
+      },
+      // Storage pins the serialization: the second sibling reads what the
+      // first wrote, which concurrent sections would miss.
+      async "/nested-siblings-storage"() {
+        const log = [];
+        await this.state.blockConcurrencyWhile(async () => {
+          log.push("outer-body");
+          this.state.blockConcurrencyWhile(async () => {
+            log.push("s1-body");
+            await new Promise((resolve) => setTimeout(resolve, 50));
+            await this.state.storage.put("siblings-storage-key", "s1val");
+            log.push("s1-wrote");
+          });
+          this.state.blockConcurrencyWhile(async () => {
+            log.push("s2-body");
+            await new Promise((resolve) => setTimeout(resolve, 10));
+            log.push(`s2-read:${await this.state.storage.get("siblings-storage-key")}`);
+          });
+          log.push("outer-returned");
+          await new Promise((resolve) => setTimeout(resolve, 300));
+          log.push("outer-after-sleep");
+          return "outer-value";
+        });
+        log.push("outer-awaited");
+        return report({ log });
+      },
+      // A failing sibling breaks the event and the sibling behind it never
+      // runs: the write below stays missing, where concurrent sections
+      // would leave it behind.
+      async "/nested-siblings-fail-run"() {
+        await this.state.blockConcurrencyWhile(async () => {
+          this.state.blockConcurrencyWhile(async () => {
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            throw new Error("s1-boom");
+          });
+          this.state.blockConcurrencyWhile(async () => {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+            await this.state.storage.put("siblings-fail-key", "s2val");
+          });
+          await new Promise((resolve) => setTimeout(resolve, 300));
+          return "outer-value";
+        });
+        return report({ settled: "resolved" });
+      },
+      async "/nested-siblings-fail-state"() {
+        return report({ key: await this.state.storage.get("siblings-fail-key") ?? null });
+      },
       // #267: a throw or reject inside a top-level or nested block breaks
       // the whole event on workerd (500 Internal Server Error), and the stub
       // caller receives the value the block threw -- a `catch` around the
@@ -1500,6 +1859,20 @@ const routes = {
     });
     return report(out);
   },
+  // #278: a failing sibling breaks the event and the sibling behind it never
+  // runs, so its write stays missing -- where concurrent sections would leave
+  // it behind. The driver answers 200 carrying the stub outcome and the key.
+  async "/nested-siblings-fail"() {
+    const out = {};
+    const sib = OBJ.getByName("nested-siblings-fail");
+    out.first = await attempt(async () => {
+      const response = await sib.fetch("https://do.test/nested-siblings-fail-run");
+      return { status: response.status, body: await response.text() };
+    });
+    const revived = OBJ.getByName("nested-siblings-fail");
+    out.state = await revived.fetch("https://do.test/nested-siblings-fail-state").then((r) => r.json());
+    return report(out);
+  },
   // #271 P2: an RPC call observes a block abort the way a fetch does: the
   // first call rejects with the value the block threw (class intact, no
   // `remote` marker), the same stub stays broken, and a fresh stub works.
@@ -1541,6 +1914,62 @@ const routes = {
     out.state = await (await state.fetch("https://do.test/block-tx-state")).json();
     return report(out);
   },
+  // #268: an open nested section holds the enclosing body's timers and
+  // subrequests, while microtasks and storage run free. Each shape below
+  // records the completion order, which is where the hold shows: the old
+  // code fires the timer while the section is still open.
+  async "/nested-hold-timers"() {
+    const out = {};
+    for (const [key, path] of [
+      ["hold", "/nested-hold"],
+      ["mid", "/nested-hold-mid"],
+      ["handler", "/nested-hold-handler"],
+      ["early", "/nested-hold-early"],
+      ["returned", "/nested-hold-returned"],
+    ]) {
+      const stub = OBJ.getByName(`nested-hold-${key}`);
+      out[key] = await attempt(async () => {
+        const response = await stub.fetch(`https://do.test${path}`);
+        return { status: response.status, body: await response.text() };
+      });
+    }
+    return report(out);
+  },
+  async "/nested-hold-fetch"() {
+    const out = {};
+    const sub = OBJ.getByName("nested-hold-subfetch");
+    out.sub = await attempt(async () => {
+      const response = await sub.fetch("https://do.test/nested-hold-subfetch");
+      return { status: response.status, body: await response.text() };
+    });
+    const stub = OBJ.getByName("nested-hold-stubfetch");
+    out.stub = await attempt(async () => {
+      const response = await stub.fetch("https://do.test/nested-hold-stubfetch");
+      return { status: response.status, body: await response.text() };
+    });
+    return report(out);
+  },
+  // #268 P1a/P1b: fail a nested block on one stub, then run the proven
+  // pre-armed shape (a timer armed before any section opens) on a fresh
+  // stub to the same reset instance. A leaking implementation poisons the
+  // second leg with the first leg's records; a capture-time bail lets the
+  // pre-armed timer escape even without a leak.
+   async "/nested-hold-prearmed-after-fail"() {
+     const out = {};
+     const failing = OBJ.getByName("nested-hold-prearmed");
+     out.fail = await attempt(async () => {
+       const response = await failing.fetch("https://do.test/nested-hold-boom");
+       return { status: response.status, body: await response.text() };
+     });
+     // A fresh stub to the same reset instance: a stub that observed the
+     // aborted object stays broken, exactly as in the block-fail cases.
+     const stub = OBJ.getByName("nested-hold-prearmed");
+     out.prearmed = await attempt(async () => {
+       const response = await stub.fetch("https://do.test/nested-hold-early");
+       return { status: response.status, body: await response.text() };
+     });
+     return report(out);
+   },
   async "/ids"() {
     const a = OBJ.idFromName("alpha");
     const b = OBJ.idFromName("alpha");

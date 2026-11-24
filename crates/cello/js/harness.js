@@ -1469,19 +1469,37 @@ const __fetchTakeBody = (input, usedBefore) => {
   __markBodyUsed(input);
 };
 globalThis.fetch = async (input, init) => {
+  // Whose section this call belongs to: a nested section that is still open
+  // when the response arrives holds the response until it drains (#268).
+  const hold = __captureNestedHold();
   const rawUrl = typeof input === "string" ? input : input?.url;
   const adoptsBody = __fetchAdoptsBody(input, init);
   const usedBefore = adoptsBody && input.bodyUsed;
   if (typeof rawUrl === "string" && rawUrl.startsWith("data:")) {
     if (adoptsBody) __fetchTakeBody(input, usedBefore);
-    return __dataUrlResponse(rawUrl);
+    // Even a data: URL waits: workerd holds every subrequest completion
+    // while a deeper section is open, not just network ones (#268). With
+    // nothing open the response returns directly, free of extra awaits.
+    if (hold === undefined) return __dataUrlResponse(rawUrl);
+    const response = await __dataUrlResponse(rawUrl);
+    await __holdNestedSections(hold);
+    return response;
   }
   const req = new Request(input, init);
   if (adoptsBody) __fetchTakeBody(input, usedBefore);
   // `fetch(url, { headers: { Upgrade: "websocket" } })` is the other way
   // Cloudflare opens an outbound socket, and the one most examples use.
   if ((req.headers.get("upgrade") ?? "").toLowerCase() === "websocket") {
-    return await __fetchWebSocketUpgrade(req);
+    // Like every other completion, the upgrade waits for open deeper
+    // sections on resolve and reject alike (#268).
+    try {
+      const upgraded = await __fetchWebSocketUpgrade(req);
+      if (hold !== undefined) await __holdNestedSections(hold);
+      return upgraded;
+    } catch (error) {
+      if (hold !== undefined) await __holdNestedSections(hold);
+      throw error;
+    }
   }
   // The caller's signal, never the incoming request's own.
   const signal = __requestState(req).signalForSubrequests;
@@ -1515,10 +1533,17 @@ globalThis.fetch = async (input, init) => {
       }, () => {}).catch(() => {});
     }
     raw = await (signal ? __awaitCancellableDoCall(dispatch, signal) : dispatch);
+    // A nested section that is still open holds the response until it
+    // drains, the way it holds the enclosing body's timers (#268). An abort
+    // throws above and never reaches this wait.
+    if (hold !== undefined) await __holdNestedSections(hold);
   } catch (error) {
     // An abort is the caller's reason, not a network error, so it skips
-    // every translation below.
+    // every translation below -- and the hold above: the caller asked out.
     if (signal?.aborted && error === signal.reason) throw error;
+    // A failed subrequest waits the same way a response does: workerd holds
+    // the completion while a deeper section is open, then rejects (#268).
+    if (hold !== undefined) await __holdNestedSections(hold);
     // A tenant-egress refusal rejects as TypeError, the way workerd
     // surfaces a network failure. The marker comes from the host
     // (`egress::FETCH_REFUSAL_MARKER`); only the detail crosses to JS.
@@ -2248,6 +2273,78 @@ const __invalidTimerCallback = (callback) => {
 // as workerd does (a bundle that persists or does arithmetic on the handle
 // loses the object but keeps the id).
 const __timerHandles = new Map();
+// #268: while a nested section is open, the enclosing body's own task
+// continuations wait. A timer or subrequest started at a shallower section
+// fires only after the sections nested inside it drain; the section owner's
+// own continuations run in their own section, so they never wait for
+// themselves. Microtasks and storage complete freely, and a timer or
+// subrequest started with no cell event does not hold at all.
+//
+// The capture runs where the body schedules the work; the wait runs where
+// the work completes. A depth alone would do if the body were still parked,
+// but a section outlives the body's return through the drain, so the wait
+// consults the section records the open sections recorded.
+// Which body a timer or subrequest belongs to, by async context. A body
+// records its own section when it starts, and the record rides the body's
+// continuations, so a schedule after an `await` still names the scheduling
+// body rather than whatever depth happens to be open then. `__currentActorScope`
+// cannot do this: a block body runs under the gate's context, not the
+// event's, so the event stack does not name it.
+const __holdKey = Symbol("cello.hold");
+ // Isolate-wide count of open nested sections, consulted at completion
+ // time: the capture cannot know whether a section will open before the
+ // work lands, so it never bails out here.
+ let __openSectionCount = 0;
+ const __captureNestedHold = () => {
+   const frame = __als_get();
+   const entered = frame === undefined ? undefined : frame.get(__holdKey);
+   if (entered !== undefined) return entered;
+   // Frameless work resolves at completion time, when openness is known: a
+   // capture cannot know whether a section will open before the work lands,
+   // so pre-armed timers and subrequests must not bail out here. Handler
+   // work runs in no body and names no section, so the wait covers every
+   // open section of its state.
+   const scope = __currentActorScope();
+   if (scope === "") return undefined;
+   const state = __cell.instances[scope]?.__celloState;
+   if (state === undefined || state === null) return undefined;
+   return { state, section: undefined };
+ };
+// Whether `record` is nested inside `ancestor`, through any number of
+// levels: a section holds only the waits scheduled in the sections above
+// it, never a later sibling, which merely reserved a deeper number without
+// being enclosed (#278).
+const __isNestedSection = (record, ancestor) => {
+  let current = record.parent;
+  while (current !== null) {
+    if (current === ancestor) return true;
+    current = current.parent;
+  }
+  return false;
+};
+ const __holdNestedSections = (hold) => {
+   // The zero path: no section is open anywhere in the isolate, so nothing
+   // can be waiting. This is the completion-time fast path that keeps the
+   // no-nesting fetch cheap.
+   if (__openSectionCount === 0) return Promise.resolve();
+   if (hold === undefined) return Promise.resolve();
+   const open = hold.state === undefined ? undefined : hold.state._openNested;
+   if (open === undefined || open.size === 0) return Promise.resolve();
+  // A section that already settled holds nothing: work scheduled after its
+  // close is orphaned the way handler-level work is, and waits for every
+  // open section instead of the closed one.
+  const section = hold.section !== undefined && !hold.section.settledFlag ? hold.section : undefined;
+  return (async () => {
+    for (;;) {
+      const deeper = [...open]
+        .filter(([, record]) => section === undefined ||
+          (record !== section && __isNestedSection(record, section)))
+        .map(([, record]) => record.settled.then(() => {}, () => {}));
+      if (deeper.length === 0) return;
+      await Promise.all(deeper);
+    }
+  })();
+};
 class Timeout {
   #id;
   #op = 0;
@@ -2269,6 +2366,10 @@ class Timeout {
     const op = __timer_alloc();
     this.#op = op;
     this.#live = true;
+    // Whose section this round belongs to: a nested section that opens
+    // afterwards holds the callback until it drains (#268). Armed outside a
+    // cell event there is nothing to hold it.
+    const hold = __captureNestedHold();
     // A rejected op died with its event (client disconnect): the deadline
     // will never arrive, but the callback still runs so promises built on it
     // settle instead of hanging to their budget (denoland/celld#294). The
@@ -2293,7 +2394,13 @@ class Timeout {
       }
       this.#callback(...this.#args);
     };
-    __op_timer(op, this.#delay).then(fire, fire);
+    __op_timer(op, this.#delay).then(
+      () => {
+        if (hold === undefined || (hold.state._openNested?.size ?? 0) === 0) fire();
+        else __holdNestedSections(hold).then(fire);
+      },
+      fire,
+    );
   }
   refresh() {
     if (this.#live) this.#cancel();
@@ -4314,10 +4421,27 @@ class DurableObjectState {
     __primDefineProp(this, "_hibernationTimeout", {
       value: null, enumerable: false, configurable: true, writable: true,
     });
-    // `blockConcurrencyWhile` records nested blocks here; defining the slot
-    // up front keeps that bookkeeping off `Object.keys(ctx)` after the first
-    // nested block (#251).
-    __primDefineProp(this, "_nestedBlocks", {
+    // `blockConcurrencyWhile` sections form a tree: every nested section has
+    // the section whose body scheduled it as its parent, and siblings -- the
+    // children of one parent -- run one at a time in schedule order, each
+    // starting only after the sibling ahead of it has fully settled (#278).
+    // Each record's `settled` fulfills with null when its subtree drained,
+    // or with the raw failure when its body or a descendant failed; it never
+    // rejects, so the sibling behind it and the parent draining it need no
+    // rejection handlers of their own. `_blockSeq` hands out the order.
+    // Defining both slots up front keeps that bookkeeping off
+    // `Object.keys(ctx)` after the first nested block (#251).
+    __primDefineProp(this, "_blockSeq", {
+      value: 0, enumerable: false, configurable: true, writable: true,
+    });
+    // Open nested sections by their caller promise, with the record each
+    // reserved. A timer or subrequest the enclosing body started waits while
+    // a section nested inside its own drains, so the fire path consults the
+    // records instead of the bare depth: a section outlives the body's return
+    // through the drain, and a sibling scheduled later reserves a deeper
+    // number without being enclosed (#268, #278).
+    // Defined up front for the same key-list reason as `_blockSeq`.
+    __primDefineProp(this, "_openNested", {
       value: undefined, enumerable: false, configurable: true, writable: true,
     });
     const facet = __cell.facetConfigs[scope];
@@ -4385,15 +4509,103 @@ class DurableObjectState {
       //
       // The section opens here but workerd invokes the callback on a later
       // turn, never inside the call that made it (#261).
-      const nested = this.#scheduleConcurrencyBlock(f);
-      // A body that failed reset the object and rides with the release. A
-      // block whose deferred turn was cancelled never ran, so it has no
-      // failure to carry and must not refuse the section's waiters the way a
-      // reset does (#267).
-      (this._nestedBlocks ||= []).push(nested.then(
-        () => null,
-        (error) => this._aborted ? __describeFailure(error) : null,
-      ));
+      //
+      // Sibling sections -- the children of one parent -- run one at a time
+      // in schedule order: each starts only after the sibling ahead of it
+      // has fully settled, body and descendants alike (#278). A body that
+      // failed reset the object, so the sibling behind it never runs and
+      // carries that failure instead. The wait is bounded the way every
+      // section's is: a running sibling holds its own 30-second limit, so a
+      // sibling awaiting another breaks the event through that limit instead
+      // of wedging, exactly as workerd's does.
+      this._blockDepth++;
+      // The reservation order is the section order: a sibling scheduled
+      // later reserves a deeper number without being enclosed.
+      const reservedDepth = this._blockDepth;
+      const frame = __als_get();
+      const entered = frame === undefined ? undefined : frame.get(__holdKey);
+      let parent;
+      if (entered !== undefined && entered.state === this && entered.section !== undefined) {
+        // The scheduling body's own section, or the nearest ancestor still
+        // open: a continuation that outlives its section joins the drain
+        // still running above it.
+        parent = entered.section;
+        while (parent.settledFlag) {
+          if (parent.parent === null) { parent = undefined; break; }
+          parent = parent.parent;
+        }
+      }
+      if (parent === undefined) {
+        // Scheduled outside any body -- a timer or handler reaction firing
+        // while a section drains -- joins the youngest open section of this
+        // state. `_blockDepth` is nonzero here, so one exists.
+        const openSections = this._openNested;
+        if (openSections !== undefined) {
+          for (const candidate of openSections.values()) {
+            if (parent === undefined || candidate.seq > parent.seq) parent = candidate;
+          }
+        }
+      }
+      const record = {
+        seq: this._blockSeq++,
+        state: this,
+        parent: parent ?? null,
+        children: [],
+        settledFlag: false,
+        settled: null,
+      };
+      let resolveSettled;
+      record.settled = new Promise((resolve) => { resolveSettled = resolve; });
+      const prev = parent === null || parent.children.length === 0
+        ? undefined
+        : parent.children[parent.children.length - 1];
+      if (parent !== null) parent.children.push(record);
+      const open = (this._openNested ??= new Map());
+      const gatePrev = prev === undefined ? undefined : prev.settled;
+      const nested = __block_turn().then(() => gatePrev).then(
+        (prevFailure) => {
+          if (prevFailure !== null && prevFailure !== undefined) {
+            this._blockDepth--;
+            if (open.delete(nested)) __openSectionCount--;
+            record.settledFlag = true;
+            resolveSettled(prevFailure);
+            throw prevFailure;
+          }
+          return this.#startConcurrencyBlock(f, reservedDepth, record);
+        },
+        (error) => {
+          // The deferred turn never arrived -- the event ended and its ops
+          // were rejected -- so the body never ran and the depth its section
+          // reserved must come back (#267). Left behind, it makes the next
+          // block read as nested and ride a hold nobody took.
+          this._blockDepth--;
+          if (open.delete(nested)) __openSectionCount--;
+          record.settledFlag = true;
+          resolveSettled(this._aborted ? error : null);
+          throw error;
+        },
+      );
+      open.set(nested, record);
+      __openSectionCount++;
+      // The caller's promise settles with the body, before the descendants
+      // run; the record settles after the drain, which is what the sibling
+      // behind this one and the parent draining it wait for. The record
+      // never rejects: a body that failed reset the object and rides with
+      // the release, while a block whose deferred turn was cancelled never
+      // ran, so it has no failure to carry and must not refuse the section's
+      // waiters the way a reset does (#267).
+      nested.then(
+        (value) => this.#drainNestedChildren(record).then((failure) => {
+          if (open.delete(nested)) __openSectionCount--;
+          record.settledFlag = true;
+          resolveSettled(failure);
+        }),
+        (error) => {
+          if (open.delete(nested)) __openSectionCount--;
+          record.settledFlag = true;
+          resolveSettled(this._aborted ? error : null);
+        },
+      );
       return nested;
     }
     // The host owns the gate (cello_logic::gate::InputGate). It replaces a
@@ -4454,8 +4666,18 @@ class DurableObjectState {
         let failure = null;
         let value;
         let thrown = null;
+        // The root of this block's section tree: bodies scheduled while it
+        // runs nest under it, and the drain below waits for them (#278).
+        const rootSection = {
+          seq: this._blockSeq++,
+          state: this,
+          parent: null,
+          children: [],
+          settledFlag: false,
+          settled: null,
+        };
         try {
-          value = await this.#runConcurrencyBlock(f);
+          value = await this.#runConcurrencyBlock(f, rootSection);
         } catch (error) {
           thrown = error;
           failure = __describeFailure(error);
@@ -4468,12 +4690,13 @@ class DurableObjectState {
         // delay the refusal and a transaction's rollback behind it. Each
         // nested block has its own limit, so a drain is bounded by the
         // last one started, as workerd's nested critical sections are.
-        while (failure === null && this._nestedBlocks && this._nestedBlocks.length > 0) {
-          for (const nestedFailure of await Promise.all(this._nestedBlocks.splice(0))) {
-            if (nestedFailure !== null && failure === null) failure = nestedFailure;
-          }
+        // Siblings drain in schedule order: each child below runs only
+        // after the sibling ahead of it has fully settled (#278).
+        if (thrown === null) {
+          failure = await this.#drainNestedChildren(rootSection);
+          if (failure !== null) failure = this._aborted ? __describeFailure(failure) : null;
         }
-        this._nestedBlocks = undefined;
+        rootSection.settledFlag = true;
         __gate_release(this._scope, event, owner, failure);
         if (thrown !== null) throw thrown;
         return value;
@@ -4510,30 +4733,47 @@ class DurableObjectState {
     if (actorEvent !== undefined) actorEvent.sections.push(next);
     return guest;
   }
-  #runConcurrencyBlock(f) {
+  #runConcurrencyBlock(f, section) {
     this._blockDepth++;
-    return this.#startConcurrencyBlock(f);
+    return this.#startConcurrencyBlock(f, this._blockDepth, section);
   }
-  // A nested block's section is open from the call, so a block a body started
-  // from it counts as nested too, but the callback itself starts on a later
-  // turn: workerd's nested critical section is entered by the enclosing
-  // one's turn order, not by the caller's (#261). Rising above the caller's
-  // microtasks is what a guest can see, and it is what keeps a body that
-  // awaits its own nested block from running that block inside the call.
-  #scheduleConcurrencyBlock(f) {
-    this._blockDepth++;
-    return __block_turn().then(() => this.#startConcurrencyBlock(f), (error) => {
-      // The deferred turn never arrived -- the event ended and its ops were
-      // rejected -- so the body never ran and the depth its section reserved
-      // must come back (#267). Left behind, it makes the next block read as
-      // nested and ride a hold nobody took.
-      this._blockDepth--;
-      throw error;
-    });
+  // Drain a section's child sections, in schedule order: each child runs
+  // only after the sibling ahead of it has fully settled, so awaiting them
+  // here is ordered already (#278). Returns the first failure, if any. A
+  // body that failed skips this. Never rejects.
+  async #drainNestedChildren(record) {
+    let failure = null;
+    try {
+      while (failure === null && record.children.length > 0) {
+        const results = await Promise.all(record.children.splice(0).map((child) => child.settled));
+        for (const result of results) {
+          if (result !== null && result !== undefined && failure === null) failure = result;
+        }
+      }
+    } catch {
+      // A child's `settled` never rejects; this is belt-and-braces so a
+      // drain never rejects its section's bookkeeping.
+    }
+    return failure;
   }
   // The body and the limit around it. A synchronous throw resets the object
   // and rejects, as a body that throws any other way does.
-  #startConcurrencyBlock(f) {
+  #startConcurrencyBlock(f, reservedDepth, section) {
+    // Name this section for the timer hold and the section tree: timers and
+    // subrequests the body schedules -- synchronously or after an `await` --
+    // wait while a section nested inside this one is open, while the section
+    // owner's own continuations run in their own section and never wait for
+    // themselves (#268). Bodies the section schedules nest under it, and a
+    // sibling scheduled later waits behind it (#278). The frame rides the
+    // body's continuations the way `__ctxRun` frames do; the `finally`
+    // restores the prior frame for the synchronous caller. `reservedDepth`
+    // is the depth this section reserved when it opened, which the deferred
+    // start must not re-read: a sibling scheduled later reserves deeper
+    // without being enclosed.
+    const prior = __als_get();
+    const frame = new Map(prior);
+    frame.set(__holdKey, { state: this, section });
+    __als_set(frame);
     let result;
     try {
       result = f();
@@ -4541,6 +4781,8 @@ class DurableObjectState {
       this._blockDepth--;
       this.#resetAfterConcurrencyFailure(error);
       throw error;
+    } finally {
+      __als_set(prior);
     }
     const timerId = __timer_alloc();
     let settled = false;
@@ -4571,9 +4813,22 @@ class DurableObjectState {
       },
     );
   }
+  // Reconcile the open-section count synchronously before the termination
+  // below: the settle microtasks that would forget these records never run
+  // on a terminated cell, so without this the isolate-global counter stays
+  // elevated and every later capture in the isolate pays the slow path.
+  // Clearing the map drops the stale records with it; the guarded
+  // `open.delete` forgets keep any surviving reaction safe.
+  #reconcileOpenSections() {
+    const open = this._openNested;
+    if (open === undefined) return;
+    __openSectionCount -= open.size;
+    open.clear();
+  }
   #resetAfterConcurrencyFailure(error) {
     if (this._aborted) return;
     this._aborted = true;
+    this.#reconcileOpenSections();
     // Drop this scope's queued puts, not the executing cell's: under a
     // stub-mediated caller the executing cell is the caller, whose puts
     // must survive. The host verifies this scope is a resetting cell of
@@ -4602,6 +4857,7 @@ class DurableObjectState {
   abort(reason) {
     if (this._aborted) return;
     this._aborted = true;
+    this.#reconcileOpenSections();
     // Drop this scope's queued puts, not the executing cell's: under a
     // stub-mediated caller the executing cell is the caller, whose puts
     // must survive. The host verifies this scope is a resetting cell of
@@ -8592,9 +8848,17 @@ class DurableObjectNamespace {
     let brokenFailure = null;
     const invoke = async (operation) => {
       if (brokenFailure !== null) throw __cellHandlerReplay(brokenFailure);
+      // Whose section this call belongs to: stub completions wait like the
+      // enclosing body's timers while a deeper section is open, resolve or
+      // reject -- workerd holds the failure until the section drains too
+      // (#268).
+      const hold = __captureNestedHold();
       try {
-        return await operation();
+        const result = await operation();
+        if (hold !== undefined) await __holdNestedSections(hold);
+        return result;
       } catch (error) {
+        if (hold !== undefined) await __holdNestedSections(hold);
         const routingError = __durableObjectRoutingError(error);
         if (routingError !== null) throw routingError;
         const message = String(error && error.message || error);
@@ -15035,10 +15299,16 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
           "SyntaxError");
       }
       __sockets.set(state.id, this);
+      // Whose section this dial belongs to: a nested section that is still
+      // open holds the open/error dispatch until it drains, like every
+      // other subrequest completion, resolve and reject alike (#268).
+      const hold = __captureNestedHold();
+      const held = (dispatch) => hold === undefined ? dispatch :
+        (...args) => { __holdNestedSections(hold).then(() => dispatch(...args)); };
       const connection = __ws_connect(state.id, scope, id, JSON.stringify(requested));
       __registerWaitUntil(connection);
       if (state.polled) this.#startPump();
-      connection.then((protocol) => {
+      connection.then(held((protocol) => {
         if (state.readyState === WebSocket.READY_STATE_CLOSING) {
           if (state.pendingClose) {
             const [code, reason] = state.pendingClose;
@@ -15050,12 +15320,12 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
         state.protocol = protocol;
         state.readyState = WebSocket.READY_STATE_OPEN;
         this.dispatchEvent(new Event("open"));
-      }, (error) => {
+      }), held((error) => {
         state.readyState = WebSocket.READY_STATE_CLOSED;
         __sockets.delete(state.id);
         this.dispatchEvent(new ErrorEvent("error", { message: String(error?.message || error), error }));
         this.#dispatchClose(1006, "", false);
-      });
+      }));
     }
   }
   get readyState() { return this.#s.readyState; }
