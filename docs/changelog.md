@@ -105,20 +105,23 @@ workerd 1.20261121.1).
   `prefix`, `cursor`, `startAfter` or `delimiter` that is not a string, or an
   `include` that is not an array, fails with `Incorrect type for the
   '<field>' field on 'ListOptions'`.
-- **An invalid R2 cursor answers the empty page** (#164). Every cursor is now
-  an opaque, versioned base64url token (`cello-r2-cursor-v1.…`), and a string
-  outside that format -- a plain key, a made-up word, or a token that does
-  not parse -- answers `{ objects: [], truncated: false, delimitedPrefixes:
-  [] }` instead of restarting the listing from the first page: a restart
-  loops a paginating client forever, and R2 answers the empty page. A
-  complete page carries `cursor: undefined` as its own member, as workerd's
-  `R2Objects` does. `cello r2 list --page` and `--cursor` refuse such a
-  cursor with an error rather than printing an empty page. This drops the
-  plain-key cursor 0.2.9 answered a page with; a client holding one gets the
-  empty page and restarts its walk from a fresh first page. The token is
-  unsigned, so a client can mint one, and it is honoured as a listing
-  position inside the binding's own bucket and prefix and nothing more (no
-  other bucket, no escape from the prefix's directory, no wider page bound).
+- **An invalid R2 cursor answers the empty page** (#164). Every cursor Cello
+  answers is now an opaque, versioned base64url token
+  (`cello-r2-cursor-v1.…`), and a string outside that format that names no
+  object answers `{ objects: [], truncated: false, delimitedPrefixes: [] }`
+  instead of restarting the listing from the first page: a restart loops a
+  paginating client forever, and R2 answers the empty page. A complete page
+  carries `cursor: undefined` as its own member, as workerd's `R2Objects`
+  does. `cello r2 list --page` and `--cursor` refuse such a cursor with an
+  error rather than printing an empty page. **Rolling upgrades:** 0.2.9 and
+  earlier answered a page with the plain key it consumed, so a plain key is
+  still read as a cursor through 0.2.10 -- and only while the bucket holds an
+  object at that key, so a legitimate 0.2.9 cursor keeps paging while a
+  made-up string gets the empty page. The plain-key path is removed in
+  0.2.11. The token is unsigned, so a client can mint one, and it is honoured
+  as a listing position inside the binding's own bucket and prefix and
+  nothing more (no other bucket, no escape from the prefix's directory, no
+  wider page bound).
 - **Binding option arguments are type-checked** (#187). R2 `get`, `put`,
   `list` and `createMultipartUpload`; KV `put` and `list`; and Durable Object
   storage `get`, `put`, `delete`, `list`, `setAlarm` and `deleteAlarm`
