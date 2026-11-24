@@ -24,9 +24,12 @@ const shape = (error) => ({
   remote: error !== null && typeof error === "object" ? error.remote : null,
   stack: typeof error?.stack === "string" ? error.stack : null,
   stackLines: typeof error?.stack === "string" ? error.stack.split("\n").length : null,
-  // The oversize probe throws a string `payload`; its length proves the clone
-  // crossed whole rather than being truncated or dropped (#238).
+  // The oversize probe throws a string `payload`; its length plus "every
+  // character is x" prove the clone crossed whole rather than truncated,
+  // dropped or corrupted, without shipping 70 KB of it (#238).
   payloadLength: typeof error?.payload === "string" ? error.payload.length : null,
+  payloadAllX: typeof error?.payload === "string"
+    ? /^x*$/.test(error.payload) : null,
 });
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 5));
