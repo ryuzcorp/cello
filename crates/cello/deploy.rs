@@ -3768,6 +3768,12 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
                  websocket_standard_binary_type vs no_websocket_standard_binary_type"
             );
         }
+        if has("sql_boolean_text") && has("no_sql_boolean_text") {
+            bail!(
+                "Compatibility flags are mutually contradictory: \
+                 sql_boolean_text vs no_sql_boolean_text"
+            );
+        }
     }
     metadata.insert("bindings".into(), Value::Array(bindings));
     if !queue_consumers.is_empty() {

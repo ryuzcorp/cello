@@ -271,6 +271,11 @@ pub struct Compat {
     /// a binary message arrives as a `Blob`, per the WHATWG default. Without
     /// it cello keeps the historical `"arraybuffer"`.
     pub websocket_standard_binary_type: bool,
+    /// `sql_boolean_text`: a `true`/`false` bind into Durable Object SQL is
+    /// stored as the TEXT `'true'`/`'false'`, which is what workerd stores.
+    /// Without it — a compatibility date before 2026-11-24, or none — the
+    /// bind stays INTEGER `1`/`0`, the type Cello wrote before that date.
+    pub sql_boolean_text: bool,
     /// Queue bodies default to JSON on compatibility dates after 2024-03-18;
     /// older deployments retain the V8 structured-clone default.
     pub queue_json_messages: bool,
@@ -315,6 +320,13 @@ impl Compat {
     ///   and its internal queue stubs call fetch/RPC, never the helpers.
     /// - `websocket_standard_binary_type` is read only when constructing
     ///   a `WebSocket`; the shared cells construct none.
+    /// - `sql_boolean_text` is read only by the bind conversion of a
+    ///   tenant cell's `sql.exec` (`storage::json_to_sql`), which runs in
+    ///   the isolate that owns that cell. The runtime isolate hosts the
+    ///   runtime-supplied classes, whose SQL never crosses that op — D1
+    ///   binds through its own adapter, and the queue, workflow and wake
+    ///   tables bind typed values in Rust — so the union never changes
+    ///   the type a script's own rows were written with.
     ///
     /// No tenant code runs in the runtime isolate, so the reflected
     /// `Cloudflare.compatibilityFlags` there is unread too. A future
@@ -330,6 +342,7 @@ impl Compat {
             sqlite_vec: self.sqlite_vec || other.sqlite_vec,
             websocket_standard_binary_type: self.websocket_standard_binary_type
                 || other.websocket_standard_binary_type,
+            sql_boolean_text: self.sql_boolean_text || other.sql_boolean_text,
             queue_json_messages: self.queue_json_messages || other.queue_json_messages,
             nodejs_process_env: self.nodejs_process_env || other.nodejs_process_env,
         }

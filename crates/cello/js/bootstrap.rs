@@ -1029,7 +1029,7 @@ pub(super) fn adopt_cell(
             cell_storage.epoch,
             cell_storage.replicated_wake,
             cell_storage.vfs,
-            compat.sqlite_vec,
+            compat,
         )
         .context("cell storage open failed")?;
     }
@@ -1050,7 +1050,7 @@ pub(super) fn adopt_embedded_cell(
     startup: EmbeddedStartup,
     compat: Compat,
 ) -> Result<Option<i64>> {
-    storage::open_embedded(cell, parent, name, &startup.path, compat.sqlite_vec)
+    storage::open_embedded(cell, parent, name, &startup.path, compat)
         .context("facet storage open failed")?;
     let alarm = finish_cell_adoption(tc, cell, true)?;
     let depth = parent.facet_path.len() + 1;
