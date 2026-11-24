@@ -65,7 +65,7 @@ curl "http://127.0.0.1:9876/?name=b"   # {"n":1}
 - `transaction()` and `transactionSync()` group several writes.
 - `storage.setAlarm()`, `getAlarm()`, and `deleteAlarm()` manage one alarm per object, and Cello calls the `alarm(alarmInfo)` handler.
 - `ctx.acceptWebSocket()` accepts a hibernatable WebSocket, and Cello calls `webSocketMessage()` for each frame. `ctx.setHibernatableWebSocketEventTimeout()` sets the hibernatable WebSocket event timeout with workerd's conversion, and `ctx.getHibernatableWebSocketEventTimeout()` reports it.
-- `blockConcurrencyWhile()` closes the input gate.
+- `blockConcurrencyWhile()` closes the input gate, and a non-function argument is refused the way workerd refuses it: the call answers a rejected promise carrying WebIDL's message instead of throwing. A block taken inside another block's body is a nested section: its callback starts on a later turn, after the calling body's microtasks and after the enclosing block's promise has settled, and the outer section stays open over it until it drains. The promise `blockConcurrencyWhile()` answers settles when the body settles, before a nested block runs.
 - `storage.sync()` waits for the durability of the earlier committed writes.
 - `storage.getCurrentBookmark()`, `getBookmarkForTime()`, and `onNextSessionRestoreBookmark()` are the session-bookmark methods. A local storage back-end has no point-in-time recovery, so the last two refuse with workerd's own error, and `getCurrentBookmark()` answers a per-object bookmark: see [Bookmarks](#bookmarks).
 - `ctx.props` is a facet's props, and `{}` for a class declared without props.

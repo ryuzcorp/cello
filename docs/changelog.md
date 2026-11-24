@@ -20,6 +20,24 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
   reason and an invalid one fails with `Decompression failed.` — Workerd's
   shape in both cases, where Cello used to fail every such write with the
   cancel error.
+- **`blockConcurrencyWhile` refuses and schedules the way workerd does
+  (#261).** A non-function argument is now refused as WebIDL refuses it:
+  the member answers a rejected promise carrying
+  `Failed to execute 'blockConcurrencyWhile' on 'DurableObjectState': parameter 1 is not of type 'function'.`
+  instead of throwing at the call, so the caller keeps running and a real
+  block after a refusal still starts. A nested block's callback runs on a
+  later turn, as workerd's does: after the calling body's microtasks and
+  after the enclosing block's promise has settled and run its reactions,
+  never inside the call that made it. The promise the member answers
+  settles when the block's body settles, as workerd's does, and the
+  section stays open past it: nested blocks still drain, and the outer
+  hold still covers each of them, before the gate releases. Everything else
+  about the block is unchanged -- one section per event, the depth limit,
+  the drain, the failure reset and the 30-second limit. That limit now has
+  a conformance test, which shortens it through a `CELLO_TEST_WAIT=1` seam
+  instead of waiting 30 s. The differential gate gained three cases
+  (`do/block-refusals`, `do/nested-block-order`, `do/nested-block-drain`)
+  that fail before this change and every case agrees.
 - **A compression stream settles a cancel racing an abort the way Workerd
   does (#252).** A `DecompressionStream`/`CompressionStream` with a write in
   flight, a pending `read()` and a synchronous `reader.cancel()` followed by
