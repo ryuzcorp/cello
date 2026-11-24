@@ -467,7 +467,10 @@ The `tail` and `email` handlers are unavailable.
   operations keep reporting the cancel reason; a write whose transform was
   already running still completes, as does one queued behind it.
   `IdentityTransformStream` and
-  `FixedLengthStream` resolve a write only once its bytes have been read.
+  `FixedLengthStream` resolve a write only once its bytes have been read. A
+  chunk that is not a `BufferSource` rejects only that write with a
+  `TypeError`, leaving both sides usable and -- for `FixedLengthStream` --
+  not counting toward the expected length.
 - A pull source runs on Workerd's schedule, which differs from the WHATWG
   text: `pull()` is called when a read request is registered and again while
   an `enqueue` leaves the desired size positive, but not after a `read()`

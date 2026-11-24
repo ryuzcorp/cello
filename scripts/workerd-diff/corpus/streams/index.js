@@ -1030,6 +1030,116 @@ const routes = {
     }
     return report(out);
   },
+  async "/identity-invalid-chunk"() {
+    // Issue #280: writing a chunk that is not a BufferSource rejects only
+    // that write with a TypeError, leaving both sides usable -- the same
+    // shape as #276 for compression streams. Cello used to run the
+    // conversion in the sink, erroring the readable and the write. Shaped
+    // both ways round the first read without any timing; every promise
+    // settles on both runtimes.
+    const shape = async (readFirst) => {
+      const stream = new IdentityTransformStream();
+      const writer = stream.writable.getWriter();
+      const reader = stream.readable.getReader();
+      const chunks = [];
+      let drained = null;
+      const startDrain = () => {
+        drained = (async () => {
+          for (;;) {
+            try {
+              const { value, done } = await reader.read();
+              if (done) return { done: true };
+              chunks.push(value.byteLength);
+            } catch (error) { return errorInfo(error); }
+          }
+        })();
+      };
+      let invalid;
+      if (readFirst) {
+        startDrain();
+        invalid = writer.write(42).then(() => "ok", errorInfo);
+      } else {
+        invalid = writer.write(42).then(() => "ok", errorInfo);
+        startDrain();
+      }
+      const invalidOut = await invalid;
+      const valid = writer.write(new Uint8Array([9, 9, 9])).then(() => "ok", errorInfo);
+      const close = writer.close().then(() => "ok", errorInfo);
+      const closed = writer.closed.then(() => "ok", errorInfo);
+      const out = {
+        invalid: invalidOut,
+        valid: await valid,
+        close: await close,
+        closed: await closed,
+        drain: await drained,
+        chunks,
+        total: chunks.reduce((sum, len) => sum + len, 0),
+      };
+      reader.releaseLock();
+      writer.releaseLock();
+      return out;
+    };
+    return report({
+      invalidFirst: await shape(false),
+      readFirst: await shape(true),
+    });
+  },
+
+  async "/fixed-length-invalid-chunk"() {
+    // Issue #280, the FixedLengthStream side: an invalid chunk rejects only
+    // that write and does not count toward the expected length -- a 3-byte
+    // and a 2-byte write still fill a length-5 stream exactly and the close
+    // resolves.
+    const shape = async (readFirst) => {
+      const stream = new FixedLengthStream(5);
+      const writer = stream.writable.getWriter();
+      const reader = stream.readable.getReader();
+      const chunks = [];
+      let drained = null;
+      const startDrain = () => {
+        drained = (async () => {
+          for (;;) {
+            try {
+              const { value, done } = await reader.read();
+              if (done) return { done: true };
+              chunks.push(value.byteLength);
+            } catch (error) { return errorInfo(error); }
+          }
+        })();
+      };
+      let invalid;
+      if (readFirst) {
+        startDrain();
+        invalid = writer.write(42).then(() => "ok", errorInfo);
+      } else {
+        invalid = writer.write(42).then(() => "ok", errorInfo);
+        startDrain();
+      }
+      const invalidOut = await invalid;
+      const first = writer.write(new Uint8Array([1, 2, 3])).then(() => "ok", errorInfo);
+      const second = writer.write(new Uint8Array([4, 5])).then(() => "ok", errorInfo);
+      const close = writer.close().then(() => "ok", errorInfo);
+      const closed = writer.closed.then(() => "ok", errorInfo);
+      const out = {
+        invalid: invalidOut,
+        first: await first,
+        second: await second,
+        close: await close,
+        closed: await closed,
+        drain: await drained,
+        chunks,
+        total: chunks.reduce((sum, len) => sum + len, 0),
+      };
+      reader.releaseLock();
+      writer.releaseLock();
+      return out;
+    };
+    return report({
+      invalidFirst: await shape(false),
+      readFirst: await shape(true),
+    });
+  },
+
   async "/pipe-to-destination-states"() {
     // Issue #269: pipeTo onto a destination it cannot take rejects instead
     // of hanging. A destination locked by a held writer or by another pipe

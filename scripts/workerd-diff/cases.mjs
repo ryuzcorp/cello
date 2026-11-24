@@ -77,6 +77,9 @@ export const cases = [
   { name: "transform-backpressure", fixture: "streams", path: "/transform-backpressure" },
   { name: "identity-transform", fixture: "streams", path: "/identity-transform" },
   { name: "fixed-length", fixture: "streams", path: "/fixed-length" },
+  // #280: an invalid chunk rejects only its own write on internal byte streams.
+  { name: "identity-invalid-chunk", fixture: "streams", path: "/identity-invalid-chunk" },
+  { name: "fixed-length-invalid-chunk", fixture: "streams", path: "/fixed-length-invalid-chunk" },
   { name: "gzip-roundtrip", fixture: "streams", path: "/gzip-roundtrip" },
   { name: "deflate-roundtrip", fixture: "streams", path: "/deflate-roundtrip" },
   { name: "text-encoder-stream", fixture: "streams", path: "/text-encoder-stream" },

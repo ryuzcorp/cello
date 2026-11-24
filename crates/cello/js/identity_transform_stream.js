@@ -413,6 +413,10 @@ class IdentityTransformStream {
       abort(reason) { ctl._errorRd(toError(reason)); },
     });
     ctl._writable = writable;
+    // An invalid chunk rejects only that write, leaving both sides usable:
+    // the conversion throws before any delivery or length accounting, as
+    // on Workerd (#280). Validated when the write is accepted (#276).
+    __cello.$$writableStreamState(writable).validateChunk = bytes;
     // abort() must not deadlock behind a write parked in _deliver: the
     // writable machinery waits for the in-flight write before running
     // the sink abort, so unpark it with the abort reason.
