@@ -2094,13 +2094,13 @@ class R2Bucket {
     const o = __bindingOptions(options, "list", "R2Bucket", 1, "ListOptions");
     // `limit` is an int: a non-finite value is 0, a fractional one truncates,
     // and R2's MaxKeys rule refuses a page bound that converts to zero or is
-    // over 1000. A negative bound is R2's "use the default", not a refusal --
-    // workerd answers the full page for it -- and an absent one is the same
-    // page.
+    // over 1000. Only -1 is R2's "use the default page" sentinel -- workerd
+    // answers the 1000-key default page for it and refuses every other
+    // negative -- and an absent one is that same page.
     let limit = 0;
     if (o.limit !== undefined) {
       const requested = __boundInt32(o.limit);
-      if (requested === 0 || requested > 1000) {
+      if (requested === 0 || requested > 1000 || requested < -1) {
         throw __r2Failure(
           "list",
           "MaxKeys params must be positive integer <= 1000.",
@@ -2153,7 +2153,13 @@ class R2Bucket {
   async createMultipartUpload(key, options) {
     const { binding, bucketName } = this.#state();
     const name = __r2Key(binding, "createMultipartUpload", key);
-    const write = __r2WriteOptions(binding, "createMultipartUpload", options);
+    const write = __r2WriteOptions(
+      binding,
+      "createMultipartUpload",
+      __bindingOptions(
+        options, "createMultipartUpload", "R2Bucket", 2, "MultipartOptions",
+      ),
+    );
     if (write.onlyIf) {
       __r2Reject(
         binding,
@@ -2798,7 +2804,10 @@ class DurableObjectStorage {
         "longer running");
     await __storage_sync(this._scope);
   }
-  async setAlarm(t) {
+  async setAlarm(t, options) {
+    // Arguments convert before the call, so the options refusal precedes the
+    // instant's validation and the alarm-handler check.
+    __bindingOptions(options, "setAlarm", "DurableObjectStorage", 2, "SetAlarmOptions");
     // Captured synchronously, before the first await: a call from the
     // constructor runs while the instance is not registered yet, and that is
     // exactly workerd's Initializing state, where setAlarm is allowed
@@ -2825,7 +2834,8 @@ class DurableObjectStorage {
     const v = __alarm_get(this._scope);
     return v === null ? null : v;
   }
-  async deleteAlarm() {
+  async deleteAlarm(options) {
+    __bindingOptions(options, "deleteAlarm", "DurableObjectStorage", 1, "SetAlarmOptions");
     this._assertTransactionActive("deleteAlarm");
     if (!this._transactionControl) await Promise.resolve();
     if (!this._flushPendingPuts()) return;

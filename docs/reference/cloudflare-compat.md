@@ -233,9 +233,11 @@ Only the binding types in the [services table](#services) are available.
 Every binding method converts its options argument the way workerd does: an
 absent or `null` argument means no options, any object is read for its
 fields, and another argument throws `parameter N is not of type
-'XOptions'`. What a binding's *own* fields accept is per service; the
-[KV](../services/kv.md), [R2](../services/r2.md) and [D1](../services/d1.md)
-pages list them.
+'XOptions'`. That covers R2 `get`/`put`/`list`/`createMultipartUpload`, KV
+`put`/`list`, and Durable Object storage `get`/`put`/`delete`/`list`/
+`setAlarm`/`deleteAlarm`. What a binding's *own* fields accept is per
+service; the [KV](../services/kv.md), [R2](../services/r2.md) and
+[D1](../services/d1.md) pages list them.
 
 - **D1 `meta.rows_read`/`rows_written` are Cello's own counters.**
   `changes`, `last_row_id`, `changed_db`, `size_after`, `total_attempts` and
@@ -246,10 +248,12 @@ pages list them.
   here. A statement whose row counts follow from its result (a `SELECT`
   returns the rows it read; an `INSERT`/`UPDATE`/`DELETE` reports the rows it
   wrote) agrees with workerd.
-- **R2 cursors are opaque tokens.** A string Cello did not issue answers the
-  empty page R2 answers instead of restarting the listing. For the release
-  after 0.2.9 a plain key is still accepted as the cursor a page used to
-  answer with, while the bucket holds an object at that key.
+- **R2 cursors are opaque tokens.** A string outside the token format --
+  including the plain key 0.2.9 answered a page with -- gets the empty page
+  R2 answers instead of a listing restarted from the top. A token is honoured
+  as a position inside the binding's own bucket and prefix; it is unsigned,
+  so a client can mint one, but it cannot read another bucket, escape the
+  prefix's directory, or widen a page bound.
 
 `env` additionally carries `CELLO_NODE`: the name of the node running your
 code, injected by the host after every deployment binding. A bundle that
