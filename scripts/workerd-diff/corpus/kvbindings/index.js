@@ -169,6 +169,52 @@ const routes = {
       withMeta: [...withMeta],
     });
   },
+
+  // The options argument of each method (#187). `get`/`getWithMetadata` take
+  // a response type, which is not a dictionary: a name outside the four is
+  // the unknown-type refusal. `put` and `list` take a dictionary, converted
+  // as workerd's JSG converts one; `delete` takes no options at all.
+  async "/options"() {
+    await KV.put("opt/key", "v");
+    const out = {};
+    const values = [
+      ["string", "arrayBuffer"],
+      ["badString", "nope"],
+      ["number", 1],
+      ["true", true],
+      ["null", null],
+      ["array", []],
+      ["function", () => {}],
+      ["date", new Date(0)],
+      ["undefined", undefined],
+      ["object", {}],
+      ["typedObject", { type: "json" }],
+      ["badTypedObject", { type: "nope" }],
+    ];
+    for (const [name, value] of values) {
+      out[`get:${name}`] = await attempt(async () => {
+        const got = await KV.get("opt/key", value);
+        return got === null ? null : typeof got;
+      });
+      out[`getWithMetadata:${name}`] = await attempt(async () => {
+        const got = await KV.getWithMetadata("opt/key", value);
+        return got === null ? null : typeof got.value;
+      });
+      out[`put:${name}`] = await attempt(async () => {
+        await KV.put("opt/put", "v", value);
+        return "ok";
+      });
+      out[`list:${name}`] = await attempt(async () => {
+        const page = await KV.list(value);
+        return { complete: page.list_complete !== false };
+      });
+      out[`delete:${name}`] = await attempt(async () => {
+        await KV.delete("opt/absent", value);
+        return "ok";
+      });
+    }
+    return report(out);
+  },
 };
 
 export default {

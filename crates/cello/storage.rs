@@ -2884,9 +2884,18 @@ pub struct D1PreparedRequest {
 #[derive(serde::Serialize)]
 pub struct D1Meta {
     duration: f64,
+    /// Workerd's `timings`: the same measurement as `duration`, under the
+    /// name Cloudflare's own `D1Meta` carries. A Worker instrumenting
+    /// statement time reads this one.
+    timings: D1Timings,
     rows_read: u64,
     rows_written: u64,
     last_row_id: i64,
+    /// The rows this statement changed: the delta of SQLite's
+    /// `total_changes` across it, so a statement that changed nothing -- a
+    /// read, a `CREATE TABLE`, an `UPDATE ... WHERE 0` -- reports zero. That
+    /// is what workerd reports; `sqlite3_changes()` is connection-level and
+    /// repeats the last writing statement's count instead.
     changes: u64,
     changed_db: bool,
     size_after: u64,
@@ -2899,6 +2908,13 @@ pub struct D1Meta {
     /// One writer, no replicas: every read is served by the primary, and
     /// saying so honestly beats omitting the field.
     served_by_primary: bool,
+}
+
+/// The one timing workerd reports. `duration` is the same value: a local
+/// D1 has one statement to measure, so nothing is left outside it.
+#[derive(serde::Serialize)]
+pub struct D1Timings {
+    sql_duration_ms: f64,
 }
 
 /// One result set: positional rows plus the column names to shape them with.
@@ -3572,18 +3588,27 @@ unsafe fn d1_run_prepared(
         return Err(d1_error(over));
     }
     let rows_written = total_changes_for_handle(database).saturating_sub(changes_before);
-    let (last_row_id, changes) = if readonly {
-        (0, 0)
+    // `changes` is what this statement changed, not SQLite's connection-level
+    // counter: `sqlite3_changes()` reports the last statement's count even for
+    // one that changed nothing, and workerd reports the delta (0 for DDL, for
+    // `UPDATE ... WHERE 0`, and for a read).
+    let changes = rows_written;
+    let last_row_id = if readonly {
+        0
     } else {
-        (connection.last_insert_rowid(), connection.changes())
+        connection.last_insert_rowid()
     };
     let changed_db =
         !readonly && (rows_written > 0 || d1_schema_version(connection) != schema_before);
+    let duration = started.elapsed().as_secs_f64() * 1000.0;
     Ok(D1PreparedResult {
         columns,
         rows: stepped.rows,
         meta: D1Meta {
-            duration: started.elapsed().as_secs_f64() * 1000.0,
+            duration,
+            timings: D1Timings {
+                sql_duration_ms: duration,
+            },
             rows_read: rows_read.unwrap_or(stepped.rows_read),
             rows_written,
             last_row_id,

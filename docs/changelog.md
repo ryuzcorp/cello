@@ -76,6 +76,63 @@ or API-shape break.
   `globalThis.DOMException` neither gets a call inside either path nor changes
   the class its caller sees.
 
+Three binding divergences the 0.2.9 sweep filed are fixed, and the
+differential gate gained three cases (204 in all, every one agreeing with
+workerd 1.20261121.1).
+
+- **`D1Result.meta` carries `timings`** (#158). Every result answers
+  `timings: { sql_duration_ms }`, the same measurement as `duration`, so a
+  Worker instrumenting statement time no longer reads `undefined`.
+  `changes` is now the number of rows the statement changed -- the delta of
+  SQLite's `total_changes` -- instead of the connection's
+  `sqlite3_changes()`, which repeated the last writing statement's count for
+  a statement that changed nothing; a `CREATE TABLE` now reports `changes:
+  0`, as workerd does. `rows_read`/`rows_written` stay Cello's own counters.
+  Workerd reads them from libSQL's btree layer, so it also charges a write
+  for the rows it reads and a DDL statement for the pages it touches (a
+  `CREATE TABLE` reports `1` and `2`), which stock SQLite cannot reproduce;
+  where the count follows from the result -- a `SELECT`'s rows read, a
+  write's rows written -- the two agree. The deviation is documented in
+  [Cloudflare compatibility](reference/cloudflare-compat.md#bindings).
+- **R2 `list()` validates `limit` and its cursor** (#164). `limit` follows
+  R2's `MaxKeys` rule: 1 to 1000 bounds the page, a negative value is the
+  default page, and `0`, `NaN`, a value above 1000, or a value that converts
+  to one of those (including `null`) fails with `list: MaxKeys params must be
+  positive integer <= 1000. (10022)`, while a finite value outside the 32-bit
+  range fails with `Value out of range. Must be between -2147483648 and
+  2147483647 (inclusive).`. Every field is converted as R2 converts it: a
+  `prefix`, `cursor`, `startAfter` or `delimiter` that is not a string, or an
+  `include` that is not an array, fails with `Incorrect type for the
+  '<field>' field on 'ListOptions'`.
+- **An invalid R2 cursor answers the empty page** (#164). Every cursor is now
+  an opaque, versioned base64url token (`cello-r2-cursor-v1.…`), and a
+  string Cello did not issue answers `{ objects: [], truncated: false,
+  delimitedPrefixes: [] }` instead of restarting the listing from the first
+  page -- a restart loops a paginating client forever, and R2 answers the
+  empty page. A complete page carries `cursor: undefined` as its own member,
+  as workerd's `R2Objects` does. `cello r2 list --page` and `--cursor`
+  refuse such a cursor with an error rather than printing an empty page. A
+  page's cursor used to be the plain key it consumed, so for one release a
+  plain key is still accepted as a cursor, and only while the bucket still
+  holds an object at that key; cursors issued by 0.2.9 keep paging, and a
+  key the bucket does not have is the empty page. Remove that path in the
+  next release.
+- **Binding option arguments are type-checked** (#187). R2 `get`, `put` and
+  `list`; KV `put` and `list`; and Durable Object storage `get`, `put`,
+  `delete` and `list` convert their options dictionary as workerd's JSG
+  does: an absent or `null` argument means no options, an object (including
+  an array or a `Date`, which carry none of the fields) is the dictionary its
+  properties spell, and any other argument throws `Failed to execute
+  '<method>' on '<interface>': parameter N is not of type 'XOptions'.` A typo
+  in an options object no longer reads as "no options". The entries form of
+  `storage.put` refuses an argument list that matches no overload with
+  workerd's own `put() may only be called with …` message, KV
+  `get`/`getWithMetadata` refuse a response type outside the four names with
+  workerd's `Unknown response type.` message instead of falling back to text,
+  and `storage.list(null)` lists where it used to fail deserializing the
+  options. `head` and `delete` take no options on R2, so a stray argument is
+  still ignored there, as in workerd.
+
 ## v0.2.9
 
 Cello now answers like workerd 1.20261121.1 across the Fetch API, streams,

@@ -141,6 +141,80 @@ export class Probe {
         out.symbolValue = await attempt(() => s.put("sym", Symbol("s")));
         return report(out);
       },
+      async "/storage-options"() {
+        // The options argument of each method, converted as workerd's JSG
+        // converts a dictionary: null and any object are dictionaries (an
+        // array or a Date has none of the members), a primitive is the
+        // refusal. Every probe starts from the same two keys, so one
+        // argument's outcome cannot change the next one's answer.
+        const s = this.state.storage;
+        const out = {};
+        const reset = async () => {
+          await s.deleteAll();
+          await s.put("k", 1);
+          await s.put("second", 2);
+        };
+        const values = [
+          ["string", "nope"],
+          ["number", 1],
+          ["true", true],
+          ["null", null],
+          ["array", []],
+          ["arrayValues", ["x"]],
+          ["function", () => {}],
+          ["date", new Date(0)],
+          ["undefined", undefined],
+          ["object", {}],
+        ];
+        for (const [name, value] of values) {
+          await reset();
+          out[`get:${name}`] = await attempt(async () => {
+            const got = await s.get("k", value);
+            return got === undefined ? "<undefined>" : got;
+          });
+          out[`getMany:${name}`] = await attempt(async () => {
+            const got = await s.get(["k", "second"], value);
+            return got instanceof Map ? got.size : String(got);
+          });
+          out[`put:${name}`] = await attempt(async () => {
+            await s.put("k", 2, value);
+            return await s.get("k");
+          });
+          out[`delete:${name}`] = await attempt(async () => {
+            const count = await s.delete("absent", value);
+            return count === undefined ? "<undefined>" : count;
+          });
+          out[`deleteMany:${name}`] = await attempt(async () => {
+            const count = await s.delete(["absent"], value);
+            return count === undefined ? "<undefined>" : count;
+          });
+          out[`list:${name}`] = await attempt(async () => {
+            const listed = await s.list(value);
+            return listed instanceof Map ? listed.size : String(listed);
+          });
+        }
+        // The entries form is `put(entries, options)`: an argument list that
+        // matches no overload is refused with its own message. What the write
+        // stores is not compared here: workerd takes only a plain object as
+        // `entries` and silently writes nothing for a Map, which is a separate
+        // divergence from this one.
+        await reset();
+        const entries = { k: 3 };
+        for (const [name, value] of [
+          ["string", "nope"],
+          ["number", 1],
+          ["true", true],
+          ["object", {}],
+          ["undefined", undefined],
+        ]) {
+          out[`putEntries:${name}`] = await attempt(async () => {
+            await s.put(entries, value);
+            return "ok";
+          });
+        }
+        await s.deleteAll();
+        return report(out);
+      },
       async "/sql"() {
         const sql = this.state.storage.sql;
         sql.exec("DROP TABLE IF EXISTS t");
