@@ -206,6 +206,10 @@ export const cases = [
   // #259: the runtime's script-scoped workflow class is aliased into the
   // classes registry, and `ctx.exports` must not expose it as a handle.
   { name: "do-workflow/exports-surface", fixture: "do-workflow", path: "/exports-surface" },
+  // #266: a module's WorkflowEntrypoint classes are its workflows'
+  // bindings in `ctx.exports`, in a plain Worker and inside a Durable Object.
+  { name: "workflow-exports", fixture: "workflow", path: "/exports" },
+  { name: "workflow-exports-do", fixture: "workflow", path: "/do" },
   { name: "ws-pair", fixture: "ws", path: "/pair" },
   { name: "ws-upgrade", fixture: "ws", websocket: "/ws" },
   { name: "ws-hibernation", fixture: "ws-hib", websocket: { path: "/ws", close: false } },

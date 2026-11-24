@@ -1,0 +1,11 @@
+{
+  "name": "workflow-exports",
+  "main": "index.js",
+  "compatibility_date": "2026-11-24",
+  "no_bundle": true,
+  "durable_objects": { "bindings": [{ "name": "OBJ", "class_name": "Probe" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Probe"] }],
+  "workflows": [
+    { "binding": "SLOW", "name": "slow-workflow", "class_name": "Slow" }
+  ]
+}

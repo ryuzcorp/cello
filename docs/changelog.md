@@ -22,6 +22,19 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
   differential gate gained four cases -- the three orderings that failed
   before this change plus a cancel-then-close control that already agreed --
   and every case agrees.
+- **A module's Workflows are in `ctx.exports` as their workflow bindings
+  (#266).** A `WorkflowEntrypoint` class export is its Workflow's binding,
+  keyed by the class name, as workerd keys it: `ctx.exports.Slow` is a
+  `[object WrappedBinding]` (a `WorkflowImpl` over `WrappedBinding`, with
+  `create`, `createBatch`, `deleteBatch` and `get`, no own property, and the
+  workflow name in a private slot), a distinct object over the same instance
+  store `env.SLOW` reaches, in a Durable Object as in a stateless entrypoint.
+  The reserved `__Workflow.<script>` cell alias stays out of the export map.
+  `env.<binding>` now reflects workerd's binding shape too. A config that
+  names one class for two workflows, or that names `default`, is refused at
+  deploy, as workerd refuses it. The differential gate gained
+  `workflow-exports` and `workflow-exports-do` (246 total) and every case
+  agrees.
 - **Compression streams deliver output per push and keep an accepted write
   across a cancel, as Workerd does (#257).** A `CompressionStream` now
   enqueues whatever the encoder emitted for each write instead of holding

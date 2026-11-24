@@ -3466,6 +3466,7 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
         Some(_) => bail!("config `workflows` must be an array"),
     };
     let mut workflow_names = BTreeSet::new();
+    let mut workflow_classes = BTreeSet::new();
     for workflow in workflows {
         // Any key cello does not model stops the deploy, per the loud-gap
         // rule: an unread knob (`schedules` is the notable one) must be a
@@ -3523,6 +3524,29 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
             bail!(
                 "workflow {workflow_name:?} names the reserved class {class_name:?} as its \
                  `class_name`; export a WorkflowEntrypoint subclass of your own"
+            );
+        }
+        // Workerd reads a workflow class from a *named* export; `default` is
+        // the module's handler, and workerd refuses a workflow that names it
+        // ("refers to class \"default\", but the Worker exports no such
+        // WorkflowEntrypoint"). `ctx.exports.default` stays the default
+        // handler's stub, so the name cannot also be a workflow binding.
+        if class_name == "default" {
+            bail!(
+                "workflow {workflow_name:?} names the class \"default\"; export the \
+                 WorkflowEntrypoint subclass under its own name, because `default` is \
+                 the Worker's handler"
+            );
+        }
+        // `ctx.exports` keys a workflow binding by its class name, as workerd
+        // does, so one class can name one workflow. Workerd refuses the second
+        // ("configures multiple Workflows for class ...") rather than let the
+        // config's order pick which binding the class shows.
+        if !workflow_classes.insert(class_name) {
+            bail!(
+                "workflows name the class {class_name:?} more than once; a \
+                 WorkflowEntrypoint class is one workflow's binding in `ctx.exports`, \
+                 so give each workflow its own class"
             );
         }
         if let Some(script) = workflow.get("script_name").and_then(Value::as_str) {
@@ -5412,6 +5436,78 @@ mod tests {
             names.contains(&"REGION"),
             "an ordinary dotenv entry still lands: {names:?}"
         );
+    }
+
+    /// `ctx.exports` keys a workflow binding by its class name, as workerd
+    /// does, so a second workflow naming the same class has no entry to be.
+    /// Workerd refuses it ("configures multiple Workflows for class ...");
+    /// accepting it would let the config's order decide which workflow the
+    /// class shows.
+    #[test]
+    fn two_workflows_naming_one_class_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("wrangler.json"),
+            "{\"name\": \"wftest\", \"main\": \"index.js\", \
+              \"compatibility_date\": \"2026-01-01\", \
+              \"workflows\": [\
+                {\"binding\": \"A\", \"name\": \"alpha\", \"class_name\": \"Shared\"}, \
+                {\"binding\": \"B\", \"name\": \"beta\", \"class_name\": \"Shared\"}]}",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("index.js"),
+            "export default { fetch() { return new Response('ok'); } }",
+        )
+        .unwrap();
+        let config = dir.path().join("wrangler.json");
+        match read_project(&config, dir.path(), &VarOverrides::None) {
+            Ok(_) => panic!("two workflows on one class must be refused"),
+            Err(error) => assert!(
+                format!("{error:?}").contains("more than once"),
+                "the refusal must name the shared class: {error:?}"
+            ),
+        }
+        std::fs::write(
+            dir.path().join("wrangler.json"),
+            "{\"name\": \"wftest\", \"main\": \"index.js\", \
+              \"compatibility_date\": \"2026-01-01\", \
+              \"workflows\": [\
+                {\"binding\": \"A\", \"name\": \"alpha\", \"class_name\": \"Alpha\"}, \
+                {\"binding\": \"B\", \"name\": \"beta\", \"class_name\": \"Beta\"}]}",
+        )
+        .unwrap();
+        read_project(&config, dir.path(), &VarOverrides::None)
+            .expect("one class per workflow must parse");
+    }
+
+    /// Workerd reads a workflow class from a named export and refuses
+    /// `class_name = "default"`; `ctx.exports.default` is the Worker's
+    /// handler, so it cannot also be a workflow binding.
+    #[test]
+    fn a_workflow_class_cannot_be_the_default_export() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("wrangler.json"),
+            "{\"name\": \"wftest\", \"main\": \"index.js\", \
+              \"compatibility_date\": \"2026-01-01\", \
+              \"workflows\": [\
+                {\"binding\": \"A\", \"name\": \"alpha\", \"class_name\": \"default\"}]}",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("index.js"),
+            "export default { fetch() { return new Response('ok'); } }",
+        )
+        .unwrap();
+        let config = dir.path().join("wrangler.json");
+        match read_project(&config, dir.path(), &VarOverrides::None) {
+            Ok(_) => panic!("a workflow on the default export must be refused"),
+            Err(error) => assert!(
+                format!("{error:?}").contains("default"),
+                "the refusal must name the default export: {error:?}"
+            ),
+        }
     }
 
     /// A fake engine CLI script: builds answer with `built_id`, inspects of
