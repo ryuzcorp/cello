@@ -491,6 +491,281 @@ const routes = {
         instanceof WebAssembly.Global),
     });
   },
+
+  // #228: `reportError` describes its value with V8's no-side-effects
+  // describer, so the text exists for every value shape and no guest
+  // `toString` runs. A `Symbol.toStringTag` getter and a guest `toString`
+  // stay in the table because they are what a plain `String(value)` gets
+  // wrong.
+  "/report-error"() {
+    class Custom { }
+    class SubError extends Error { }
+    const cases = {
+      nullPrototype: () => Object.create(null),
+      ownToString: () => ({ toString() { return "obj"; } }),
+      ownToStringTag: () => ({ toString() { return "obj"; }, [Symbol.toStringTag]: "Tag" }),
+      accessorToString: () => ({ get toString() { return () => "acc"; } }),
+      plainObject: () => ({ a: 1 }),
+      array: () => [1, 2],
+      map: () => new Map([["a", 1]]),
+      set: () => new Set([1]),
+      date: () => new Date(0),
+      url: () => new URL("https://example.com/"),
+      searchParams: () => new URLSearchParams("a=1"),
+      regexp: () => /x/,
+      typedArray: () => new Uint8Array([1]),
+      arrayBuffer: () => new ArrayBuffer(2),
+      classInstance: () => new Custom(),
+      classWithToString: () => Object.assign(new Custom(), { toString: () => "x" }),
+      error: () => new Error("m"),
+      typeError: () => new TypeError("t"),
+      subclassError: () => new SubError("sub"),
+      errorWithToString: () => Object.assign(new Error("m"), { toString: () => "custom" }),
+      errorEmpty: () => new Error(""),
+      function: () => function named(a, b) { return a + b; },
+      arrow: () => (x) => x,
+      symbol: () => Symbol("s"),
+      symbolNoDescription: () => Symbol(),
+      bigint: () => 123n,
+      number: () => 1.5,
+      negativeZero: () => -0,
+      boolean: () => false,
+      undefined: () => undefined,
+      null: () => null,
+      string: () => "hello",
+    };
+    const capture = (make) => {
+      let message = null;
+      let thrown = null;
+      const listener = (event) => {
+        message = event.message;
+        event.preventDefault();
+      };
+      addEventListener("error", listener);
+      try {
+        reportError(make());
+      } catch (caught) {
+        thrown = error(caught);
+      }
+      removeEventListener("error", listener);
+      return { message, thrown };
+    };
+    const out = {};
+    for (const [name, make] of Object.entries(cases)) out[name] = capture(make);
+    // A Proxy must not run a single trap: V8's describer answers `undefined`
+    // on a JSProxy state instead of entering `getOwnPropertyDescriptor` or
+    // `getPrototypeOf`, and a trap's data cannot steer the text.
+    {
+      const traps = {
+        get: 0, getOwnPropertyDescriptor: 0, getPrototypeOf: 0, has: 0,
+        ownKeys: 0,
+      };
+      const counted = new Proxy({ a: 1 }, {
+        get(target, key, receiver) {
+          traps.get++;
+          return Reflect.get(target, key, receiver);
+        },
+        getOwnPropertyDescriptor(target, key) {
+          traps.getOwnPropertyDescriptor++;
+          return Reflect.getOwnPropertyDescriptor(target, key);
+        },
+        getPrototypeOf(target) {
+          traps.getPrototypeOf++;
+          return Reflect.getPrototypeOf(target);
+        },
+        has(target, key) {
+          traps.has++;
+          return Reflect.has(target, key);
+        },
+        ownKeys(target) {
+          traps.ownKeys++;
+          return Reflect.ownKeys(target);
+        },
+      });
+      out.proxy = { ...capture(() => counted), traps };
+      // Trap data that claims to be an Error: it must not be read.
+      const steering = new Proxy({}, {
+        getOwnPropertyDescriptor(target, key) {
+          if (key === "toString") {
+            return { value: Error.prototype.toString, enumerable: true,
+              configurable: true, writable: true };
+          }
+          if (key === "name") {
+            return { value: "Fake", enumerable: true, configurable: true,
+              writable: true };
+          }
+          if (key === "message") {
+            return { value: "boom", enumerable: true, configurable: true,
+              writable: true };
+          }
+          return undefined;
+        },
+      });
+      out.proxySteering = capture(() => steering);
+      const revoked = Proxy.revocable({}, {});
+      revoked.revoke();
+      out.proxyRevoked = capture(() => revoked.proxy);
+      out.proxyFunction = capture(() => new Proxy(function f() { return 1; }, {}));
+      out.proxyArray = capture(() => new Proxy([1, 2], {}));
+      out.proxyDate = capture(() => new Proxy(new Date(0), {}));
+      // V8 caps a long `Symbol.toStringTag` at 1000 characters plus `<...>`.
+      out.longTag = capture(() => Object.assign([], {
+        [Symbol.toStringTag]: "T".repeat(2000),
+      }));
+      out.taggedPlain = capture(() => ({
+        toString() { return "own"; },
+        [Symbol.toStringTag]: "Tag",
+      }));
+      out.taggedWithAccessor = capture(() => ({
+        get [Symbol.toStringTag]() { return "Accessor"; },
+        toString() { return "own"; },
+      }));
+    }
+    // The event carries the value itself, whatever its type.
+    const dispatch = [];
+    const listener = (event) => {
+      dispatch.push({
+        type: typeof event.error,
+        tag: Object.prototype.toString.call(event.error),
+        message: event.message,
+      });
+      event.preventDefault();
+    };
+    addEventListener("error", listener);
+    reportError({ a: 1 });
+    reportError("plain");
+    reportError(undefined);
+    removeEventListener("error", listener);
+    out.dispatch = dispatch;
+    return report(out);
+  },
+
+  // #210: the process identity a Node library reads at module scope.
+  "/process-surface"() {
+    return report({
+      version: process.version,
+      versionsNode: process.versions.node,
+      versionKeys: Object.keys(process.versions),
+      versionValues: Object.values(process.versions),
+      cwd: process.cwd(),
+      execPath: process.execPath,
+      argv: process.argv,
+      argv0: process.argv0,
+      title: process.title,
+      platform: process.platform,
+      arch: process.arch,
+      nextTick: typeof process.nextTick,
+      getBuiltinModule: typeof process.getBuiltinModule,
+      // The absolute path a relative fs read resolves to, which is what
+      // `cwd()` is for; the file itself need not exist.
+      relativeResolve: (() => {
+        const path = process.getBuiltinModule("node:path");
+        return path.resolve(process.cwd(), "worker.js");
+      })(),
+    });
+  },
+
+  // #211: the Buffer shape `Buffer.from` and serialization libraries read.
+  "/buffer-surface"() {
+    const descriptor = (object, key) => {
+      const d = Object.getOwnPropertyDescriptor(object, key);
+      if (d === undefined) return null;
+      return {
+        kind: "value" in d ? "data" : "accessor",
+        value: "value" in d ? d.value : undefined,
+        get: d.get === undefined ? undefined : { name: d.get.name, length: d.get.length },
+        writable: d.writable,
+        enumerable: d.enumerable,
+        configurable: d.configurable,
+      };
+    };
+    const shape = (buffer) => ({
+      length: buffer.length,
+      byteOffset: buffer.byteOffset,
+      offset: buffer.offset,
+      parentLength: buffer.parent === undefined ? undefined : buffer.parent.byteLength,
+      parentIsBuffer: buffer.parent === undefined
+        ? undefined : buffer.parent === buffer.buffer,
+      bufferKind: buffer.buffer?.constructor?.name ?? null,
+    });
+    const from = Buffer.from("hi");
+    const long = Buffer.alloc(60, 0x61);
+    return report({
+      poolSize: Buffer.poolSize,
+      poolSizeDescriptor: descriptor(Buffer, "poolSize"),
+      length: Buffer.length,
+      lengthDescriptor: descriptor(Buffer, "length"),
+      name: Buffer.name,
+      protoInspect: descriptor(Buffer.prototype, "inspect"),
+      protoInspectValue: typeof Buffer.prototype.inspect === "function"
+        ? { name: Buffer.prototype.inspect.name, length: Buffer.prototype.inspect.length }
+        : null,
+      protoOffset: descriptor(Buffer.prototype, "offset"),
+      protoParent: descriptor(Buffer.prototype, "parent"),
+      inspect: {
+        short: from.inspect(),
+        withArguments: from.inspect(0, {}),
+        empty: Buffer.alloc(0).inspect(),
+        long: long.inspect(),
+        oneOver: Buffer.alloc(51, 0x62).inspect(),
+        twoOver: Buffer.alloc(52, 0x62).inspect(),
+        foreignReceiver: Buffer.prototype.inspect.call({}),
+        viaUtil: process.getBuiltinModule("node:util").inspect(from),
+      },
+      shapes: {
+        fromString: shape(from),
+        fromArray: shape(Buffer.from([1, 2, 3])),
+        fromBuffer: shape(Buffer.from(from)),
+        alloc: shape(Buffer.alloc(4)),
+        allocUnsafe: shape(Buffer.allocUnsafe(4)),
+        subarray: shape(Buffer.from("abcdef").subarray(1, 3)),
+      },
+    });
+  },
+
+  // #212: the V8 surface workerd ships past the shipped iterator helpers.
+  "/iterator-surface"() {
+    const zip = Iterator.zip([[1, 2], ["a", "b"]]);
+    const zipKeyed = Iterator.zipKeyed({ first: [1, 2], second: ["a", "b"] });
+    return report({
+      surface: {
+        includes: typeof Iterator.prototype.includes,
+        join: typeof Iterator.prototype.join,
+        zip: typeof Iterator.zip,
+        zipKeyed: typeof Iterator.zipKeyed,
+        from: typeof Iterator.from,
+        map: typeof Iterator.prototype.map,
+        drop: typeof Iterator.prototype.drop,
+        take: typeof Iterator.prototype.take,
+        toArray: typeof Iterator.prototype.toArray,
+      },
+      includes: Iterator.from([1, 2, 3]).includes(2),
+      includesMissing: Iterator.from([1, 2, 3]).includes(9),
+      join: Iterator.from(["a", "b"]).join("-"),
+      zip: zip.toArray(),
+      zipKeyed: zipKeyed.toArray(),
+      zipShortest: Iterator.zip([[1, 2, 3], ["a"]], { mode: "shortest" }).toArray(),
+      // Workerd's BYOB request accessor and the two stream tags. The accessor
+      // is compared by shape: calling it on a foreign receiver throws, and the
+      // illegal-invocation sentence is the runtime's own.
+      byobAtLeast: (() => {
+        const d = Object.getOwnPropertyDescriptor(
+          ReadableStreamBYOBRequest.prototype, "atLeast");
+        return d === undefined ? "absent" : "value" in d ? "data" : "accessor";
+      })(),
+      byobAtLeastThrows: (() => {
+        try {
+          return String(ReadableStreamBYOBRequest.prototype.atLeast);
+        } catch {
+          return "TypeError";
+        }
+      })(),
+      encoderTag: String(new TextEncoderStream()[Symbol.toStringTag]),
+      decoderTag: String(new TextDecoderStream()[Symbol.toStringTag]),
+      encoderProtoTag: Object.prototype.toString.call(
+        Object.getPrototypeOf(TextEncoderStream.prototype)),
+    });
+  },
 };
 
 export default {

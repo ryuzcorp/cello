@@ -217,6 +217,53 @@ export class Probe {
         out.setInvalid = await attempt(() => s.setAlarm("tomorrow"));
         return report(out);
       },
+      async "/storage-refusals"() {
+        // #233: a URL and a URLSearchParams carry private state, so the plain
+        // codec would store `{}`; workerd refuses both with a DataCloneError
+        // that names the interface. `back` proves the write did not land. The
+        // refusal sentence itself is each runtime's own, so the transcript
+        // pins the class, that the interface is named, and that nothing was
+        // stored -- not the wording.
+        const s = this.state.storage;
+        const host = async (name, make) => {
+          const key = "refuse-" + name;
+          const out = await attempt(() => s.put(key, make()));
+          out.back = (await s.get(key)) ?? null;
+          if (out.error) {
+            out.error = {
+              name: out.error.name,
+              namesType: out.error.message.includes(name),
+            };
+          }
+          return out;
+        };
+        return report({
+          url: await host("URL", () => new URL("https://example.com/a?b=1")),
+          searchParams: await host("URLSearchParams",
+            () => new URLSearchParams("a=1&b=2")),
+          formData: await host("FormData", () => {
+            const form = new FormData();
+            form.set("a", "1");
+            return form;
+          }),
+          // A forged prototype is plain data on both runtimes: the brand,
+          // not the prototype chain, decides. The property is defined
+          // rather than assigned so `URL.prototype.href`'s brand-checked
+          // setter (a different message on each runtime) never runs.
+          forgedUrl: await attempt(async () => {
+            const forged = Object.create(URL.prototype);
+            Object.defineProperty(forged, "href",
+              { value: "https://example.com/", enumerable: true });
+            await s.put("refuse-forged", forged);
+            return await s.get("refuse-forged");
+          }),
+          forgedSearchParams: await attempt(async () => {
+            const forged = Object.create(URLSearchParams.prototype);
+            await s.put("refuse-forged-params", forged);
+            return await s.get("refuse-forged-params");
+          }),
+        });
+      },
       async "/websockets"() {
         const out = {};
         const pair = new WebSocketPair();

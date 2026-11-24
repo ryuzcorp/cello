@@ -195,8 +195,13 @@ if (!__cello.__buffer) (() => {
       if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1;
     return a.length === b.length ? 0 : a.length < b.length ? -1 : 1;
   };
+  // Workerd's `Buffer.poolSize` is 0 (#211): Node's 8192 makes `Buffer.from`
+  // and `allocUnsafe` carve out of an 8 KiB pool, and workerd's Node port
+  // never does. It is installed as a non-writable, non-configurable value
+  // below, matching workerd's descriptor.
+  const __kPoolSize = 0;
+  const __kInspectMaxBytes = 50;
   class NodeBuffer extends Uint8Array {
-    static poolSize = 8192;
     static from(value, encodingOrOffset, length) {
       if (typeof value === "string") {
         const enc = __normEnc(encodingOrOffset ?? "utf8");
@@ -331,6 +336,20 @@ if (!__cello.__buffer) (() => {
     }
     get parent() {
       try { return this.buffer; } catch { return undefined; }
+    }
+    // Node's `Buffer.prototype.inspect` (#211): the first 50 bytes as hex,
+    // then how many bytes are left. Both arguments are Node's signature and
+    // are ignored, as Node ignores them, and the body goes through
+    // `toString("hex")` so it reads whatever `this` is exactly like Node's.
+    inspect(recurseTimes, ctx) {
+      const max = __kInspectMaxBytes;
+      const str = this.toString("hex", 0, max).replace(/(.{2})/g, "$1 ").trim();
+      const remaining = this.length - max;
+      return "<Buffer " + str +
+        (remaining > 0
+          ? " ... " + remaining + " more byte" + (remaining > 1 ? "s" : "")
+          : "") +
+        ">";
     }
     toString(encoding, start, end) {
       const enc = encoding === undefined ? "utf8" : __normEnc(encoding);
@@ -703,6 +722,28 @@ if (!__cello.__buffer) (() => {
   Object.defineProperty(NodeBuffer, Symbol.species, { value: NodeBuffer });
   // The public class name: inspect and error messages must say Buffer.
   Object.defineProperty(NodeBuffer, "name", { value: "Buffer" });
+  // Workerd's shape (#211): `poolSize` is 0 and read-only, the constructor
+  // takes Node's three arguments (so `Buffer.length` is 3), `inspect` is an
+  // enumerable prototype member (Node assigns it), and `offset`/`parent` are
+  // enumerable, non-configurable accessors named `get`. A class method or
+  // getter is non-enumerable, a class getter is named "get offset", and a
+  // plain static field is writable, so all four are redefined here.
+  Object.defineProperty(NodeBuffer, "poolSize",
+    { value: __kPoolSize, writable: false, enumerable: true,
+      configurable: false });
+  Object.defineProperty(NodeBuffer, "length",
+    { value: 3, writable: false, enumerable: false, configurable: true });
+  const proto = NodeBuffer.prototype;
+  Object.defineProperty(proto, "inspect",
+    { value: proto.inspect, writable: true, enumerable: true,
+      configurable: true });
+  for (const name of ["offset", "parent"]) {
+    const accessor = Object.getOwnPropertyDescriptor(proto, name).get;
+    Object.defineProperty(accessor, "name", { value: "get" });
+    Object.defineProperty(proto, name, {
+      get: accessor, set: undefined, enumerable: true, configurable: false,
+    });
+  }
   // Node's Buffer is callable: Buffer(n) allocates, Buffer(x) is from().
   // A proxy keeps statics, prototype, and instanceof identical.
   const __bufferCallable = new Proxy(NodeBuffer, {

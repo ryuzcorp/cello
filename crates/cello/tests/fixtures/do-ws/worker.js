@@ -65,6 +65,64 @@ export class Plain {
         out.back = (await s.get("host-" + name)) ?? null;
         return out;
       };
+      // A host instance carries private slots, so the *brand* decides, not the
+      // prototype chain; a forged prototype stays plain data (#233).
+      const forged = (prototype, key, value) => {
+        const object = Object.create(prototype);
+        Object.defineProperty(object, key,
+          { value, enumerable: true });
+        return object;
+      };
+      // The refusal must not run guest code or use the global class: a Worker
+      // that replaces `DOMException` still gets the harness one.
+      const replaced = await (async () => {
+        const original = globalThis.DOMException;
+        globalThis.DOMException = class DOMException extends Error {
+          constructor(...args) {
+            super(...args);
+            this.replaced = true;
+          }
+        };
+        try {
+          let sawReplaced = false;
+          const out = await attempt(
+            () => s.put("host-url-replaced", new URL("https://example.com/")),
+            (error) => {
+              sawReplaced = error?.replaced === true;
+              return shape(error);
+            });
+          out.back = (await s.get("host-url-replaced")) ?? null;
+          out.replaced = sawReplaced;
+          return out;
+        } finally {
+          globalThis.DOMException = original;
+        }
+      })();
+      // The batch path refuses through the same captured class, so a replaced
+      // global must not surface there either (#233).
+      const replacedBatch = await (async () => {
+        const original = globalThis.DOMException;
+        globalThis.DOMException = class DOMException extends Error {
+          constructor(...args) {
+            super(...args);
+            this.replaced = true;
+          }
+        };
+        try {
+          let sawReplaced = false;
+          const out = await attempt(
+            () => s.put({ "host-batch-url": new URL("https://example.com/") }),
+            (error) => {
+              sawReplaced = error?.replaced === true;
+              return shape(error);
+            });
+          out.replaced = sawReplaced;
+          out.back = (await s.get("host-batch-url")) ?? null;
+          return out;
+        } finally {
+          globalThis.DOMException = original;
+        }
+      })();
       return Response.json({
         undef: await attempt(() => s.put("undef", undefined), shape),
         fn: await attempt(() => s.put("fn", () => 1), shape),
@@ -77,6 +135,24 @@ export class Plain {
         blob: await host("blob", () => new Blob(["x"])),
         response: await host("response", () => new Response("x")),
         bucket: await host("bucket", () => this.env.BUCKET),
+        url: await host("url", () => new URL("https://example.com/a?b=1")),
+        searchParams: await host("searchParams",
+          () => new URLSearchParams("a=1&b=2")),
+        // A forged prototype is plain data on both runtimes: the brand, not
+        // the prototype chain, decides. The property is defined rather than
+        // assigned so `URL.prototype.href`'s brand-checked setter (a
+        // different message on each runtime) never runs.
+        forgedUrl: await (async () => {
+          const value = forged(URL.prototype, "href", "https://example.com/");
+          try {
+            await s.put("host-forged-url", value);
+            return { stored: await s.get("host-forged-url") };
+          } catch (error) {
+            return { failure: shape(error) };
+          }
+        })(),
+        replaced,
+        replacedBatch,
         batch: await attempt(() => s.put({ "host-b1": new Headers({ a: "1" }) }), shape),
         batchBack: (await s.get("host-b1")) ?? null,
       });
