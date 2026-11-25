@@ -10,10 +10,14 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
    discarded the continuation before any checkpoint could run it, and no op
    of its own ever completes afterward. The host now fails every other begun
    drive of the aborted cell with the abort's value -- what the block threw,
-   or the reason passed to `state.abort()` -- the way workerd answers them.
-   The differential gate gained two cases (`do/nested-hold-crossfail` and
-   `do/nested-hold-crossabort`, each with a sequential leg proving the gate
-   is not stuck shut) and every case agrees.
+  or the reason passed to `state.abort()` -- the way workerd answers them.
+  `state.abort()`'s reason now reads as workerd's does: the whole reason
+  stringified (`Error: msg` for an `Error`), or `Application called abort()
+  to reset Durable Object.` when none is given, where Cello answered the
+  bare message and `undefined`. The differential gate gained four cases
+  (`do/nested-hold-crossfail` and `do/nested-hold-crossabort` with a string,
+  no and an `Error` reason, each with a sequential leg proving the gate is
+  not stuck shut) and every case agrees.
  - **Several timers held past their deadlines release innermost scope first,
    the way workerd releases them (#282).** Cello fired every held timer in
    global deadline order; on workerd each scope drains before the one around
