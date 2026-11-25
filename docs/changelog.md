@@ -3,6 +3,16 @@ title: Changelog
 description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.9.
 ---
 ## Unreleased
+ - **An event suspended across another event's block failure is refused
+   instead of hanging (#284).** A dispatched event that arms a sleep and is
+   still suspended when a second event's `blockConcurrencyWhile` body throws
+   hung forever: the reset resolved its held wait, but the termination
+   discarded the continuation before any checkpoint could run it, and no op
+   of its own ever completes afterward. The host now fails every other begun
+   drive of the aborted cell with the abort's value, the way workerd answers
+   them with what the block threw. The differential gate gained one case
+   (`do/nested-hold-crossfail`, with a sequential leg proving the gate is
+   not stuck shut) that fails on `origin/main` and every case agrees.
  - **Several timers held past their deadlines release innermost scope first,
    the way workerd releases them (#282).** Cello fired every held timer in
    global deadline order; on workerd each scope drains before the one around

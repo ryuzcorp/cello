@@ -1555,6 +1555,62 @@ static GATE_WAITERS: OnceLock<Mutex<HashMap<String, Vec<GateWake>>>> = OnceLock:
 fn gate_waiters() -> &'static Mutex<HashMap<String, Vec<GateWake>>> {
     GATE_WAITERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
+/// Drives to wake when `cell`'s current incarnation aborts: a block body
+/// threw or its limit expired, the object reset, and execution terminated.
+/// An event that began before the abort but is suspended in plain JavaScript
+/// — its held sleep resolved by the reset, its continuation discarded with
+/// the terminated isolate — would otherwise wait forever: no op of its own
+/// ever completes, and no later turn runs its microtasks. Failing it here
+/// answers its caller the way workerd answers it, with the value the block
+/// threw, instead of hanging. Registration covers the whole drive, taken
+/// synchronously after the event begins with no await before it, so an
+/// abort cannot land between beginning and registering; an abort that lands
+/// before the begin makes the event fresh, and it never registers for it.
+type CellAbortWake = tokio::sync::oneshot::Sender<crate::engine_api::CellHandlerError>;
+/// Drives registered to be failed when their cell aborts, by cell.
+type CellAbortWaiters = Mutex<HashMap<String, Vec<(u64, CellAbortWake)>>>;
+static CELL_ABORT_WAITERS: OnceLock<CellAbortWaiters> = OnceLock::new();
+static CELL_ABORT_WAITER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+fn cell_abort_waiters() -> &'static CellAbortWaiters {
+    CELL_ABORT_WAITERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+/// Register this drive to fail when `cell` aborts. Returns the registration
+/// id with the receiver; `cell_abort_unwait` removes it when the drive ends
+/// without an abort, so quiet cells do not accumulate dead senders.
+pub(crate) fn cell_abort_wait(
+    cell: &str,
+) -> (
+    u64,
+    tokio::sync::oneshot::Receiver<crate::engine_api::CellHandlerError>,
+) {
+    let id = CELL_ABORT_WAITER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let (wake, waiter) = tokio::sync::oneshot::channel();
+    cell_abort_waiters()
+        .lock()
+        .unwrap()
+        .entry(cell.to_string())
+        .or_default()
+        .push((id, wake));
+    (id, waiter)
+}
+/// Drop an abort registration whose drive ended first.
+pub(crate) fn cell_abort_unwait(cell: &str, id: u64) {
+    let mut waiters = cell_abort_waiters().lock().unwrap();
+    if let Some(list) = waiters.get_mut(cell) {
+        list.retain(|(other, _)| *other != id);
+        if list.is_empty() {
+            waiters.remove(cell);
+        }
+    }
+}
+/// Fail every registered drive of `cell` with the abort's value. Senders of
+/// drives that already ended fail silently and are dropped with the drain.
+fn signal_cell_abort(cell: &str, handler: &crate::engine_api::CellHandlerError) {
+    let waiters = cell_abort_waiters().lock().unwrap().remove(cell);
+    for (_, wake) in waiters.into_iter().flatten() {
+        let _ = wake.send(handler.clone());
+    }
+}
 
 /// Take a ticket to be woken when `cell`'s gate opens, or `None` if it is
 /// open now.
@@ -7745,6 +7801,33 @@ impl Worker {
         out
     }
 
+    /// Fail an event whose cell aborted while it was suspended: answer with
+    /// the abort's value and retire it, without running any more of its
+    /// JavaScript. The continuation that would have observed the failure is
+    /// already discarded with the terminated isolate, so the host answers
+    /// for it. Mirrors the failure arms of `finish_turn`: fail in turn for
+    /// the durability positions, drop the background, and abandon the ops.
+    pub fn turn_fail_aborted(&mut self, entry: &mut InFlight, error: anyhow::Error) -> Vec<Op> {
+        let Some(inner) = self.inner.as_mut() else {
+            return Vec::new();
+        };
+        let (mut locker, _cells) = inner.lock();
+        v8::scope!(let hs, &mut *locker);
+        let realm = inner.realm(hs);
+        let context = realm.context;
+        let cs = &mut v8::ContextScope::new(hs, context);
+        let tc = std::pin::pin!(v8::TryCatch::new(cs));
+        let tc = &mut tc.init();
+        let previous_io_context = install_io_context(tc, &entry.context);
+        let previous = install_trace(tc, entry.trace.as_ref());
+        entry.context.begin_cpu_turn();
+        entry.fail_in_turn(error);
+        entry.background = None;
+        entry.abandon();
+        restore_trace(tc, previous);
+        restore_io_context(tc, previous_io_context);
+        Vec::new()
+    }
     /// Enter the isolate solely to see whether another event settled this
     /// one's promise.
     ///
@@ -12652,6 +12735,10 @@ fn op_actor_fail(
     // A cell with no open savepoint answers `ROLLBACK` with a no-op, so the
     // common path is unchanged.
     let _ = crate::storage::transaction_control(&cell, "rollback", false, "");
+    // Fail drives suspended on this cell's previous incarnation — a held
+    // sleep whose continuation the termination below discards — with the
+    // same value, the way workerd answers them, instead of hanging.
+    signal_cell_abort(&cell, &handler);
     *state.termination.lock().expect("termination lock poisoned") = Some(ExecutionTermination {
         error: handler.message.clone(),
         actor_scope: Some(cell),
