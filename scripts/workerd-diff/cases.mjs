@@ -275,6 +275,14 @@ export const cases = [
     fixture: "do",
     path,
   })),
+  // #284: a dispatched event suspended in sleep across another event's
+  // block failure must be refused, not hang; a later sequential event
+  // still answers, proving the gate is not stuck shut.
+  ...["/nested-hold-crossfail"].map((path) => ({
+    name: `do${path}`,
+    fixture: "do",
+    path,
+  })),
   // #261: the section outlives the guest's promise, so the nested block that
   // a response left running still writes, and a second event's block waits
   // behind it before it reads.

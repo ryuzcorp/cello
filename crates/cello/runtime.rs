@@ -3784,6 +3784,36 @@ fn notify_gated_failure_for_test(
     }
 }
 
+/// Abort-signal registration for one cell drive. The receiver fails the
+/// drive when the cell's incarnation aborts; dropping the guard removes a
+/// registration whose drive ended first, so quiet cells do not accumulate
+/// dead senders.
+struct CellAbortGuard {
+    cell: String,
+    id: u64,
+}
+impl CellAbortGuard {
+    fn listen(
+        cell: &str,
+    ) -> (
+        Self,
+        tokio::sync::oneshot::Receiver<crate::engine_api::CellHandlerError>,
+    ) {
+        let (id, waiter) = js::cell_abort_wait(cell);
+        (
+            Self {
+                cell: cell.to_string(),
+                id,
+            },
+            waiter,
+        )
+    }
+}
+impl Drop for CellAbortGuard {
+    fn drop(&mut self) {
+        js::cell_abort_unwait(&self.cell, self.id);
+    }
+}
 async fn drive_cell_inner(
     affiliation: crate::pool::Affiliation,
     mut job: CellJob,
@@ -3946,88 +3976,129 @@ async fn drive_cell_inner(
         notify_gated_failure_for_test(&mut entry, &mut test_observers.gated_failure);
     }
 
+    // A block failure aborts the cell while begun-but-suspended events wait
+    // in plain JavaScript, their continuations discarded with the terminated
+    // isolate. Fail such a drive with the abort's value instead of hanging:
+    // registration is synchronous after the begin above, so no abort can
+    // land between beginning and registering.
+    enum Next {
+        Wake(Wake),
+        Aborted(Option<crate::engine_api::CellHandlerError>),
+    }
+    let (_abort_guard, abort_receiver) = CellAbortGuard::listen(&scope);
+    let mut abort_rx = Some(abort_receiver);
+    let mut abort_closed = false;
     while !entry.finished() {
-        let (started, moves) = match wake_with_cross_entry_gate(&mut ops, &mut entry, budget).await
-        {
-            Wake::Op(op, result) => {
-                slot.turn(|worker| {
-                    let started = worker.turn_deliver(&mut entry, op, result);
-                    (started, worker.take_alarm_moves())
-                })
-                .await
+        let next = if abort_closed {
+            Next::Wake(wake_with_cross_entry_gate(&mut ops, &mut entry, budget).await)
+        } else {
+            match abort_rx.as_mut() {
+                Some(rx) => asyncrt::select_biased! {
+                    "an aborted cell fails its suspended drives before they observe anything else";
+                    abort = &mut *rx => {
+                        abort_closed = true;
+                        Next::Aborted(abort.ok())
+                    }
+                    wake = wake_with_cross_entry_gate(&mut ops, &mut entry, budget) => Next::Wake(wake),
+                },
+                None => Next::Wake(wake_with_cross_entry_gate(&mut ops, &mut entry, budget).await),
             }
-            Wake::GatedReply(completion) => {
-                entry.finish_gated_reply(completion);
-                (Vec::new(), Vec::new())
-            }
-            Wake::CancelGatedReply => {
-                entry.cancel_gated_reply();
-                (Vec::new(), Vec::new())
-            }
-            Wake::CrossEntryGateChanged => {
-                entry.finish_cross_entry_gates();
-                (Vec::new(), Vec::new())
-            }
-            Wake::Cancelled { shutdown } => {
-                let cancelled = slot
-                    .turn(|worker| {
-                        let started = if shutdown {
-                            worker.turn_cancel_for_shutdown(&mut entry)
-                        } else {
-                            worker.turn_cancel(&mut entry)
-                        };
+        };
+        let (started, moves) = match next {
+            Next::Wake(wake) => match wake {
+                Wake::Op(op, result) => {
+                    slot.turn(|worker| {
+                        let started = worker.turn_deliver(&mut entry, op, result);
                         (started, worker.take_alarm_moves())
                     })
-                    .await;
-                entry.cancel_gated_reply();
-                #[cfg(cello_internal_tests)]
-                notify_gated_failure_for_test(&mut entry, &mut test_observers.gated_failure);
-                cancelled
-            }
-            Wake::Expired => {
-                entry.time_out(budget);
-                slot.turn(|worker| worker.turn_retire_input_gates(&entry))
-                    .await;
-                #[cfg(cello_internal_tests)]
-                notify_gated_failure_for_test(&mut entry, &mut test_observers.gated_failure);
-                (Vec::new(), Vec::new())
-            }
-            Wake::BackgroundExpired => {
-                // The response already went out, so this records no
-                // failure: it seals further `waitUntil`, drops the
-                // background claim, and lets the abort pass below release
-                // the isolate. An event still holding the cell's input
-                // gate or running another event's critical section keeps
-                // its ops by design, and stays loud about it — and so does
-                // one whose response body is still streaming, which keeps
-                // the ops the body is made of.
-                let streaming = entry.has_response_stream();
-                entry.expire_background();
-                log_background_expired(streaming, entry.keeps_native_ops(), Some(&scope));
-                (Vec::new(), Vec::new())
-            }
-            Wake::Idle => {
-                entry.stuck();
-                slot.turn(|worker| worker.turn_retire_input_gates(&entry))
-                    .await;
-                #[cfg(cello_internal_tests)]
-                notify_gated_failure_for_test(&mut entry, &mut test_observers.gated_failure);
-                (Vec::new(), Vec::new())
-            }
-            Wake::PendingEventIdle => {
+                    .await
+                }
+                Wake::GatedReply(completion) => {
+                    entry.finish_gated_reply(completion);
+                    (Vec::new(), Vec::new())
+                }
+                Wake::CancelGatedReply => {
+                    entry.cancel_gated_reply();
+                    (Vec::new(), Vec::new())
+                }
+                Wake::CrossEntryGateChanged => {
+                    entry.finish_cross_entry_gates();
+                    (Vec::new(), Vec::new())
+                }
+                Wake::Cancelled { shutdown } => {
+                    let cancelled = slot
+                        .turn(|worker| {
+                            let started = if shutdown {
+                                worker.turn_cancel_for_shutdown(&mut entry)
+                            } else {
+                                worker.turn_cancel(&mut entry)
+                            };
+                            (started, worker.take_alarm_moves())
+                        })
+                        .await;
+                    entry.cancel_gated_reply();
+                    #[cfg(cello_internal_tests)]
+                    notify_gated_failure_for_test(&mut entry, &mut test_observers.gated_failure);
+                    cancelled
+                }
+                Wake::Expired => {
+                    entry.time_out(budget);
+                    slot.turn(|worker| worker.turn_retire_input_gates(&entry))
+                        .await;
+                    #[cfg(cello_internal_tests)]
+                    notify_gated_failure_for_test(&mut entry, &mut test_observers.gated_failure);
+                    (Vec::new(), Vec::new())
+                }
+                Wake::BackgroundExpired => {
+                    // The response already went out, so this records no
+                    // failure: it seals further `waitUntil`, drops the
+                    // background claim, and lets the abort pass below release
+                    // the isolate. An event still holding the cell's input
+                    // gate or running another event's critical section keeps
+                    // its ops by design, and stays loud about it — and so does
+                    // one whose response body is still streaming, which keeps
+                    // the ops the body is made of.
+                    let streaming = entry.has_response_stream();
+                    entry.expire_background();
+                    log_background_expired(streaming, entry.keeps_native_ops(), Some(&scope));
+                    (Vec::new(), Vec::new())
+                }
+                Wake::Idle => {
+                    entry.stuck();
+                    slot.turn(|worker| worker.turn_retire_input_gates(&entry))
+                        .await;
+                    #[cfg(cello_internal_tests)]
+                    notify_gated_failure_for_test(&mut entry, &mut test_observers.gated_failure);
+                    (Vec::new(), Vec::new())
+                }
+                Wake::PendingEventIdle => {
+                    slot.turn(|worker| {
+                        let started = worker.turn_cancel_pending_events(&mut entry);
+                        (started, worker.take_alarm_moves())
+                    })
+                    .await
+                }
+                Wake::Poll => {
+                    slot.turn(|worker| {
+                        let started = worker.turn_poll(&mut entry);
+                        (started, worker.take_alarm_moves())
+                    })
+                    .await
+                }
+            },
+            Next::Aborted(Some(handler)) => {
                 slot.turn(|worker| {
-                    let started = worker.turn_cancel_pending_events(&mut entry);
+                    let started = worker.turn_fail_aborted(
+                        &mut entry,
+                        anyhow::Error::new(crate::engine_api::CellAbort(handler)),
+                    );
                     (started, worker.take_alarm_moves())
                 })
                 .await
             }
-            Wake::Poll => {
-                slot.turn(|worker| {
-                    let started = worker.turn_poll(&mut entry);
-                    (started, worker.take_alarm_moves())
-                })
-                .await
-            }
+            // The abort sender went away without sending: no abort happened.
+            // Re-wait; the receiver stays closed so this arm runs once.
+            Next::Aborted(None) => (Vec::new(), Vec::new()),
         };
         #[cfg(cello_internal_tests)]
         if entry.gated_reply_and_io_context().0.is_some() {

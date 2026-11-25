@@ -1149,6 +1149,23 @@ export class Probe {
         log.push("awaited");
         return report({ log });
       },
+      // #284: B dispatches first and suspends in sleep; A arrives mid-sleep,
+      // takes a top-level block that throws. B's held sleep fires across the
+      // failure: B must be refused, not hang. A lets its throw escape, so
+      // the stub caller sees the 500, exactly as in the reported shape.
+      async "/crossfail-a"() {
+        await this.state.blockConcurrencyWhile(async () => {
+          await new Promise((resolve) => setTimeout(resolve, 200));
+          throw new Error("A-gate-boom");
+        });
+      },
+      async "/crossfail-b"() {
+        const out = {};
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        out.slept = true;
+        out.block = await attempt(() => this.state.blockConcurrencyWhile(async () => "B-value"));
+        return report(out);
+      },
       // #278: sibling nested sections in one body run one at a time, in
       // schedule order: the second starts only after the first has fully
       // settled, body and descendants alike. Each log below carries order
@@ -2079,6 +2096,30 @@ const routes = {
         return { status: response.status, body: await response.text() };
       });
     }
+    return report(out);
+  },
+  // #284: B dispatches first and suspends in sleep; A arrives ~50 ms later,
+  // takes a top-level block that throws. B's held sleep fires across the
+  // failure: B must be refused, not hang. Both legs race under a bound so
+  // a hang reports as a divergence instead of stalling the runner; a final
+  // sequential leg on a fresh stub proves the gate is not stuck shut.
+  async "/nested-hold-crossfail"() {
+    const out = {};
+    const race = (promise, ms) => Promise.race([
+      promise.then((ok) => ({ ok }), (error) => ({ error: errorInfo(error) })),
+      new Promise((resolve) => setTimeout(() => resolve({ timeout: true }), ms)),
+    ]);
+    const get = async (stub, path) => {
+      const response = await stub.fetch(`https://do.test${path}`);
+      return { status: response.status, body: await response.text() };
+    };
+    const stub = OBJ.getByName("nested-hold-crossfail");
+    const bFirst = get(stub, "/crossfail-b");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    out.a = await attempt(() => get(stub, "/crossfail-a"));
+    out.b = await race(bFirst, 10000);
+    const fresh = OBJ.getByName("nested-hold-crossfail");
+    out.sequential = await race(attempt(() => get(fresh, "/crossfail-b")), 10000);
     return report(out);
   },
   async "/ids"() {
