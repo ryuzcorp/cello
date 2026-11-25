@@ -24,6 +24,31 @@ const errorInfo = (error) => ({
 const attempt = async (fn, describe = errorInfo) => {
   try { return { ok: await fn() }; } catch (error) { return { error: describe(error) }; }
 };
+// #284: B dispatches first and suspends in sleep; A arrives ~50 ms later and
+// takes a top-level block that fails (a throw, or `state.abort()`). B's held
+// sleep fires across the failure: B must be refused, not hang. Both legs
+// race under a bound so a hang reports as a divergence instead of stalling
+// the runner; a final sequential leg on a fresh stub proves the gate is not
+// stuck shut.
+const crossFail = async (name, failPath) => {
+  const out = {};
+  const race = (promise, ms) => Promise.race([
+    promise.then((ok) => ({ ok }), (error) => ({ error: errorInfo(error) })),
+    new Promise((resolve) => setTimeout(() => resolve({ timeout: true }), ms)),
+  ]);
+  const get = async (stub, path) => {
+    const response = await stub.fetch(`https://do.test${path}`);
+    return { status: response.status, body: await response.text() };
+  };
+  const stub = OBJ.getByName(name);
+  const bFirst = get(stub, "/crossfail-b");
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  out.a = await attempt(() => get(stub, failPath));
+  out.b = await race(bFirst, 10000);
+  const fresh = OBJ.getByName(name);
+  out.sequential = await race(attempt(() => get(fresh, "/crossfail-b")), 10000);
+  return report(out);
+};
 // #251: how a binding object reflects. Own properties keep their order -- a
 // Worker can read it -- while a prototype's members are sorted, because a
 // native prototype's definition order is not a contract. An accessor reports
@@ -1159,6 +1184,13 @@ export class Probe {
           throw new Error("A-gate-boom");
         });
       },
+      // #284 review: the same shape through `state.abort()` inside the block.
+      async "/crossabort-a"() {
+        await this.state.blockConcurrencyWhile(async () => {
+          await new Promise((resolve) => setTimeout(resolve, 200));
+          this.state.abort("A-abort-stop");
+        });
+      },
       async "/crossfail-b"() {
         const out = {};
         await new Promise((resolve) => setTimeout(resolve, 100));
@@ -2098,29 +2130,14 @@ const routes = {
     }
     return report(out);
   },
-  // #284: B dispatches first and suspends in sleep; A arrives ~50 ms later,
-  // takes a top-level block that throws. B's held sleep fires across the
-  // failure: B must be refused, not hang. Both legs race under a bound so
-  // a hang reports as a divergence instead of stalling the runner; a final
-  // sequential leg on a fresh stub proves the gate is not stuck shut.
+  // #284: see `crossFail` -- a suspended B across another event's failing
+  // block is refused, not hung.
   async "/nested-hold-crossfail"() {
-    const out = {};
-    const race = (promise, ms) => Promise.race([
-      promise.then((ok) => ({ ok }), (error) => ({ error: errorInfo(error) })),
-      new Promise((resolve) => setTimeout(() => resolve({ timeout: true }), ms)),
-    ]);
-    const get = async (stub, path) => {
-      const response = await stub.fetch(`https://do.test${path}`);
-      return { status: response.status, body: await response.text() };
-    };
-    const stub = OBJ.getByName("nested-hold-crossfail");
-    const bFirst = get(stub, "/crossfail-b");
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    out.a = await attempt(() => get(stub, "/crossfail-a"));
-    out.b = await race(bFirst, 10000);
-    const fresh = OBJ.getByName("nested-hold-crossfail");
-    out.sequential = await race(attempt(() => get(fresh, "/crossfail-b")), 10000);
-    return report(out);
+    return crossFail("nested-hold-crossfail", "/crossfail-a");
+  },
+  // #284 review: `state.abort()` must fail a suspended B the same way.
+  async "/nested-hold-crossabort"() {
+    return crossFail("nested-hold-crossabort", "/crossabort-a");
   },
   async "/ids"() {
     const a = OBJ.idFromName("alpha");

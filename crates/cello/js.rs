@@ -12684,6 +12684,18 @@ fn op_actor_abort(
         .lock()
         .expect("pending puts lock poisoned")
         .remove(&cell);
+    // Fail drives suspended on this cell with the abort's reason, as the
+    // block-failure path does: the termination below discards their queued
+    // continuations, so they would otherwise never answer (#284 review).
+    signal_cell_abort(
+        &cell,
+        &crate::engine_api::CellHandlerError {
+            kind: crate::engine_api::CellHandlerKind::Error,
+            name: "Error".to_string(),
+            message: reason.clone(),
+            value: None,
+        },
+    );
     *state.termination.lock().expect("termination lock poisoned") = Some(ExecutionTermination {
         error: format!("__CELLO_ACTOR_ABORT__:{reason}"),
         actor_scope: Some(cell),
