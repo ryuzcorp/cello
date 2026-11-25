@@ -1184,11 +1184,24 @@ export class Probe {
           throw new Error("A-gate-boom");
         });
       },
-      // #284 review: the same shape through `state.abort()` inside the block.
+      // #284 review: the same shape through `state.abort()` inside the block,
+      // with a string reason, none, and an `Error` reason.
       async "/crossabort-a"() {
         await this.state.blockConcurrencyWhile(async () => {
           await new Promise((resolve) => setTimeout(resolve, 200));
           this.state.abort("A-abort-stop");
+        });
+      },
+      async "/crossabort-none-a"() {
+        await this.state.blockConcurrencyWhile(async () => {
+          await new Promise((resolve) => setTimeout(resolve, 200));
+          this.state.abort();
+        });
+      },
+      async "/crossabort-error-a"() {
+        await this.state.blockConcurrencyWhile(async () => {
+          await new Promise((resolve) => setTimeout(resolve, 200));
+          this.state.abort(new Error("A-abort-error"));
         });
       },
       async "/crossfail-b"() {
@@ -2138,6 +2151,12 @@ const routes = {
   // #284 review: `state.abort()` must fail a suspended B the same way.
   async "/nested-hold-crossabort"() {
     return crossFail("nested-hold-crossabort", "/crossabort-a");
+  },
+  async "/nested-hold-crossabort-none"() {
+    return crossFail("nested-hold-crossabort-none", "/crossabort-none-a");
+  },
+  async "/nested-hold-crossabort-error"() {
+    return crossFail("nested-hold-crossabort-error", "/crossabort-error-a");
   },
   async "/ids"() {
     const a = OBJ.idFromName("alpha");

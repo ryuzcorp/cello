@@ -4946,8 +4946,10 @@ class DurableObjectState {
     const instance = __cell.instances[this._scope];
     if (instance && instance.__celloState === this)
       delete __cell.instances[this._scope];
-    const message = reason instanceof Error
-      ? reason.message
+    // workerd stringifies the whole reason (`Error: msg` for an Error) and
+    // answers a fixed sentence when none is given (#284 review).
+    const message = reason == null
+      ? "Application called abort() to reset Durable Object."
       : String(reason);
     // Direct host-dispatched event on this actor: the uncatchable
     // terminate_execution path. Under a same-isolate stub caller,
