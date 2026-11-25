@@ -13,6 +13,18 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.3.
   cursors must restart their listings from the first page. Pinned by the
   `plain_key_cursor_answers_the_empty_page` unit test and the R2 gate
   cases.
+- **Same-turn write+cancel and writes during an abort settle like
+  workerd's (#283).** A `write()` followed by a readable `cancel()` in
+  the same turn on a plain `TransformStream` now resolves the write and
+  the pending `ready` while `closed` rejects with the cancel reason, as
+  workerd does; Cello used to reject all three. A `write()` issued
+  between `abort()` and its settlement on an `IdentityTransformStream`
+  or `FixedLengthStream` now follows the abort -- settling after it with
+  the closed-stream `TypeError`, with `closed` rejecting last -- instead
+  of rejecting at once with the abort reason. An `abort()` with a parked
+  write and no reader also unparks the write with the abort reason
+  instead of hanging. Pinned by the `transform-same-turn-cancel` and
+  `identity-fixed-write-during-abort` workerd-diff cases.
 
 ## v0.3.0
 
