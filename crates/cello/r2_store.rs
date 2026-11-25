@@ -481,7 +481,6 @@ pub(crate) async fn delete(bucket_name: &str, keys: &[String]) -> Result<(), Str
 /// Shared by the binding's JSON projection and the CLI's structured one,
 /// so the two cannot drift in scoping, resumption, or page size.
 struct ScopedList {
-    bucket: String,
     store: &'static Bucket,
     scoped: String,
     cursor: Cursor,
@@ -507,16 +506,9 @@ enum Cursor {
     /// position inside this binding's own bucket and prefix and nothing more
     /// (see `docs/services/r2.md`).
     Token { pos: String, bound: Option<String> },
-    /// The plain key a page consumed, which is what 0.2.9 and earlier
-    /// answered a cursor with. A client can be mid-pagination across a
-    /// rolling upgrade, so a plain string is honoured through 0.3.0 and
-    /// dropped after -- and only as a key the bucket still has. A string no
-    /// object answers for is not a listing position: R2 answers the empty
-    /// page for a cursor it did not issue, and so does this.
-    Legacy(String),
-    /// A string that is not a cursor in this binding's format and names no
-    /// object. R2 answers the empty page for a cursor it did not issue, and
-    /// so does this; the message names what was wrong for the CLI.
+    /// A string that is not a cursor this binding issued. R2 answers the
+    /// empty page for a cursor it did not issue, and so does this; the
+    /// message names what was wrong for the CLI.
     Invalid(String),
 }
 
@@ -535,7 +527,6 @@ impl ScopedList {
         };
         let (offset, token_bound) = match &cursor {
             Cursor::Token { pos, bound } => (Some(blob_key(bucket_name, pos)), bound.clone()),
-            Cursor::Legacy(key) => (Some(blob_key(bucket_name, key)), None),
             Cursor::Start | Cursor::Invalid(_) => (None, None),
         };
         // A cursor carries its own bound, or none at all; only a boundless
@@ -550,7 +541,6 @@ impl ScopedList {
             },
         };
         Ok(Self {
-            bucket: bucket_name.to_string(),
             store,
             scoped: blob_key(bucket_name, &request.prefix),
             cursor,
@@ -579,18 +569,6 @@ impl ScopedList {
     async fn walk(&self) -> Result<Walked, String> {
         if let Cursor::Invalid(message) = &self.cursor {
             return Ok(Walked::InvalidCursor(message.clone()));
-        }
-        if let Cursor::Legacy(key) = &self.cursor {
-            // One head per legacy cursor, and only while the plain-key
-            // spelling is read (0.3.0): a legitimate 0.2.9 cursor names the
-            // last key its page consumed, so a bucket that still has that
-            // object answers the continuation. A token pays no head, because
-            // a token is its own position.
-            if head(&self.bucket, key).await?.is_none() {
-                return Ok(Walked::InvalidCursor(format!(
-                    "R2 cursor {key:?} is not a cursor this binding issued, and no object has that key"
-                )));
-            }
         }
         self.store
             .list_page(
@@ -659,14 +637,12 @@ fn encode_cursor(pos: &str, bound: Option<&str>) -> String {
 }
 
 /// Read a cursor. A token in this family (either spelling, so a celld node's
-/// cursor keeps working) is a listing position on its own; a plain string is
-/// the key a page consumed, which is what 0.2.9 and earlier answered, and
-/// [`ScopedList::walk`] proves the bucket still has it. A token that does
-/// not parse is the invalid cursor workerd answers empty for, never a resume
-/// somewhere surprising.
+/// cursor keeps working) is a listing position on its own. Any other string
+/// is the invalid cursor workerd answers empty for, never a resume somewhere
+/// surprising.
 fn decode_cursor(cursor: &str) -> Cursor {
     if !cursor.starts_with(CURSOR_FAMILY) && !cursor.starts_with(LEGACY_CURSOR_FAMILY) {
-        return Cursor::Legacy(cursor.to_string());
+        return Cursor::Invalid(format!("invalid R2 cursor: {cursor:?}"));
     }
     let Some(payload) = cursor
         .strip_prefix(CURSOR_V1)
@@ -1256,8 +1232,8 @@ mod tests {
 
     /// A cursor token round-trips its position and bound, even when both
     /// look adversarial: magic-looking keys, unicode, and empty positions
-    /// all survive the wrap. A plain string is the 0.2.9 cursor, decoded as
-    /// a legacy key that `walk` then proves against the bucket.
+    /// all survive the wrap. A plain string is not a cursor this binding
+    /// issued, so it decodes as the invalid cursor.
     #[test]
     fn cursor_tokens_round_trip() {
         for (pos, bound) in [
@@ -1277,7 +1253,10 @@ mod tests {
                 }
             );
         }
-        assert_eq!(decode_cursor("a/2"), Cursor::Legacy("a/2".to_string()));
+        assert!(
+            matches!(decode_cursor("a/2"), Cursor::Invalid(_)),
+            "a plain key is the invalid cursor"
+        );
     }
 
     /// Every page answers a token, and a key that itself looks like a token
@@ -1377,41 +1356,15 @@ mod tests {
         );
     }
 
-    /// A 0.2.9 cursor was the plain key its page consumed, and a client can
-    /// be mid-pagination across a rolling upgrade, so the plain spelling is
-    /// read through 0.3.0: it resumes when the bucket still holds that
-    /// object, and answers the empty page when it does not (as it does for
-    /// any string no object answers for). Both branches are pinned here; the
-    /// token path pays no head.
+    /// A plain key is not a cursor this binding issued -- not even when the
+    /// bucket holds an object at that key, as a 0.2.9 cursor did -- so it
+    /// answers the empty page R2 answers for a cursor it did not issue,
+    /// never a listing resumed past the key.
     #[tokio::test]
-    async fn plain_key_cursor_resumes_only_for_a_key_the_bucket_has() {
+    async fn plain_key_cursor_answers_the_empty_page() {
         for key in ["a", "b", "c"] {
             put("plaincur", key, None).await;
         }
-        let page = list(
-            "plaincur",
-            &list_request("", Some("a"), None, 10, None, false),
-        )
-        .await
-        .expect("the legacy cursor resumes");
-        assert_eq!(
-            page.get("objects")
-                .and_then(Value::as_array)
-                .map(|objects| objects
-                    .iter()
-                    .filter_map(|object| object.get("key").and_then(Value::as_str))
-                    .collect::<Vec<_>>()),
-            Some(vec!["b", "c"]),
-            "a plain key the bucket holds keeps paging, as 0.2.9 answered"
-        );
-        assert!(page.get("cursor_error").is_none());
-
-        // The key a page stopped at is gone, or the string was never a key:
-        // not a position, so the empty page the binding answers for a cursor
-        // it cannot place -- never a listing restarted from the top.
-        delete("plaincur", &["a".to_string()])
-            .await
-            .expect("remove the boundary object");
         for cursor in ["a", "garbage", "ü"] {
             let page = list(
                 "plaincur",

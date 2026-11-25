@@ -320,14 +320,12 @@ service; the [KV](../services/kv.md), [R2](../services/r2.md) and
   `secureTransport` names are checked afterwards. A fully converted address
   then rejects: Cello has
   no Fetcher TCP transport for a stub, so no socket is opened.
-- **R2 cursors are opaque tokens.** A string outside the token format that
-  names no object gets the empty page R2 answers instead of a listing
-  restarted from the top. A plain key is still read as the cursor 0.2.9
-  answered a page with, through 0.3.0, and only while the bucket holds an
-  object at that key -- a rolling upgrade must not truncate a client's
-  pagination; the plain-key path is removed in 0.3.1. A token is honoured as
-  a position inside the binding's own bucket and prefix; it is unsigned, so a
-  client can mint one, but it cannot read another bucket, escape the prefix's
+- **R2 cursors are opaque tokens.** Any string outside the token format --
+  a made-up word, a token that does not parse, or a plain key, even one
+  the bucket holds -- gets the empty page R2 answers instead of a listing
+  restarted from the top. A token is honoured as a position inside the
+  binding's own bucket and prefix; it is unsigned, so a client can mint
+  one, but it cannot read another bucket, escape the prefix's
   directory, or widen a page bound.
 
 `env` additionally carries `CELLO_NODE`: the name of the node running your

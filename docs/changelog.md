@@ -2,6 +2,18 @@
 title: Changelog
 description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.3.0.
 ---
+## Unreleased
+
+- **Breaking: plain-key R2 cursors are gone (#286).** A string that is
+  not a `cello-r2-cursor-v1.` token -- including a plain key the bucket
+  holds, which 0.2.9 answered pages with and 0.3.0 still read across a
+  rolling upgrade -- now answers the empty page
+  `{ objects: [], truncated: false, delimitedPrefixes: [] }`, as workerd
+  answers for a cursor it did not issue. Clients still holding 0.2.9
+  cursors must restart their listings from the first page. Pinned by the
+  `plain_key_cursor_answers_the_empty_page` unit test and the R2 gate
+  cases.
+
 ## v0.3.0
 
 0.3.0 is a minor version bump because of the breaking changes listed below. Cello now answers like workerd 1.20261121.1 across the rest of the sweep: nested `blockConcurrencyWhile` ordering and failure propagation, the round-2 stream pipe/cancel/abort races, Workflow instance shapes and errors, binding option validation, and the Low-severity tail (`reportError`'s message, the `process` identity, the `Buffer` shape, the iterator helpers V8 still gates behind flags, and `storage.put()` of a `URL` or `URLSearchParams`). This release closes every open workerd-1.20261121.1 differential issue found since 0.2.9 except the two edge races tracked in #283 (a same-turn write+cancel on a plain `TransformStream`, and a write landing between `abort()` and its settlement on identity/fixed streams). Durability gets two fixes for loop parks that starved cells of uploads (#200, #243), compression output now matches workerd byte for byte through the zlib-rs backend, and R2 cursors become opaque versioned tokens. The `scripts/workerd-diff` gate now runs 297 cases and every one agrees.
