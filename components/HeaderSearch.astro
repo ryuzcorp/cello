@@ -1,0 +1,34 @@
+---
+// Blume keeps social links in the footer only, so the header gets its GitHub
+// and Discord icons through the `Search` slot: the icons render after the
+// built-in search trigger, before the theme toggle.
+import Search from "blume/components/layout/Search.astro";
+import { SOCIAL_ICONS } from "blume/components/layout/footer-socials.ts";
+import { NEW_TAB_ATTRS } from "blume/core/new-tab.ts";
+
+const links = [
+  { href: "https://github.com/ryuzcorp/cello", ...SOCIAL_ICONS.github },
+  { href: "https://discord.gg/WnVTMCTz74", ...SOCIAL_ICONS.discord },
+];
+
+// Same classes as Blume's header icon buttons (Header.astro `iconButton`).
+const iconButton =
+  "inline-flex size-9 shrink-0 cursor-pointer items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground";
+---
+
+<Search {...Astro.props} />
+{
+  links.map((link) => (
+    <a
+      aria-label={link.label}
+      class={iconButton}
+      data-blume-tooltip={link.label}
+      href={link.href}
+      {...NEW_TAB_ATTRS}
+    >
+      <svg aria-hidden="true" fill="currentColor" height="16" viewBox="0 0 24 24" width="16">
+        <path d={link.path} />
+      </svg>
+    </a>
+  ))
+}

@@ -12,6 +12,8 @@ on:
       - README.md
       - scripts/install.sh
       - blume.config.ts
+      - components.ts
+      - components/**
       - package.json
       - package-lock.json
       - .github/workflows/docs.yml
@@ -22,6 +24,8 @@ on:
       - README.md
       - scripts/install.sh
       - blume.config.ts
+      - components.ts
+      - components/**
       - package.json
       - package-lock.json
       - .github/workflows/docs.yml
