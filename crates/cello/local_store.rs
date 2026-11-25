@@ -1029,7 +1029,6 @@ fn precondition(path: &str) -> Error {
 }
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods)] // Test tempdirs spawn burst writers outside the execution boundary.
 mod tests {
     use super::*;
     use object_store::UpdateVersion;
@@ -1069,31 +1068,53 @@ mod tests {
             .to_vec()
     }
 
-    /// Upstream #310: one barrier-synchronized burst of 64 PUTs lands every
-    /// row and commits in a handful of batches, not one transaction per PUT.
-    /// The bound has 4x margin over the observed 1-4; without the writer the
-    /// same burst is 64 separate commits.
+    /// Upstream #310: a burst of 64 writes that is fully queued before the
+    /// writer can commit lands every row and commits in a handful of batches,
+    /// not one transaction per PUT. The burst is queued synchronously while
+    /// a `BEGIN IMMEDIATE` transaction on a second connection holds the
+    /// database write lock, so the writer parks in its own `BEGIN IMMEDIATE`
+    /// instead of committing a partial batch early: every row is queued
+    /// before the first commit either way, and the writer drains at most one
+    /// partial head plus the rest in a second batch. A barrier-synchronized
+    /// burst of async PUTs asserted the same bound, but the writer's
+    /// `try_recv` drain only sees what arrived before it wakes, so host load
+    /// starving the PUT tasks split one burst into more commits (#240). The
+    /// bound keeps 8x margin over the deterministic 1-2; without the writer
+    /// the same burst is 64 separate commits.
     #[test]
     fn writer_batches_one_burst_into_few_commits() {
         let runtime = crate::asyncrt::shared_test_runtime();
         runtime.block_on(async {
             let (_dir, store) = open_store();
-            let store = Arc::new(store);
-            let barrier = Arc::new(tokio::sync::Barrier::new(64));
-            let mut tasks = Vec::new();
+            // Hold the write lock so the writer cannot commit until the whole
+            // burst is queued. The writer's connection sets a 30s busy
+            // timeout, so it parks in `BEGIN IMMEDIATE` instead of failing.
+            let holding = store.connect().unwrap();
+            holding.execute_batch("BEGIN IMMEDIATE").unwrap();
+            let mut pending = Vec::with_capacity(64);
             for i in 0u8..64 {
-                let (store, barrier) = (store.clone(), barrier.clone());
-                tasks.push(tokio::spawn(async move {
-                    barrier.wait().await;
-                    let location: Path = format!("k{i:03}").into();
-                    store
-                        .put(&location, PutPayload::from(Bytes::from(vec![i; 64])))
-                        .await
-                        .unwrap();
-                }));
+                let (reply_tx, reply_rx) = oneshot::channel();
+                store
+                    .writer
+                    .queue
+                    .send(PutRequest {
+                        key: format!("k{i:03}"),
+                        body: Bytes::from(vec![i; 64]),
+                        options: PutOptions::default(),
+                        etag: None,
+                        modified_ms: crate::asyncrt::wall_ms(),
+                        reply: reply_tx,
+                    })
+                    .unwrap();
+                pending.push((i, reply_rx));
             }
-            for task in tasks {
-                task.await.unwrap();
+            // Every write is queued; let the writer commit.
+            holding.execute_batch("COMMIT").unwrap();
+            for (i, reply_rx) in pending {
+                reply_rx
+                    .await
+                    .unwrap_or_else(|_| panic!("writer answers queued write k{i:03}"))
+                    .unwrap_or_else(|error| panic!("queued write k{i:03} commits: {error:?}"));
             }
             for i in 0u8..64 {
                 assert_eq!(
