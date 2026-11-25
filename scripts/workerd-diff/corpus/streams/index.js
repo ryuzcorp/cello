@@ -3013,6 +3013,110 @@ const routes = {
     return report({ constructed, rangeErrors, final, held: held.length });
   },
 
+  async "/transform-same-turn-cancel"() {
+    // Issue #283 (race 1): a write() followed by a readable cancel() in the
+    // same turn on a plain TransformStream. Neither runtime started the
+    // transform yet (the writable's start gate is still shut), and workerd
+    // still resolves the write and the pending ready while closed rejects
+    // with the cancel reason.
+    const order = [];
+    const ts = new TransformStream();
+    const writer = ts.writable.getWriter();
+    const write = writer.write("a").then(
+      () => (order.push("write-ok"), "done"),
+      (error) => (order.push("write-rejected"), errorInfo(error)));
+    const ready = writer.ready.then(
+      () => (order.push("ready-ok"), "ready-ok"),
+      (error) => (order.push("ready-rejected"), errorInfo(error)));
+    const closed = writer.closed.then(
+      () => (order.push("closed-ok"), "closed"),
+      (error) => (order.push("closed-rejected"), errorInfo(error)));
+    await ts.readable.cancel("same-turn");
+    const out = {
+      write: await write,
+      ready: await ready,
+      closed: await closed,
+      order,
+    };
+    out.desiredSize = attempt(() => writer.desiredSize);
+    out.writeAfter = await writer.write("z").then(() => "ok", errorInfo);
+    writer.releaseLock();
+    return report(out);
+  },
+
+  async "/identity-fixed-write-during-abort"() {
+    // Issue #283 (race 2): a write() issued synchronously between abort()
+    // and its settlement on an internal byte stream. Workerd rejects it
+    // with the closed-stream TypeError per its abortPromise lifecycle --
+    // like a write after the abort settled -- while the abort itself still
+    // fulfills and closed rejects with the abort reason.
+    const idle = async (kind) => {
+      const stream = kind === "identity"
+        ? new IdentityTransformStream()
+        : new FixedLengthStream(10);
+      const writer = stream.writable.getWriter();
+      const order = [];
+      const abort = writer.abort(new Error("abort-boom")).then(
+        () => (order.push("abort-ok"), "aborted"),
+        (error) => (order.push("abort-rejected"), errorInfo(error)));
+      const valid = writer.write(new Uint8Array([1, 2, 3])).then(
+        () => (order.push("valid-ok"), "ok"),
+        (error) => (order.push("valid-rejected"), errorInfo(error)));
+      const invalid = writer.write(42).then(
+        () => (order.push("invalid-ok"), "ok"),
+        (error) => (order.push("invalid-rejected"), errorInfo(error)));
+      const closed = writer.closed.then(
+        () => (order.push("closed-ok"), "closed"),
+        (error) => (order.push("closed-rejected"), errorInfo(error)));
+      const out = {
+        abort: await abort,
+        valid: await valid,
+        invalid: await invalid,
+        closed: await closed,
+        ready: await writer.ready.then(() => "ok", errorInfo),
+        order,
+      };
+      writer.releaseLock();
+      return out;
+    };
+    // The same window with a write already parked (no reader): the abort
+    // unparks it with the abort reason, the abort still fulfills, a write
+    // issued after the abort reports the closed stream, and closed rejects
+    // with the abort reason last.
+    const parked = async (kind) => {
+      const stream = kind === "identity"
+        ? new IdentityTransformStream()
+        : new FixedLengthStream(10);
+      const writer = stream.writable.getWriter();
+      const order = [];
+      const first = writer.write(new Uint8Array([1])).then(
+        () => (order.push("first-ok"), "ok"),
+        (error) => (order.push("first-rejected"), errorInfo(error)));
+      const abort = writer.abort(new Error("abort-boom")).then(
+        () => (order.push("abort-ok"), "aborted"),
+        (error) => (order.push("abort-rejected"), errorInfo(error)));
+      const late = writer.write(new Uint8Array([2])).then(
+        () => (order.push("late-ok"), "ok"),
+        (error) => (order.push("late-rejected"), errorInfo(error)));
+      const closed = writer.closed.then(
+        () => (order.push("closed-ok"), "closed"),
+        (error) => (order.push("closed-rejected"), errorInfo(error)));
+      const out = {
+        first: await first,
+        abort: await abort,
+        late: await late,
+        closed: await closed,
+        order,
+      };
+      writer.releaseLock();
+      return out;
+    };
+    return report({
+      identity: { idle: await idle("identity"), parked: await parked("identity") },
+      fixed: { idle: await idle("fixed"), parked: await parked("fixed") },
+    });
+  },
+
   async "/compression-abort-failing-flush"() {
     // Issue #270: a truncated member with a pending read, so the close
     // starts a flush that fails; an abort that lands before it settles

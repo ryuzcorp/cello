@@ -397,20 +397,28 @@ function __write(st, chunk) {
       __errorStream(st, e);
     }
   }
+  // A write landing between abort() and its settlement follows the abort's
+  // lifecycle on internal (compression/identity/fixed) streams: the abort
+  // is still settling, so the state below has not flipped yet, and the
+  // write settles once the abort does, reporting the closed stream the
+  // settled abort leaves behind (#283). Chaining on the pending request --
+  // rather than rejecting now -- is what orders the abort first, then the
+  // writes, then closed. The settled abort flips an internal stream to
+  // 'closed', which the check below keeps reporting; anything else with a
+  // request still recorded is still settling.
+  if (st.closesOnError && st.abortPromise !== null && st.state !== 'closed')
+    return st.abortPromise.then(() => {
+      // Throw, rather than returning a rejected promise: adopting a
+      // thenable costs a microtask, and closed must settle after these
+      // writes, not before them (#283).
+      throw new TypeError("This WritableStream has been closed.");
+    });
   if (st.state === 'errored')
     return Promise.reject(st.storedError);
   // Workerd names each state separately here (#132), and its message
   // for a closing stream says "ReadableStream": measured on
   // 1.20261121.1, not a typo of ours.
   if (st.state === 'closed')
-    return Promise.reject(new TypeError(
-      "This WritableStream has been closed."));
-  // Workerd's internal (compression) streams end an aborted writable in
-  // the closed shape: once abort() was called, a later write() reports
-  // the closed stream instead of the abort reason (#270). The abort is
-  // still settling (or deferred behind the start gate), so the state has
-  // not flipped yet; the pending request is what marks it.
-  if (st.closesOnError && st.pendingAbort !== null)
     return Promise.reject(new TypeError(
       "This WritableStream has been closed."));
   // Workerd's internal (compression/identity/fixed) streams report a
@@ -523,9 +531,14 @@ function __abortRequest(st, reason) {
     // abort() resolves -- instead of the abort reason poisoning the parked
     // write. Release the write from the readable handshake so it runs; the
     // settle path (__startWrite or __closeAfterError) ends the request.
+    // Only a sink parked on that handshake can wait this way. An internal
+    // byte stream's parked write has no reader coming, so it takes the
+    // erroring path below and the abort hook unparks it with the abort
+    // reason instead of deadlocking behind it (#283).
     if (st.closesOnError && st.state === 'writable' &&
+        st.unblockWrite !== undefined &&
         (st.inFlightWrite !== null || st.queue.length > 0)) {
-      if (st.unblockWrite) st.unblockWrite();
+      st.unblockWrite();
       return p;
     }
     __startErroring(st, reason);
@@ -597,12 +610,23 @@ function __finishErroring(st) {
           writerState.readyResolve = null;
           writerState.readyReject = null;
         }
+        // Writes that landed between abort() and its settlement chain on
+        // the abort request, so they settle right after it; closed settles
+        // after them. Defer the close/closed rejections past those chained
+        // writes instead of rejecting them in the same tick (#283).
+        Promise.resolve().then(() => __rejectCloseAndClosed(st));
+      } else {
+        __rejectCloseAndClosed(st);
       }
-      __rejectCloseAndClosed(st);
     },
     (e) => {
       abortReq.reject(e);
-      __rejectCloseAndClosed(st);
+      // Same ordering as the fulfilling arm: chained writes settle before
+      // closed does (#283).
+      if (st.closesOnError)
+        Promise.resolve().then(() => __rejectCloseAndClosed(st));
+      else
+        __rejectCloseAndClosed(st);
     },
   );
 }
@@ -1118,7 +1142,31 @@ class TransformStream {
           // on the backpressure handshake, or queued behind one, fail with
           // the TypeError instead; the stored error stays the cancel reason
           // either way (#272).
-          if (target.state === 'writable' && target.started &&
+          if (target.state === 'writable' && !target.started &&
+              target.queue.length > 0) {
+            // The cancel landed before the writable's start gate opened,
+            // so no write was ever dispatched: workerd resolves the queued
+            // writes (and the pending ready) instead of failing them,
+            // while closed still rejects with the cancel reason (#283).
+            // Settle closed first, then ready, then the writes -- the
+            // observed order -- before erroring the stream for the gate.
+            const writerState = target.writer
+              ? __wtrState(target.writer)
+              : null;
+            if (writerState) __rejectClosedWriter(writerState, reason);
+            if (writerState && writerState.readyResolve) {
+              writerState.readyResolve();
+              writerState.readyResolve = null;
+              writerState.readyReject = null;
+            }
+            for (const entry of target.queue) {
+              target.queueSize -= entry.size;
+              entry.resolve();
+            }
+            if (target.queueSize < 0) target.queueSize = 0;
+            target.queue = [];
+            target.backpressure = false;
+          } else if (target.state === 'writable' && target.started &&
               (target.inFlightWrite !== null || target.queue.length > 0)) {
             if (transformRunning) {
               for (const entry of target.queue) {

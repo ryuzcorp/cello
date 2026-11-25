@@ -90,7 +90,10 @@ export const cases = [
   // #280 round 2: overflow/close/write shapes, string chunks, abort shape.
   { name: "fixed-length-overflow-write-close", fixture: "streams", path: "/fixed-length-overflow-write-close" },
   { name: "identity-string-chunks", fixture: "streams", path: "/identity-string-chunks" },
-  { name: "identity-fixed-abort-shape", fixture: "streams", path: "/identity-fixed-abort-shape" },
+  // #283: same-turn write+cancel on a plain transform, and a write landing
+  // between abort() and its settlement on internal byte streams.
+  { name: "transform-same-turn-cancel", fixture: "streams", path: "/transform-same-turn-cancel" },
+  { name: "identity-fixed-write-during-abort", fixture: "streams", path: "/identity-fixed-write-during-abort" },
   { name: "gzip-roundtrip", fixture: "streams", path: "/gzip-roundtrip" },
   { name: "deflate-roundtrip", fixture: "streams", path: "/deflate-roundtrip" },
   { name: "text-encoder-stream", fixture: "streams", path: "/text-encoder-stream" },
