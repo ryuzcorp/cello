@@ -1,10 +1,16 @@
 ---
 title: Changelog
-description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.3.0.
+description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.3.1.
 ---
-## Unreleased
+## v0.3.1
 
-- **Breaking: plain-key R2 cursors are gone (#286).** A string that is
+0.3.1 finishes what 0.3.0 left open. It drops the 0.2.9 plain-key R2 cursors, as the 0.3.0 notes announced, and fixes the two stream edge races tracked in #283, including a hang when `abort()` met a parked write with no reader. The `local_store` batching test no longer flakes under host load (#240); that change is test-only. The `scripts/workerd-diff` gate now runs 298 cases and every one agrees. One order-only difference is left on plain streams (#290: `abort()` resolves before `writer.closed` rejects).
+
+**Breaking changes.** Check this one before upgrading:
+
+- **R2 `list()` no longer reads 0.2.9 plain-key cursors (#286).** A client that still holds one gets the empty page, so its listing has to restart from the first page.
+
+- **Plain-key R2 cursors are gone (#286).** A string that is
   not a `cello-r2-cursor-v1.` token -- including a plain key the bucket
   holds, which 0.2.9 answered pages with and 0.3.0 still read across a
   rolling upgrade -- now answers the empty page
