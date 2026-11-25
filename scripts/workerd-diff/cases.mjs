@@ -278,7 +278,7 @@ export const cases = [
   // #284: a dispatched event suspended in sleep across another event's
   // block failure must be refused, not hang; a later sequential event
   // still answers, proving the gate is not stuck shut.
-  ...["/nested-hold-crossfail"].map((path) => ({
+  ...["/nested-hold-crossfail", "/nested-hold-crossabort"].map((path) => ({
     name: `do${path}`,
     fixture: "do",
     path,
