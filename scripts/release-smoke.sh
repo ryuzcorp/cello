@@ -78,7 +78,12 @@ trap cleanup EXIT INT TERM
 printf 'release smoke gate\n  image: %s\n' "$IMAGE"
 cello_version="$(dock run --rm "$IMAGE" --version 2>&1)" ||
   die "the image does not run 'cello --version': $cello_version"
-printf '  %s\n\n' "$cello_version"
+printf '  %s\n' "$cello_version"
+# The image ships the pinned esbuild for `dev`/`deploy` of Worker code; a
+# wrong-arch binary fails here with an exec-format error.
+esbuild_version="$(dock run --rm --entrypoint /usr/local/bin/esbuild "$IMAGE" --version 2>&1)" ||
+  die "the image does not run 'esbuild --version': $esbuild_version"
+printf '  esbuild %s\n\n' "$esbuild_version"
 
 dock run -d --name "$NAME" --label cello-release-smoke=1 \
   -p "127.0.0.1::$CONTAINER_PORT" \
