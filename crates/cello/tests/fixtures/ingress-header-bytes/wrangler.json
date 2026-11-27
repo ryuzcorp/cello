@@ -1,0 +1,8 @@
+{
+  "name": "ingress-header-bytes",
+  "main": "worker.js",
+  "compatibility_date": "2026-10-08",
+  "no_bundle": true,
+  "durable_objects": { "bindings": [{ "name": "ECHO", "class_name": "Echo" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Echo"] }]
+}

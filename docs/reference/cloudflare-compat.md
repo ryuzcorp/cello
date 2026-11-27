@@ -94,7 +94,11 @@ use. An unsupported feature that stays silent is a defect.
   out, a name the writer cannot represent is dropped and the response still
   goes out; a byte a field value may not carry is dropped from the value.
   Workerd writes such a byte raw -- not a legal field value -- so that single
-  case is stricter here, and the response survives either way.
+  case is stricter here, and the response survives either way. On the way
+  in, values decode as UTF-8 with replacement, as in workerd, so a valid
+  non-ASCII `Cookie` stays visible instead of dropping the header and an
+  undecodable byte becomes U+FFFD; the way back out encodes the Worker's
+  string as UTF-8, so valid values round-trip byte-for-byte (#295).
 - A `Blob` appended to `FormData` without a filename is named after the entry
   key, which is workerd's behaviour and not the WHATWG spec's `"blob"`.
 - `new Request(url, { method: "trace" })` normalizes to `TRACE`; `CONNECT`

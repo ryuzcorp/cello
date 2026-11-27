@@ -1381,14 +1381,18 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
                             cello::peer_failure::remote_handler_failure(&version, body.as_deref());
                         return Err(anyhow::Error::new(RemoteHandlerFailure(handler)));
                     }
+                    // The owner's reply bytes cross the tunnel opaquely; decode
+                    // them as UTF-8 with replacement, the way the ingress
+                    // does, so a non-ASCII value the owner legitimately wrote
+                    // is not dropped here (#295).
                     let response_headers = response
                         .headers()
                         .iter()
-                        .filter_map(|(header, value)| {
-                            value
-                                .to_str()
-                                .ok()
-                                .map(|value| (header.to_string(), value.to_string()))
+                        .map(|(header, value)| {
+                            (
+                                header.to_string(),
+                                cello::header_bytes::header_value_to_js(value.as_bytes()),
+                            )
                         })
                         .collect();
                     let stream = forwarder_response_stream(
@@ -2115,14 +2119,19 @@ fn ingress_payload_parts(
     max_body_bytes: usize,
 ) -> Result<IngressPayloadParts, String> {
     let (parts, body) = request.into_parts();
+    // Values decode as UTF-8 with replacement, as workerd decodes a received
+    // value: a valid non-ASCII `Cookie` stays visible instead of dropping
+    // the whole header, and an undecodable byte becomes U+FFFD. Hyper only
+    // yields parsed values, so no CR or LF byte can arrive here to be
+    // smuggled into a value (#295).
     let headers: Vec<(String, String)> = parts
         .headers
         .iter()
-        .filter_map(|(name, value)| {
-            value
-                .to_str()
-                .ok()
-                .map(|value| (name.to_string(), value.to_string()))
+        .map(|(name, value)| {
+            (
+                name.to_string(),
+                cello::header_bytes::header_value_to_js(value.as_bytes()),
+            )
         })
         .collect();
     let url = request_url(&parts, trust_forwarded_headers);
