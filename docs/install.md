@@ -33,6 +33,7 @@ docker run --rm ghcr.io/ryuzcorp/cello:latest --version
 
 - **Linux.** Cello nodes run on Linux (the release image is bookworm-based, so glibc ≥ 2.36).
 - **esbuild on `PATH`** for any project with Worker code. It must be the self-contained release binary, not a wrapper script: on Linux, `cello deploy` runs it with reads confined to the project. If your `esbuild` is a shim (for example from mise), point `CELLO_ESBUILD` at the real binary instead. The official image already ships the pinned esbuild at `/usr/local/bin/esbuild`, so a host install only matters outside the image. Asset-only projects need no bundler.
+- **Linux page size (arm64).** The arm64 binary starts on both 4 KiB and 16 KiB page kernels (16 KiB is the Raspberry Pi 5 default): its allocator is built for 64 KiB pages, which costs some extra memory overhead on 4 KiB systems.
 - **A bucket** for every fleet except local `cello dev`: S3-compatible, Google Cloud Storage, or Azure Blob Storage. See [Configure object storage](guides/run-fleet.md#configure-object-storage).
 
 ## Next step
