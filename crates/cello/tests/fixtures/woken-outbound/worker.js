@@ -69,7 +69,9 @@ export class Cell extends DurableObject {
       // The signal listener is the observable proof the server really saw
       // the adopter's disconnect.
       request.signal.addEventListener('abort', () => {
-        this.result = 'cancelled:signal';
+        // A synthetic dispatchEvent fires the listener without setting
+        // #aborted; only a host-driven abort counts as cancellation.
+        this.result = request.signal.aborted ? 'cancelled:signal' : 'spoofed-dispatch';
       }, { once: true });
       try {
         await new Promise((r) => setTimeout(r, 60000));
