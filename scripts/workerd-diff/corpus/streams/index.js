@@ -3146,6 +3146,79 @@ const routes = {
     }
     return report(out);
   },
+
+  async "/transform-abort-order"() {
+    // Issue #290: on a plain TransformStream workerd rejects writer.closed
+    // before the abort() promise settles. A write in the same turn as the
+    // abort rejects first, and a write already running in transform still
+    // completes before either settles.
+    const noInflight = async () => {
+      const ts = new TransformStream();
+      const writer = ts.writable.getWriter();
+      const order = [];
+      const abort = writer.abort(new Error("abort-boom")).then(
+        () => (order.push("abort-ok"), "aborted"),
+        (error) => (order.push("abort-rejected"), errorInfo(error)));
+      const write = writer.write("a").then(
+        () => (order.push("w-ok"), "ok"),
+        (error) => (order.push("w-rejected"), errorInfo(error)));
+      const closed = writer.closed.then(
+        () => (order.push("closed-ok"), "closed"),
+        (error) => (order.push("closed-rejected"), errorInfo(error)));
+      const out = {
+        abort: await abort,
+        write: await write,
+        closed: await closed,
+        order,
+      };
+      writer.releaseLock();
+      return out;
+    };
+    const parked = async () => {
+      let releaseTransform;
+      const gate = new Promise((resolve) => (releaseTransform = resolve));
+      let enteredResolve;
+      const entered = new Promise((resolve) => (enteredResolve = resolve));
+      const ts = new TransformStream({
+        transform(chunk, controller) {
+          enteredResolve();
+          return gate.then(() => controller.enqueue(chunk));
+        },
+      });
+      const writer = ts.writable.getWriter();
+      const reader = ts.readable.getReader();
+      const order = [];
+      const read = reader.read().then(
+        ({ value, done }) => ({ value: String(value), done }),
+        (error) => errorInfo(error));
+      const first = writer.write("a").then(
+        () => (order.push("w1-ok"), "ok"),
+        (error) => (order.push("w1-rejected"), errorInfo(error)));
+      await entered;
+      const abort = writer.abort(new Error("abort-boom")).then(
+        () => (order.push("abort-ok"), "aborted"),
+        (error) => (order.push("abort-rejected"), errorInfo(error)));
+      const second = writer.write("b").then(
+        () => (order.push("w2-ok"), "ok"),
+        (error) => (order.push("w2-rejected"), errorInfo(error)));
+      const closed = writer.closed.then(
+        () => (order.push("closed-ok"), "closed"),
+        (error) => (order.push("closed-rejected"), errorInfo(error)));
+      releaseTransform();
+      const out = {
+        first: await first,
+        second: await second,
+        abort: await abort,
+        closed: await closed,
+        read: await read,
+        order,
+      };
+      reader.releaseLock();
+      writer.releaseLock();
+      return out;
+    };
+    return report({ noInflight: await noInflight(), parked: await parked() });
+  },
 };
 
 export default {
