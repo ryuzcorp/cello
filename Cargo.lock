@@ -364,7 +364,7 @@ dependencies = [
 
 [[package]]
 name = "cello"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "adler2",
  "aes",
@@ -448,11 +448,11 @@ dependencies = [
 
 [[package]]
 name = "cello-logic"
-version = "0.3.1"
+version = "0.3.2"
 
 [[package]]
 name = "cello-ltx"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "bytes",
