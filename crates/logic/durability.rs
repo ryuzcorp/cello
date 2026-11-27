@@ -1,3 +1,4 @@
+// Modified by Ryuz Corp (Cello): proof-deadline unit tests (issue #298).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! When a write's durability proof gives up, sans-IO.
@@ -73,4 +74,88 @@ pub fn proof_deadline(wait: &ProofWait, progress: &ProofProgress) -> u64 {
         .started_ms
         .saturating_add(wait.budget_ms.saturating_mul(QUEUED_BUDGETS));
     anchor.saturating_add(wait.budget_ms).min(cap)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wait(ticket: u64, started_ms: u64, budget_ms: u64) -> ProofWait {
+        ProofWait {
+            started_ms,
+            ticket,
+            budget_ms,
+        }
+    }
+
+    /// While the covering capture has not begun, the deadline rides the
+    /// node's last proof: one budget past it, so a healthy but busy node
+    /// (proving other cells) never fails a queued write.
+    #[test]
+    fn queued_deadline_rides_the_node_proof() {
+        let wait = wait(7, 1_000, 10_000);
+        let progress = ProofProgress {
+            node_proof_ms: 5_000,
+            capture_seq: 3,
+            capture_started_ms: 0,
+        };
+        assert_eq!(proof_deadline(&wait, &progress), 15_000);
+    }
+
+    /// A proof landing anywhere on the node re-anchors a queued wait, even
+    /// past its original start budget.
+    #[test]
+    fn queued_deadline_advances_with_later_proofs() {
+        let wait = wait(7, 1_000, 10_000);
+        let progress = ProofProgress {
+            node_proof_ms: 12_000,
+            capture_seq: 3,
+            capture_started_ms: 0,
+        };
+        assert_eq!(proof_deadline(&wait, &progress), 22_000);
+    }
+
+    /// The queue is bounded: under sustained overload the wait ends at most
+    /// `QUEUED_BUDGETS` past its start, so a stuck queue cannot park a
+    /// client past the operation deadline.
+    #[test]
+    fn queued_wait_is_capped_in_total() {
+        let wait = wait(7, 1_000, 10_000);
+        let progress = ProofProgress {
+            node_proof_ms: 500_000,
+            capture_seq: 3,
+            capture_started_ms: 0,
+        };
+        assert_eq!(
+            proof_deadline(&wait, &progress),
+            1_000 + 10_000 * QUEUED_BUDGETS
+        );
+    }
+
+    /// Once this cell's capture covering the ticket has begun, the deadline
+    /// is fixed from the capture start: a stuck upload still fails in one
+    /// budget, and later node proofs no longer extend it.
+    #[test]
+    fn in_flight_deadline_runs_from_the_covering_capture() {
+        let wait = wait(7, 1_000, 10_000);
+        let progress = ProofProgress {
+            node_proof_ms: 900_000,
+            capture_seq: 7,
+            capture_started_ms: 4_000,
+        };
+        assert_eq!(proof_deadline(&wait, &progress), 14_000);
+    }
+
+    /// A capture that does not reach the ticket leaves the wait queued: an
+    /// older capture is never this write's proof.
+    #[test]
+    fn stale_capture_keeps_the_wait_queued() {
+        let wait = wait(7, 1_000, 10_000);
+        let progress = ProofProgress {
+            node_proof_ms: 1_000,
+            capture_seq: 6,
+            capture_started_ms: 9_000,
+        };
+        assert_eq!(proof_deadline(&wait, &progress), 11_000);
+    }
 }

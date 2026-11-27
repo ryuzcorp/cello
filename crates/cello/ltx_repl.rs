@@ -9396,5 +9396,549 @@ mod bucket_bundles_tests {
     }
 }
 
+/// Single-node write fan-out repro (issue #298, upstream denoland/celld#286).
+///
+/// On a lone node the bucket path proves each cell's writes with that cell's
+/// own capture+upload rounds (`sync_cell` behind one `syncing` flag per
+/// cell): coalescing never crosses cells, and every round pays a full
+/// capture plus one PUT per cell. Spreading a fixed load over more cells
+/// therefore shrinks each cell's batch toward one write per round while the
+/// total round count grows, so PUTs per write climb toward one and every
+/// write's ack latency floors at one full round.
+///
+/// What this module pins, deterministically and in seconds:
+/// - `quiesced_cells_cost_one_put_each`: N quiesced cells cost exactly N
+///   PUTs for N writes — the direct per-cell path (`sync_wait` drives each
+///   cell's own round, bypassing the background scan's bundle gate).
+/// - `fanout_shape_puts_per_write_grows_with_cells`: the scaled-down load
+///   shape — same total writes over 1 vs 8 cells with a programmed 5 ms
+///   PUT latency (the repro report's p50), with a lower bound of one PUT
+///   per cell — the tripwire a future cross-cell coordinator would break.
+///   It asserts only
+///   timing-independent bounds (every write acked on the bucket proof,
+///   PUTs within [cells, writes]) and REPORTS wall time, PUTs/write, mean
+///   ack latency, and max concurrent PUTs via `eprintln` for the handoff.
+///   No wall-clock ordering is asserted: absolute times belong to the
+///   machine, not the test.
+/// - `failed_upload_credits_nothing_and_resolves_nothing`,
+///   `failed_round_retries_to_one_credit`, `cancelled_waiter_disturbs_nothing`:
+///   the partial-failure and cancellation contracts of the same path — a
+///   refused PUT wakes waiters but credits no ticket and resolves nobody,
+///   the retry uploads again for exactly one credit, and dropping a waiter
+///   disturbs neither its round's peer nor later writes.
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)] // Test tempdirs/SQLite files live outside the injected filesystem, as in evict_trim_tests.
+mod fanout_repro_tests {
+    use super::*;
+    use cello_ltx::object_store::memory::InMemory;
+    use cello_ltx::object_store::path::Path as ObjPath;
+    use cello_ltx::object_store::GetOptions;
+    use cello_ltx::object_store::GetResult;
+    use cello_ltx::object_store::ListResult;
+    use cello_ltx::object_store::MultipartUpload;
+    use cello_ltx::object_store::ObjectMeta;
+    use cello_ltx::object_store::PutMultipartOptions;
+    use cello_ltx::object_store::PutOptions;
+    use cello_ltx::object_store::PutPayload;
+    use cello_ltx::object_store::PutResult;
+    use cello_ltx::object_store::Result as StoreResult;
+    use futures_util::FutureExt as _;
+    use std::sync::atomic::AtomicUsize;
+    // `futures::stream::BoxStream`, spelled out as in evict_trim_tests: the
+    // cello crate carries futures-util only, and this names the same object
+    // type.
+    type ListStream = std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = StoreResult<ObjectMeta>> + Send + 'static>,
+    >;
+
+    /// In-memory store with programmed PUT latency, PUT outcome counters,
+    /// an injected PUT failure switch, and per-PUT spans, so the fan-out
+    /// bench can separate "more rounds" (PUTs/write vs cell count) from
+    /// "slower rounds" (ack latency, PUT overlap) with no production
+    /// instrumentation on the hot path.
+    #[derive(Debug)]
+    struct ProbeStore {
+        inner: InMemory,
+        put_latency: Duration,
+        puts: AtomicUsize,
+        puts_ok: AtomicUsize,
+        puts_err: AtomicUsize,
+        fail_puts: AtomicBool,
+        spans_us: Mutex<Vec<(u64, u64)>>,
+    }
+
+    impl ProbeStore {
+        fn new(put_latency: Duration) -> Self {
+            Self {
+                inner: InMemory::new(),
+                put_latency,
+                puts: AtomicUsize::new(0),
+                puts_ok: AtomicUsize::new(0),
+                puts_err: AtomicUsize::new(0),
+                fail_puts: AtomicBool::new(false),
+                spans_us: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn puts(&self) -> usize {
+            self.puts.load(Ordering::SeqCst)
+        }
+
+        fn puts_ok(&self) -> usize {
+            self.puts_ok.load(Ordering::SeqCst)
+        }
+
+        fn puts_err(&self) -> usize {
+            self.puts_err.load(Ordering::SeqCst)
+        }
+
+        fn set_fail_puts(&self, fail: bool) {
+            self.fail_puts.store(fail, Ordering::SeqCst);
+        }
+
+        async fn note_put(
+            &self,
+            started_us: u64,
+            outcome: StoreResult<PutResult>,
+        ) -> StoreResult<PutResult> {
+            self.spans_us
+                .lock()
+                .unwrap()
+                .push((started_us, asyncrt::mono_us()));
+            self.puts.fetch_add(1, Ordering::SeqCst);
+            if outcome.is_ok() {
+                self.puts_ok.fetch_add(1, Ordering::SeqCst);
+            } else {
+                self.puts_err.fetch_add(1, Ordering::SeqCst);
+            }
+            outcome
+        }
+
+        /// The deepest PUT overlap observed: 1 means every round's upload
+        /// ran alone, higher means rounds overlapped in flight.
+        fn max_concurrent_puts(&self) -> usize {
+            let spans = self.spans_us.lock().unwrap();
+            let mut events: Vec<(u64, i32)> = Vec::with_capacity(spans.len() * 2);
+            for (start, end) in spans.iter() {
+                events.push((*start, 1));
+                events.push((*end, -1));
+            }
+            events.sort_unstable();
+            let (mut depth, mut max) = (0i32, 0i32);
+            for (_, delta) in events {
+                depth += delta;
+                max = max.max(depth);
+            }
+            max.max(0) as usize
+        }
+    }
+
+    impl std::fmt::Display for ProbeStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "ProbeStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for ProbeStore {
+        async fn put_opts(
+            &self,
+            location: &ObjPath,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> StoreResult<PutResult> {
+            let started_us = asyncrt::mono_us();
+            if !self.put_latency.is_zero() {
+                asyncrt::sleep(self.put_latency).await;
+            }
+            let outcome = if self.fail_puts.load(Ordering::SeqCst) {
+                Err(cello_ltx::object_store::Error::Generic {
+                    store: "ProbeStore",
+                    source: "injected put failure".into(),
+                })
+            } else {
+                self.inner.put_opts(location, payload, opts).await
+            };
+            self.note_put(started_us, outcome).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjPath,
+            opts: PutMultipartOptions,
+        ) -> StoreResult<Box<dyn MultipartUpload>> {
+            if !self.put_latency.is_zero() {
+                asyncrt::sleep(self.put_latency).await;
+            }
+            if self.fail_puts.load(Ordering::SeqCst) {
+                return Err(cello_ltx::object_store::Error::Generic {
+                    store: "ProbeStore",
+                    source: "injected put failure".into(),
+                });
+            }
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjPath,
+            options: GetOptions,
+        ) -> StoreResult<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn head(&self, location: &ObjPath) -> StoreResult<ObjectMeta> {
+            self.inner.head(location).await
+        }
+
+        async fn delete(&self, location: &ObjPath) -> StoreResult<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(&self, prefix: Option<&ObjPath>) -> ListStream {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&ObjPath>) -> StoreResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &ObjPath, to: &ObjPath) -> StoreResult<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(&self, from: &ObjPath, to: &ObjPath) -> StoreResult<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    fn test_watch() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    fn db_path(watch: &Path, cell: &str, epoch: u64) -> PathBuf {
+        watch
+            .join(cell)
+            .join("ltx")
+            .join(format!("e{epoch}"))
+            .join("db.sqlite")
+    }
+
+    fn sql_write(db: &Path) {
+        let connection = rusqlite::Connection::open(db).unwrap();
+        connection.busy_timeout(Duration::from_secs(5)).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS t(x TEXT); INSERT INTO t(x) VALUES('hello');",
+            )
+            .unwrap();
+    }
+
+    async fn shutdown(repl: LtxRepl) {
+        let owner = repl.take_task_owner();
+        drop(repl);
+        owner.join().await;
+    }
+
+    async fn activate_epoch(repl: &LtxRepl, cell: &str, epoch: u64) {
+        repl.activate(ActivationOptions {
+            cell,
+            epoch,
+            fresh: true,
+            took_over: false,
+            resume_local: false,
+            prior: None,
+        })
+        .await
+        .unwrap();
+    }
+
+    fn synced_seq(repl: &LtxRepl, cell: &str, epoch: u64) -> u64 {
+        repl.cells
+            .lock()
+            .unwrap()
+            .get(&(cell.to_string(), epoch))
+            .cloned()
+            .expect("cell resident")
+            .synced_seq
+            .load(Ordering::SeqCst)
+    }
+
+    /// The structural fact behind the fan-out shape: one quiesced write per
+    /// cell costs exactly one PUT per cell. No round ever covers two cells,
+    /// so spreading N writes over N cells needs N PUTs where one cell
+    /// would need one. Deterministic: a bare write takes no durability
+    /// ticket before `sync_wait`, so the background loop's filter never
+    /// sees it and the direct sync credits it alone — the total cannot
+    /// drift no matter how the tick lands.
+    #[test]
+    fn quiesced_cells_cost_one_put_each() {
+        let runtime = asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let _temp = test_watch();
+            let watch = _temp.path().to_path_buf();
+            let store = Arc::new(ProbeStore::new(Duration::ZERO));
+            let repl = LtxRepl::start_with_store_for_test(&watch, store.clone());
+            const CELLS: usize = 4;
+            for i in 0..CELLS {
+                let cell = format!("c{i}");
+                activate_epoch(&repl, &cell, 1).await;
+                // Activation's own uploads (marker, seed) fall outside
+                // this window: only the write's round may PUT from here.
+                let before = store.puts();
+                let db = db_path(&watch, &cell, 1);
+                asyncrt::blocking(move || sql_write(&db)).await.unwrap();
+                assert!(matches!(
+                    repl.sync_wait(&cell, 1, Duration::from_secs(10)).await,
+                    SyncWait::Durable
+                ));
+                assert_eq!(
+                    store.puts() - before,
+                    1,
+                    "one quiesced write costs one L0 PUT: coalescing never crosses cells"
+                );
+            }
+            assert_eq!(store.puts_err(), 0, "no failure injected");
+            for i in 0..CELLS {
+                let cell = format!("c{i}");
+                let (_, source) = repl.await_durable(&cell, 1, 0).await.unwrap();
+                assert_eq!(
+                    source,
+                    cello_logic::ProofSource::Bucket,
+                    "the lone-node ack rides the per-cell bucket upload"
+                );
+            }
+            shutdown(repl).await;
+        });
+    }
+
+    /// Scaled-down fan-out shape: the same total writes over 1 vs 8 cells,
+    /// with 5 ms of programmed PUT latency (the repro report's Seaweed
+    /// p50) standing in for the bucket round trip. Only
+    /// timing-independent bounds are asserted — every write lands its
+    /// bucket proof, and PUTs stay within [cells, writes] because every
+    /// PUT covers a new txid and retries happen only on failure. The
+    /// shape itself (PUTs/write climbing toward one as cells grow, ack
+    /// latency flooring at one full round) is REPORTED for the handoff,
+    /// not asserted: absolute times belong to the machine.
+    #[test]
+    fn fanout_shape_puts_per_write_grows_with_cells() {
+        let runtime = asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            for (cells, writers, writes_each) in
+                [(1usize, 4usize, 8usize), (8usize, 8usize, 8usize)]
+            {
+                let _temp = test_watch();
+                let watch = _temp.path().to_path_buf();
+                let store = Arc::new(ProbeStore::new(Duration::from_millis(5)));
+                let repl = LtxRepl::start_with_store_for_test(&watch, store.clone());
+                for i in 0..cells {
+                    activate_epoch(&repl, &format!("c{i}"), 1).await;
+                }
+                // Baseline past activation: its uploads (marker, seed) are
+                // not the writes' rounds.
+                let puts_at_start = store.puts();
+                let latencies: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+                let phase = async {
+                    let (repl, watch, latencies) = (&repl, &watch, &latencies);
+                    let mut writer_futs = Vec::new();
+                    for w in 0..writers {
+                        let cell = format!("c{}", w % cells);
+                        writer_futs.push(async move {
+                            for _ in 0..writes_each {
+                                let db = db_path(watch, &cell, 1);
+                                asyncrt::blocking(move || sql_write(&db)).await.unwrap();
+                                let begin_us = asyncrt::mono_us();
+                                let (_, source) = repl
+                                    .await_durable(&cell, 1, 0)
+                                    .await
+                                    .expect("the background loop proves every ticket");
+                                assert_eq!(source, cello_logic::ProofSource::Bucket);
+                                latencies
+                                    .lock()
+                                    .unwrap()
+                                    .push(asyncrt::mono_us().saturating_sub(begin_us));
+                            }
+                        });
+                    }
+                    futures_util::future::join_all(writer_futs).await;
+                };
+                let begin_us = asyncrt::mono_us();
+                if asyncrt::timeout(Duration::from_secs(30), phase)
+                    .await
+                    .is_err()
+                {
+                    panic!("fan-out phase with {cells} cells stalled past 30 s");
+                }
+                let wall_us = asyncrt::mono_us().saturating_sub(begin_us);
+                // Every `await_durable` returned, so the background loop
+                // already credited every ticket; no further quiesce can move
+                // the counters.
+                let total = writers * writes_each;
+                let puts = store.puts() - puts_at_start;
+
+                let mean_lat_us = {
+                    let lat = latencies.lock().unwrap();
+                    assert_eq!(lat.len(), total, "every write recorded its ack latency");
+                    lat.iter().sum::<u64>() / lat.len() as u64
+                };
+                eprintln!(
+                    "fanout cells={cells} writers={writers} writes={total} puts={puts} \
+                     puts_per_write={:.2} wall_ms={} mean_ack_ms={:.1} max_concurrent_puts={}",
+                    puts as f64 / total as f64,
+                    wall_us / 1_000,
+                    mean_lat_us as f64 / 1_000.0,
+                    store.max_concurrent_puts(),
+                );
+                assert_eq!(store.puts_err(), 0, "no failure injected");
+                assert!(
+                    puts >= cells,
+                    "every dirty cell uploads at least once, but never for another cell"
+                );
+                assert!(
+                    puts <= total,
+                    "every PUT covers a new txid; only a failed PUT re-uploads"
+                );
+                shutdown(repl).await;
+            }
+        });
+    }
+
+    /// A refused PUT wakes its waiters but credits no ticket and resolves
+    /// nobody: the failure owns nothing, so the write stays provable by
+    /// the next round. Deterministic: while the switch refuses, no success
+    /// path exists, so "still pending" cannot flake.
+    #[test]
+    fn failed_upload_credits_nothing_and_resolves_nothing() {
+        let runtime = asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let _temp = test_watch();
+            let watch = _temp.path().to_path_buf();
+            let store = Arc::new(ProbeStore::new(Duration::ZERO));
+            store.set_fail_puts(true);
+            let repl = LtxRepl::start_with_store_for_test(&watch, store.clone());
+            activate_epoch(&repl, "c", 1).await;
+            let db = db_path(&watch, "c", 1);
+            asyncrt::blocking(move || sql_write(&db)).await.unwrap();
+            let mut waiter = Box::pin(repl.await_durable("c", 1, 0));
+            // The ticket is taken on first poll; the background loop's
+            // attempt fails against the injected refusal.
+            assert!(
+                waiter.as_mut().now_or_never().is_none(),
+                "the waiter parks on its ticket"
+            );
+            let attempted = async {
+                while store.puts_err() == 0 {
+                    asyncrt::sleep(Duration::from_millis(5)).await;
+                }
+            };
+            if asyncrt::timeout(Duration::from_secs(10), attempted)
+                .await
+                .is_err()
+            {
+                panic!("the background sync never attempted the upload");
+            }
+            assert!(
+                waiter.as_mut().now_or_never().is_none(),
+                "a failed upload resolves no waiter"
+            );
+            assert_eq!(
+                synced_seq(&repl, "c", 1),
+                0,
+                "a failed round credits no ticket"
+            );
+            assert_eq!(store.puts_ok(), 0, "nothing succeeded while refused");
+            drop(waiter);
+            shutdown(repl).await;
+        });
+    }
+
+    /// The round after the refusal lifts proves the same ticket with
+    /// exactly one credit: the failed round staged nothing durable (the
+    /// replica watermark advances only after a PUT ack), so the retry
+    /// re-uploads the same txids without double-counting. The direct
+    /// `sync_wait` below and the background worker may race — both upload
+    /// the same idempotent bytes and both credit the same ticket — so the
+    /// test asserts only race-independent facts.
+    #[test]
+    fn failed_round_retries_to_one_credit() {
+        let runtime = asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let _temp = test_watch();
+            let watch = _temp.path().to_path_buf();
+            let store = Arc::new(ProbeStore::new(Duration::ZERO));
+            store.set_fail_puts(true);
+            let repl = LtxRepl::start_with_store_for_test(&watch, store.clone());
+            activate_epoch(&repl, "c", 1).await;
+            let db = db_path(&watch, "c", 1);
+            asyncrt::blocking(move || sql_write(&db)).await.unwrap();
+            let mut waiter = Box::pin(repl.await_durable("c", 1, 0));
+            assert!(waiter.as_mut().now_or_never().is_none());
+            let attempted = async {
+                while store.puts_err() == 0 {
+                    asyncrt::sleep(Duration::from_millis(5)).await;
+                }
+            };
+            if asyncrt::timeout(Duration::from_secs(10), attempted)
+                .await
+                .is_err()
+            {
+                panic!("the background sync never attempted the upload");
+            }
+            store.set_fail_puts(false);
+            assert!(matches!(
+                repl.sync_wait("c", 1, Duration::from_secs(10)).await,
+                SyncWait::Durable
+            ));
+            let (_, source) = waiter.await.unwrap();
+            assert_eq!(source, cello_logic::ProofSource::Bucket);
+            assert!(store.puts_ok() >= 1, "the retry uploads the same txids");
+            assert_eq!(
+                synced_seq(&repl, "c", 1),
+                1,
+                "one ticket takes exactly one credit, however many PUTs it needed"
+            );
+            shutdown(repl).await;
+        });
+    }
+
+    /// Dropping a durability waiter disturbs neither its round's peer nor
+    /// later writes: the waiter holds no lock and no ticket lease, so
+    /// cancellation is a local decision. Fully synchronous — no timing.
+    #[test]
+    fn cancelled_waiter_disturbs_nothing() {
+        let runtime = asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let _temp = test_watch();
+            let watch = _temp.path().to_path_buf();
+            let store = Arc::new(ProbeStore::new(Duration::ZERO));
+            let repl = LtxRepl::start_with_store_for_test(&watch, store.clone());
+            activate_epoch(&repl, "c", 1).await;
+            for _ in 0..2 {
+                let db = db_path(&watch, "c", 1);
+                asyncrt::blocking(move || sql_write(&db)).await.unwrap();
+            }
+            let mut waiter_a = Box::pin(repl.await_durable("c", 1, 0));
+            assert!(waiter_a.as_mut().now_or_never().is_none());
+            let mut waiter_b = Box::pin(repl.await_durable("c", 1, 0));
+            assert!(waiter_b.as_mut().now_or_never().is_none());
+            drop(waiter_a);
+            assert!(matches!(
+                repl.sync_wait("c", 1, Duration::from_secs(10)).await,
+                SyncWait::Durable
+            ));
+            let (_, source) = waiter_b.await.unwrap();
+            assert_eq!(source, cello_logic::ProofSource::Bucket);
+            // The cell keeps proving later writes after a peer's
+            // cancellation.
+            let db = db_path(&watch, "c", 1);
+            asyncrt::blocking(move || sql_write(&db)).await.unwrap();
+            let (_, source) = repl.await_durable("c", 1, 0).await.unwrap();
+            assert_eq!(source, cello_logic::ProofSource::Bucket);
+            assert_eq!(synced_seq(&repl, "c", 1), 3, "every ticket credited once");
+            shutdown(repl).await;
+        });
+    }
+}
 #[cfg(cello_internal_tests)]
 include!(env!("CELLO_INTERNAL_LTX_REPL_OBSERVERS"));
