@@ -1,4 +1,4 @@
-// Modified by Ryuz Corp (Cello): woken-continuation outbound conformance (upstream #258). Apache-2.0.
+// Modified by Ryuz Corp (Cello): woken-continuation outbound conformance (upstream #258); live-ambient adoption legs (#299, #303). Apache-2.0.
 
 // A black-box runner, not node code: it boots the real `cello dev` binary
 // and drives the issue's self-vs-woken outbound dance, so the execution
@@ -8,16 +8,19 @@
 //! Conformance for outbound calls made from a continuation woken by another
 //! event (denoland/celld#258): request A starts async work and returns; a
 //! later request resolves the promise it waits on; the continuation then
-//! makes an outbound `fetch()` (or a storage write). The waiter must settle
-//! instead of hanging to its budget.
+//! makes an outbound `fetch()`, a storage write, or a facet RPC. Under
+//! live-ambient adoption (#299, #303) the woken continuation runs as the
+//! live same-cell event that woke it, so every leg settles exactly the way
+//! workerd settles it — including the finished-fetch facet loop and the
+//! own-cell storage write the retired-event refusal used to forbid.
 //!
-//! Before the retirement-hardening line the woken outbound call never
-//! settled — no result, no error, nothing logged. Now the call fails loudly
-//! (its origin event is retired) while the self-woken control still
-//! succeeds, so every leg of the dance answers. The full workerd parity —
-//! running the call under the live waker — needs the live-ambient adoption
-//! design and stays open; this test pins the no-hang half: any leg still
-//! `pending` at the deadline fails.
+//! The cancellation leg proves adopted work retires with its adopter: the
+//! adopting event's background budget drops the adopted fetch, and the
+//! server observes the client disconnect. The forgery leg pins the other
+//! side: a live event claiming another cell's scope is still refused, so
+//! adoption never charges one cell for another's work. A genuinely
+//! orphaned continuation keeps the existing loud failure (pinned
+//! white-box by `retired_event_attribution`).
 //!
 //! One `cello dev` boots the fixture per test. No fixed sleeps on the pass
 //! path: each leg polls its result with a deadline, and the server guard
@@ -26,6 +29,7 @@
 mod common;
 
 use common::{announced, cello_command, forward_announce, NO_EXTRA_ENV};
+use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -56,7 +60,14 @@ struct TestNode {
 
 impl TestNode {
     fn boot(project: &Path) -> Self {
-        let mut child = cello_command(project, NO_EXTRA_ENV)
+        Self::boot_with_env(project, NO_EXTRA_ENV)
+    }
+
+    fn boot_with_env(
+        project: &Path,
+        extra_env: impl IntoIterator<Item = (impl AsRef<OsStr>, impl AsRef<OsStr>)>,
+    ) -> Self {
+        let mut child = cello_command(project, extra_env)
             .arg("dev")
             .arg(project)
             .arg("--port")
@@ -163,6 +174,18 @@ fn http_get(addr: &str, path: &str, timeout: Duration) -> Result<(u16, String), 
 /// the waiter is still `pending` at the deadline: that is the hang this
 /// test pins against.
 fn run_leg(node: &TestNode, begin: &str, woken: bool, name: &str) -> String {
+    run_leg_with_deadline(node, begin, woken, name, Duration::from_secs(15))
+}
+
+/// The same dance with an explicit settle deadline, for legs whose
+/// settlement waits on a budget (cancellation) or a facet first-open.
+fn run_leg_with_deadline(
+    node: &TestNode,
+    begin: &str,
+    woken: bool,
+    name: &str,
+    deadline: Duration,
+) -> String {
     let (status, _) = http_get(&node.public, begin, Duration::from_secs(15)).expect("begin");
     assert_eq!(status, 200, "{begin}");
     if woken {
@@ -191,7 +214,7 @@ fn run_leg(node: &TestNode, begin: &str, woken: bool, name: &str) -> String {
         if result != "pending" {
             return result;
         }
-        if start.elapsed() > Duration::from_secs(15) {
+        if start.elapsed() > deadline {
             panic!("woken waiter never settled (still pending)");
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -213,10 +236,100 @@ fn woken_continuation_outbound_work_settles() {
     assert_eq!(self_fetch, "ok plain ok", "{self_fetch}");
     let self_store = run_leg(&node, "/self?how=storage&name=sstore", false, "sstore");
     assert_eq!(self_store, "ok stored", "{self_store}");
+    let self_facet = run_leg_with_deadline(
+        &node,
+        "/self?how=facet&name=scoop",
+        false,
+        "scoop",
+        Duration::from_secs(30),
+    );
+    assert_eq!(self_facet, "ok pong:x", "{self_facet}");
 
-    // Woken by another request: must settle (loudly), never hang.
+    // Woken by another request: under live-ambient adoption the
+    // continuation runs as the live same-cell event that woke it, so every
+    // leg settles exactly the way workerd settles it.
     let woken_fetch = run_leg(&node, "/start?how=fetch&name=wfetch", true, "wfetch");
-    assert_ne!(woken_fetch, "pending", "woken fetch hung");
+    assert_eq!(woken_fetch, "ok plain ok", "{woken_fetch}");
     let woken_store = run_leg(&node, "/start?how=storage&name=wstore", true, "wstore");
-    assert_ne!(woken_store, "pending", "woken storage hung");
+    assert_eq!(woken_store, "ok stored", "{woken_store}");
+    let woken_facet = run_leg_with_deadline(
+        &node,
+        "/start?how=facet&name=wcoop",
+        true,
+        "wcoop",
+        Duration::from_secs(30),
+    );
+    assert_eq!(woken_facet, "ok pong:x", "{woken_facet}");
+}
+
+/// Adopted work retires with its adopter: the adopting event's background
+/// budget drops the adopted fetch, and the server observes the client
+/// disconnect. Before adoption the woken fetch threw immediately, so the
+/// hanging endpoint was never reached and no cancellation was recorded.
+#[test]
+fn adopted_outbound_cancels_with_adopting_event() {
+    let dir = tempfile::Builder::new()
+        .prefix("cello-woken-cancel-")
+        .tempdir()
+        .expect("tempdir");
+    let project = dir.path().join("app");
+    copy_dir(&fixture_dir(), &project);
+    let node = TestNode::boot_with_env(&project, [("CELLO_BACKGROUND_BUDGET_S", "10")]);
+
+    let result = run_leg_with_deadline(
+        &node,
+        "/start-slow?name=wcancel",
+        true,
+        "wcancel",
+        Duration::from_secs(40),
+    );
+    assert!(
+        result.starts_with("cancelled:"),
+        "adopted fetch was not cancelled with its adopter: {result}"
+    );
+
+    // The cell still serves: dropping the adopted op wedged nothing.
+    let again = run_leg(&node, "/self?how=storage&name=safter", false, "safter");
+    assert_eq!(again, "ok stored", "{again}");
+}
+
+/// A live event claiming another cell's scope is refused, adoption or not:
+/// the scope check compares against the executing cell, so one cell's work
+/// never charges another cell.
+#[test]
+fn executing_cell_scope_refuses_foreign_claim() {
+    let dir = tempfile::Builder::new()
+        .prefix("cello-woken-forge-")
+        .tempdir()
+        .expect("tempdir");
+    let project = dir.path().join("app");
+    copy_dir(&fixture_dir(), &project);
+    let node = TestNode::boot(&project);
+
+    let (status, scope) = http_get(
+        &node.public,
+        "/expose-scope?name=fa",
+        Duration::from_secs(15),
+    )
+    .expect("expose scope");
+    assert_eq!(status, 200);
+    let scope = scope.trim().to_string();
+    assert!(!scope.is_empty(), "empty scope");
+
+    let (status, body) = http_get(
+        &node.public,
+        &format!("/forge?name=fb&scope={scope}&key=k"),
+        Duration::from_secs(15),
+    )
+    .expect("forge answers");
+    assert_eq!(status, 200, "{body}");
+    let body = body.trim().to_string();
+    assert!(
+        body.starts_with("forged-refused:"),
+        "foreign scope was not refused: {body}"
+    );
+    assert!(
+        body.contains("not bound to the executing cell"),
+        "unexpected refusal shape: {body}"
+    );
 }

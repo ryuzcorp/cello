@@ -18,10 +18,10 @@ use crate::asyncrt;
 use crate::storage;
 use anyhow::{anyhow, Context as _, Result};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use v8::{ValueDeserializerHelper, ValueSerializerHelper};
 
@@ -1152,11 +1152,16 @@ impl EgressGate {
 /// A's reaction would otherwise be gated against the wrong cell's position, or
 /// refused as belonging to the wrong cell. The turn owner remains the answer
 /// for code that installs no continuation token — but a token that no longer
-/// resolves names a retired event, and must not borrow another event's
-/// ambient context: a stale continuation doing subrequest work would
-/// otherwise charge the ambient entry's budget.
+/// resolves names a retired event. Its work may still resume, adopted by a
+/// live event of its own cell (see `live_ambient_adoption_for`); borrowing
+/// any other ambient would charge a foreign request for work it never did.
 fn event_context(scope: &mut v8::PinScope) -> Option<Arc<IoContext>> {
-    current_reaction_or_untracked_io_context(scope)
+    match current_reaction_or_untracked_io_context(scope) {
+        Some(context) => Some(context),
+        // The continuation's event retired. Its work may still resume, but
+        // only adopted by a live event of its own cell (see below).
+        None => adopt_live_ambient(scope),
+    }
 }
 
 /// Fail an op whose calling event already retired. Its token resolved to
@@ -1164,6 +1169,147 @@ fn event_context(scope: &mut v8::PinScope) -> Option<Arc<IoContext>> {
 /// the ambient entry's would charge a foreign request for work it never did.
 fn retired_event_throw(scope: &mut v8::PinScope) {
     loader_throw(scope, "the event that issued this operation already ended");
+}
+
+/// The cell scope a retired continuation belonged to, by continuation id.
+///
+/// A continuation that belongs to a cell may resume after its initiating
+/// event returns only when woken by a live event of that same cell (a later
+/// request's turn running the reaction, or the finished fetch's read loop
+/// reaching a facet call). The token alone cannot prove that cell once the
+/// origin retired, so `IoContext::drop` leaves this tombstone behind and
+/// adoption below compares it against the live ambient turn owner. No entry
+/// means no adoption: stateless events record nothing, evicted ids fail
+/// loudly instead of charging whoever happens to run the turn, and the map
+/// is bounded so a busy cell cannot grow it without limit.
+static RETIRED_CELL_SCOPES: LazyLock<Mutex<BTreeMap<u64, String>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+/// How many retired cell scopes survive for later adoption. Ids are
+/// process-wide monotonic, so evicting the smallest drops the oldest; a
+/// continuation woken past that horizon fails like any other orphan.
+const RETIRED_CELL_SCOPE_CAP: usize = 8192;
+
+/// Record the cell scope a tracked context ran its event under. Called once
+/// from `IoContext::drop`, after which the token no longer resolves and
+/// this is the only record of which cell the continuation belonged to.
+fn record_retired_cell_scope(id: u64, scope: String) {
+    let mut scopes = RETIRED_CELL_SCOPES.lock().unwrap();
+    scopes.insert(id, scope);
+    while scopes.len() > RETIRED_CELL_SCOPE_CAP {
+        scopes.pop_first();
+    }
+}
+
+/// The cell scope a retired continuation belonged to, if it ran a cell event
+/// recently enough to still be recorded.
+fn retired_cell_scope(id: u64) -> Option<String> {
+    RETIRED_CELL_SCOPES.lock().unwrap().get(&id).cloned()
+}
+
+/// Whether a dead continuation's work may resume under this ambient event.
+///
+/// Adoption needs the tombstoned cell to match the ambient event's live
+/// cell (exact scope equality — a facet scope is not its root, and one
+/// cell never adopts another's work). The returned context is the adopting
+/// live event: the caller charges its budget, samples its gate, and
+/// enqueues under its driver, so the work retires and cancels with the
+/// adopter. Everything else keeps the existing loud failure.
+fn live_ambient_adoption_for(dead: u64, ambient: &Arc<IoContext>) -> Option<Arc<IoContext>> {
+    adopt_same_cell(&retired_cell_scope(dead)?, ambient)
+}
+
+/// The live cell an ambient event runs, if it can still take work: its
+/// mailbox is open and it runs a cell event at all. A closed mailbox
+/// means retirement already took the event's last handoff, so nothing
+/// adopted here would ever be polled.
+fn live_ambient_cell(ambient: &Arc<IoContext>) -> Option<String> {
+    if !ambient.accepts_handed_ops() {
+        return None;
+    }
+    current_cell_event(ambient).map(|frame| frame.storage)
+}
+
+/// Adopt `origin_cell`'s work into a live same-cell ambient event.
+/// Exact scope equality, and only into a live ambient: cross-cell work
+/// and genuinely orphaned continuations keep the loud failure.
+fn adopt_same_cell(origin_cell: &str, ambient: &Arc<IoContext>) -> Option<Arc<IoContext>> {
+    if live_ambient_cell(ambient).as_deref() != Some(origin_cell) {
+        return None;
+    }
+    Some(ambient.clone())
+}
+
+/// Adopt a retired continuation into the live ambient turn, if the turn
+/// owner runs the same cell the continuation belonged to.
+///
+/// Deferred to the op: the wake itself carries no scope, so only the work
+/// the continuation actually does can prove which cell it belongs to (its
+/// tombstoned scope) and which live event may own it (the turn running now).
+/// The turn owner is the `finish_turn` entry first — its checkpoints run the
+/// foreign reactions — then the thread-local turn context for the guarded
+/// turn segments. A genuinely orphaned continuation (no tombstone, no live
+/// same-cell ambient) still resolves to nothing and fails loudly.
+fn adopt_live_ambient(scope: &mut v8::PinScope) -> Option<Arc<IoContext>> {
+    let dead = reaction_continuation_id(scope)?;
+    if let Some(ambient) = turn_owner() {
+        if let Some(adopted) = live_ambient_adoption_for(dead, &ambient) {
+            return Some(adopted);
+        }
+    }
+    let ambient = turn_context()?;
+    live_ambient_adoption_for(dead, &ambient)
+}
+
+#[cfg(test)]
+mod live_ambient_adoption_tests {
+    use super::*;
+
+    fn cell_context(runtime_state: &Arc<ActorRuntimeState>, scope: &str) -> (u64, Arc<IoContext>) {
+        let context = IoContext::tracked(runtime_state);
+        let id = context
+            .continuation_id()
+            .expect("a tracked context has an id");
+        context.egress.lock().unwrap().push(EgressFrame {
+            storage: scope.to_string(),
+            before: 0,
+            root: None,
+        });
+        (id, context)
+    }
+
+    #[test]
+    fn retired_continuation_adopts_into_live_same_cell_event() {
+        let runtime_state = Arc::new(ActorRuntimeState::default());
+        let (dead, origin) = cell_context(&runtime_state, "cells:v1:test:adopt");
+        drop(origin);
+        assert_eq!(
+            retired_cell_scope(dead).as_deref(),
+            Some("cells:v1:test:adopt")
+        );
+        let (_, ambient) = cell_context(&runtime_state, "cells:v1:test:adopt");
+        assert!(live_ambient_adoption_for(dead, &ambient).is_some());
+    }
+
+    #[test]
+    fn adoption_refuses_cross_cell_stateless_closed_and_unknown() {
+        let runtime_state = Arc::new(ActorRuntimeState::default());
+        let (dead, origin) = cell_context(&runtime_state, "cells:v1:test:cell-a");
+        drop(origin);
+        // Another cell never adopts another cell's retired work.
+        let (_, other) = cell_context(&runtime_state, "cells:v1:test:cell-b");
+        assert!(live_ambient_adoption_for(dead, &other).is_none());
+        // A stateless ambient has no cell frame to match against.
+        let bare = IoContext::tracked(&runtime_state);
+        assert!(live_ambient_adoption_for(dead, &bare).is_none());
+        // A retired ambient's closed mailbox refuses.
+        let (_, retired) = cell_context(&runtime_state, "cells:v1:test:cell-a");
+        let _ = retired.close_handed_ops();
+        assert!(live_ambient_adoption_for(dead, &retired).is_none());
+        // An id with no tombstone fails instead of adopting.
+        let (_, ambient) = cell_context(&runtime_state, "cells:v1:test:cell-a");
+        assert!(live_ambient_adoption_for(u64::MAX, &ambient).is_none());
+    }
 }
 
 /// What one cell event's outbound effects gate against.
@@ -4557,6 +4703,15 @@ impl InFlight {
         self.fail(anyhow!("handler exceeded {}s budget", budget.as_secs()));
     }
 
+    /// When this entry's background budget ends, if the phase has started.
+    /// The drive races its wait against this deadline so expiry is checked
+    /// on time even while no operation completes to wake it: without the
+    /// race an entry parked on a hung adopted op re-checks expiry only on
+    /// the next wake, which may be minutes after the budget ran out.
+    pub fn background_deadline(&self, budget: Duration) -> Option<tokio::time::Instant> {
+        self.background_since.map(|since| since + budget)
+    }
+
     /// Whether post-response work has outlived its budget (upstream #275).
     /// Stamps the background phase on first observation, so the budget
     /// bounds leftover work even when no wake ever fires again. The caller
@@ -4606,6 +4761,14 @@ impl InFlight {
         self.background_since = None;
         self.completed_cell_event = false;
         self.context.seal_wait_until();
+        // Adopted work belongs to this entry's background: a continuation the
+        // entry woke keeps the entry alive through its refed op, so expiry
+        // must end it — otherwise the adopter idles until the callee settles
+        // on its own. Publishing aborts the callee's driver directly; the
+        // adopted op then settles (or was already dropped) and the entry
+        // retires. Own ops are untouched: handler-phase work survives expiry.
+        let adopted = self.context.take_adopted_child_cancels();
+        publish_child_aborts(adopted);
     }
 
     /// Nothing this request awaits can move it, so it will never settle on
@@ -5596,6 +5759,9 @@ impl Worker {
 /// turn, and the spawn and its classification drain together. Such an op
 /// does not defer retirement: see `retired`.
 fn finish_turn(tc: &mut v8::PinScope, entry: &mut InFlight) -> Vec<Op> {
+    // Name the turn owner while its tail runs: the checkpoints below run
+    // foreign reactions whose ops the adoption check attributes here.
+    let _turn_owner = TurnOwnerGuard::enter(entry.context.clone());
     if let Err(error) = finish_cpu_turn(tc, entry) {
         let error = take_execution_termination_in_context(tc, Some(&entry.context))
             .unwrap_or_else(|| anyhow!(error));
@@ -5679,8 +5845,28 @@ fn adopt(tc: &mut v8::PinScope, entry: &mut InFlight) -> Vec<Op> {
     let mut ops = Vec::with_capacity(spawns.len());
     for (id, future, lifetime, owner) in spawns {
         if let Some(owner) = owner.filter(|owner| Some(*owner) != mine) {
-            entry.hand_op(tc, owner, id, future, lifetime);
-            continue;
+            // A driver-attributed op whose owner will never poll again
+            // adopts into this live same-cell event instead of parking for
+            // a departed driver: a dead owner leaves only its tombstone
+            // behind, while an exiting owner still resolves but takes no
+            // more handoffs (its mailbox is closed). The origin cell comes
+            // from the live frame while the context resolves, else from
+            // the tombstone; a live polling owner keeps the handoff, and
+            // anything unadoptable is refused loudly at the source.
+            let owner_context = entry.runtime_state.io_context(owner);
+            let unpollable = owner_context
+                .as_ref()
+                .is_none_or(|context| !context.accepts_handed_ops());
+            let origin_cell = match &owner_context {
+                Some(context) => current_cell_event(context).map(|frame| frame.storage),
+                None => retired_cell_scope(owner),
+            };
+            let adopted = unpollable
+                && origin_cell.is_some_and(|cell| adopt_same_cell(&cell, &entry.context).is_some());
+            if !adopted {
+                entry.hand_op(tc, owner, id, future, lifetime);
+                continue;
+            }
         }
         entry.ops.insert(id);
         if lifetime == asyncrt::OpLifetime::IoContext {
@@ -6977,6 +7163,23 @@ fn cancelled(tc: &mut v8::PinScope, entry: &mut InFlight) {
     let shutdown = take_shutdown_cancellation(entry.request_id);
     cancel(tc, entry, shutdown);
 }
+/// Publish aborts for an entry's recorded child calls still in flight. The
+/// guard channel cannot carry a purge or an expiry: its receiver lives
+/// inside the caller's own op future, which a purge drops first and an
+/// expiry never drops. The registry reaches the callee's driver directly.
+/// Only still-registered calls publish — a completed call already disarmed
+/// its guard, so its stale id no-ops instead of aborting unrelated work.
+/// Idempotent with the guard-drop path for the same reason: whichever
+/// publishes first wins, and a second publish finds no waiter.
+pub(crate) fn publish_child_aborts(ids: Vec<RequestId>) {
+    let outstanding: Vec<RequestId> = {
+        let live = do_call_cancels().lock().unwrap();
+        ids.into_iter().filter(|id| live.contains_key(id)).collect()
+    };
+    for id in outstanding {
+        abort_request(id);
+    }
+}
 
 /// End a request whose cancellation has already been taken.
 ///
@@ -7027,8 +7230,20 @@ fn cancel(tc: &mut v8::PinScope, entry: &mut InFlight, shutdown: bool) {
     // drop stands and no internal watchdog mistakes it for a timeout.
     if !shutdown && !entry.keeps_native_ops_after_disconnect() {
         entry.reject_pending_ops(tc, "The client has disconnected");
+        // Let JavaScript observe the rejection before this entry retires: a
+        // catch or finally recording the abort (the adopted-fetch proof a
+        // woken continuation's test asserts) runs here, exactly as workerd
+        // delivers the abort to script before tearing the event down. Shutdown
+        // skips this branch entirely, so no script runs on the way out.
+        tc.perform_microtask_checkpoint();
     }
     if shutdown || !entry.keeps_native_ops_after_disconnect() {
+        // The drive purges this entry's ops below, and the purge publishes
+        // the recorded child aborts (see `abort_ops`): the caller's futures
+        // stay polled until then, so their drop-guards would never fire and
+        // the child would run detached past its caller's disconnect.
+        // Entries that keep working past the disconnect (waitUntil, gates,
+        // critical sections) skip this branch and keep their children.
         entry.abandon();
     }
 }
@@ -8786,6 +9001,8 @@ fn op_svc_call_impl(
             .lock()
             .unwrap()
             .insert(request_id, (cancel_sender, None));
+        // The caller owns this call's cancellation (see `op_do_call_impl`).
+        event.record_child_cancel(request_id);
         (
             Some(request_id),
             Some(cancel_receiver),
@@ -10437,6 +10654,33 @@ fn op_do_call_impl(
     let Some(event) = event_context(scope) else {
         return retired_event_throw(scope);
     };
+    // The caller owns this call's cancellation: if a disconnect retires
+    // the caller while the callee still runs, the teardown fires it.
+    event.record_child_cancel(request_id);
+    // A continuation resumed in a foreign checkpoint creates the call under
+    // its dead origin token but executes inside this live turn: settle will
+    // adopt the op into the turn owner's drive, so the adopter must also own
+    // the callee's abort. Record on the turn owner exactly when the token
+    // cannot drive the call (dead or already closed). A live token drives
+    // its own call even from a nested turn, so it never records here.
+    TURN_OWNER.with(|owner| {
+        let Some(adopter) = owner.borrow().as_ref().cloned() else {
+            return;
+        };
+        if Arc::ptr_eq(&adopter, &event) {
+            return;
+        }
+        let Some((token, runtime)) = event.continuation.as_ref() else {
+            return;
+        };
+        let unpollable = runtime
+            .upgrade()
+            .and_then(|runtime| runtime.io_context(*token))
+            .is_none_or(|context| !context.accepts_handed_ops());
+        if unpollable {
+            adopter.record_adopted_child_cancel(request_id);
+        }
+    });
     let gate = egress_gate_request(&event, cello_logic::Channel::CellRpc);
     let request = DoCallReq {
         request_id: Some(request_id),
@@ -11473,6 +11717,8 @@ fn op_fetch(
                 .lock()
                 .unwrap()
                 .insert(request_id, (cancel_sender, None));
+            // The caller owns this call's cancellation (see `op_do_call_impl`).
+            context.record_child_cancel(request_id);
             (
                 Some(request_id),
                 Some(cancel_receiver),
@@ -14026,6 +14272,23 @@ pub struct IoContext {
     /// Empty for stateless Worker code, which owns no cell and gates
     /// nothing.
     egress: Mutex<Vec<EgressFrame>>,
+    /// Child calls this event started that outlive their reply wait: Durable
+    /// Object, service-binding, and brokered-fetch dispatches, by the
+    /// callee-side request id their cancel channel is registered under.
+    /// Lazily allocated: most events make no child call. The purge drains
+    /// and publishes these (see `abort_ops`), so cancellation reaches a
+    /// child the entry's own teardown would otherwise leave running
+    /// detached: an unanswered caller keeps polling its child future,
+    /// whose guard only fires on future drop.
+    /// A completed call's id stays listed until this entry cancels or
+    /// drops; firing looks it up in the cancel registry and no-ops on a
+    /// miss, so a stale id can never abort unrelated work. Bounded like
+    /// the grant set: a stale entry cannot grow the set without limit.
+    child_cancels: OnceLock<Mutex<Vec<RequestId>>>,
+    /// Adopted child calls this entry drives but did not create (see
+    /// `record_adopted_child_cancel`). Drained and published when this
+    /// entry's background expires; drained with `child_cancels` on purge.
+    adopted_child_cancels: OnceLock<Mutex<Vec<RequestId>>>,
     /// Ops another event's turn enqueued for this event, waiting for this
     /// event's driver to take them. See `adopt`: a continuation that resumes
     /// inside a foreign turn still enqueues through that turn, and only the
@@ -14188,6 +14451,61 @@ impl IoContext {
         Ok(())
     }
 
+    /// Record a child call this event started, by the callee-side request
+    /// id its cancel channel is registered under. The entry drains these
+    /// on purge, publishing aborts for the calls still in flight (see
+    /// `abort_ops`); entries that keep their ops keep their children.
+    fn record_child_cancel(&self, id: RequestId) {
+        const CHILD_CANCEL_CAP: usize = 4096;
+        let cancels = self.child_cancels.get_or_init(|| Mutex::new(Vec::new()));
+        let mut cancels = cancels.lock().unwrap();
+        cancels.push(id);
+        // Stale ids accumulate on entries that never cancel: a completed
+        // call stays listed until this entry cancels or drops. Prune past
+        // the cap against the live registry. The registry lock nests
+        // inside this one here and nowhere else, so the order cannot
+        // invert: firing drains first and only then takes the registry.
+        if cancels.len() > CHILD_CANCEL_CAP {
+            let live = do_call_cancels().lock().unwrap();
+            cancels.retain(|id| live.contains_key(id));
+        }
+    }
+
+    /// Take and clear this event's recorded child calls.
+    pub(crate) fn take_child_cancels(&self) -> Vec<RequestId> {
+        self.child_cancels
+            .get()
+            .map(|cancels| std::mem::take(&mut *cancels.lock().unwrap()))
+            .unwrap_or_default()
+    }
+
+    /// Record an adopted child call on the entry driving it. Called at
+    /// creation when the origin token cannot drive the call (dead or
+    /// already closed): settle will adopt it into the live turn owner's
+    /// drive, so the adopter owns the callee's abort at background
+    /// expiry. A live token drives its own call even from a nested turn,
+    /// so it never records here. Same cap discipline as `child_cancels`.
+    fn record_adopted_child_cancel(&self, id: RequestId) {
+        const ADOPTED_CHILD_CANCEL_CAP: usize = 4096;
+        let cancels = self
+            .adopted_child_cancels
+            .get_or_init(|| Mutex::new(Vec::new()));
+        let mut cancels = cancels.lock().unwrap();
+        cancels.push(id);
+        if cancels.len() > ADOPTED_CHILD_CANCEL_CAP {
+            let live = do_call_cancels().lock().unwrap();
+            cancels.retain(|id| live.contains_key(id));
+        }
+    }
+
+    /// Take and clear this event's recorded adopted child calls.
+    pub(crate) fn take_adopted_child_cancels(&self) -> Vec<RequestId> {
+        self.adopted_child_cancels
+            .get()
+            .map(|cancels| std::mem::take(&mut *cancels.lock().unwrap()))
+            .unwrap_or_default()
+    }
+
     /// Start charging this turn's CPU to the entry that owns the turn.
     ///
     /// Known imprecision: a turn that runs another entry's continuations
@@ -14281,6 +14599,8 @@ impl IoContext {
             cpu_turn: Mutex::new(None),
             tail_reporting,
             tail_logs: Mutex::new(TailLogCapture::default()),
+            child_cancels: OnceLock::new(),
+            adopted_child_cancels: OnceLock::new(),
         })
     }
 
@@ -14323,6 +14643,8 @@ impl IoContext {
             // is constructed from the report sender in `begin`.
             tail_reporting: false,
             tail_logs: Mutex::new(TailLogCapture::default()),
+            child_cancels: OnceLock::new(),
+            adopted_child_cancels: OnceLock::new(),
         });
         runtime_state
             .io_contexts
@@ -14374,6 +14696,8 @@ impl IoContext {
             cpu_turn: Mutex::new(None),
             tail_reporting,
             tail_logs: Mutex::new(TailLogCapture::default()),
+            child_cancels: OnceLock::new(),
+            adopted_child_cancels: OnceLock::new(),
         });
         runtime_state
             .io_contexts
@@ -14871,7 +15195,26 @@ impl Drop for IoContext {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(claim))),
             );
         }
+        // The token stops resolving here, so leave the cell scope behind
+        // for a continuation the next event of this cell may still wake.
+        // Only a context that ran a cell event records one; a stateless
+        // event has no scope to adopt into. The frame is read before
+        // anything is recorded so the two locks are never nested: adoption
+        // takes them in the opposite order but nests neither.
+        let retired_scope = self
+            .egress
+            .lock()
+            .unwrap()
+            .last()
+            .map(|frame| frame.storage.clone());
         if let Some((id, runtime_state)) = &self.continuation {
+            // Record before removing: a checkpoint racing this drop must see
+            // the tombstone as soon as the token stops resolving. Brief
+            // overlap with a still-resolving token is safe — event_context
+            // prefers the live context and only adopts on a miss.
+            if let Some(scope) = retired_scope {
+                record_retired_cell_scope(*id, scope);
+            }
             if let Some(runtime_state) = runtime_state.upgrade() {
                 runtime_state.io_contexts.lock().unwrap().remove(id);
             }
@@ -14907,8 +15250,9 @@ const _: fn() = || {
 };
 
 thread_local! {
-    /// The request whose turn is running on this thread, or none between
-    /// turns. Never set by JS.
+    // The request whose turn is running on this thread, or none between
+    // turns. Never set by JS. A macro body takes ordinary comments, not
+    // doc comments.
     static CURRENT: RefCell<Option<Arc<IoContext>>> =
         const { RefCell::new(None) };
 }
@@ -14946,6 +15290,50 @@ fn current_context() -> Arc<IoContext> {
         let mut current = current.borrow_mut();
         current.get_or_insert_with(IoContext::new).clone()
     })
+}
+
+/// The request whose turn runs on this thread, without creating one.
+///
+/// The creating read above is for code that must have a context; adoption
+/// only needs the one a guard installed, and a missing guard means there is
+/// no ambient turn to adopt into.
+fn turn_context() -> Option<Arc<IoContext>> {
+    CURRENT.with(|current| current.borrow().clone())
+}
+
+// The entry whose turn is running, set for the whole turn tail.
+//
+// `finish_turn` runs foreign reactions in its checkpoints with no
+// `CurrentGuard` held (the begin/deliver guards cover only their own
+// segments), so the adoption check cannot read the ambient turn owner from
+// `CURRENT` there. This guard names the entry for exactly that span and
+// nothing else reads it, so no existing `CURRENT` consumer changes meaning.
+// A macro body takes ordinary comments, not doc comments.
+thread_local! {
+    static TURN_OWNER: RefCell<Option<Arc<IoContext>>> =
+        const { RefCell::new(None) };
+}
+
+/// Install the turn owner for the duration of `finish_turn`, restoring
+/// whatever was installed when the guard drops. Turns never nest, so while
+/// this guard is held it always names the running entry.
+struct TurnOwnerGuard(Option<Arc<IoContext>>);
+
+impl TurnOwnerGuard {
+    fn enter(context: Arc<IoContext>) -> Self {
+        TurnOwnerGuard(TURN_OWNER.with(|owner| owner.borrow_mut().replace(context)))
+    }
+}
+
+impl Drop for TurnOwnerGuard {
+    fn drop(&mut self) {
+        TURN_OWNER.with(|owner| *owner.borrow_mut() = self.0.take());
+    }
+}
+
+/// The entry whose turn tail is running on this thread, if any.
+fn turn_owner() -> Option<Arc<IoContext>> {
+    TURN_OWNER.with(|owner| owner.borrow().clone())
 }
 
 #[cfg(cello_internal_tests)]

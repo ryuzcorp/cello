@@ -2290,6 +2290,13 @@ fn adopt(ops: &mut Ops, started: Vec<js::Op>) {
 /// can re-enter the isolate while that detached gate waiter finishes.
 fn abort_ops(ops: &mut Ops, entry: &mut js::InFlight) {
     ops.clear();
+    // The caller is gone: publish its recorded child aborts directly. The
+    // drop above fires their guards, but each guard's receiver died with
+    // its own future, so the send reaches nothing — the registry publish
+    // is what retires an in-process callee. Entries that keep their ops
+    // never reach this purge and keep their children, as before.
+    js::publish_child_aborts(entry.io_context().take_child_cancels());
+    js::publish_child_aborts(entry.io_context().take_adopted_child_cancels());
     entry.abandon();
 }
 
@@ -2482,6 +2489,13 @@ async fn drive_worker(
         if entry.keeps_native_ops() {
             let trailing = entry.take_handed_ops();
             if trailing.is_empty() {
+                // Close the mailbox in the same synchronous block: no
+                // handoff can land between the take and the close, so
+                // anything arriving after is refused loudly at the source
+                // instead of parking for a driver that already left.
+                let late = entry.take_handed_ops_closed();
+                debug_assert!(late.is_empty(), "no handoff lands mid-turn");
+                drop(late);
                 break;
             }
             adopt(&mut ops, trailing);
@@ -2608,12 +2622,28 @@ async fn wake_with_cross_entry_gate(
     {
         return Wake::BackgroundExpired;
     }
-    match wait
-        .wait(wake(ops, entry, budget), |wake| matches!(wake, Wake::Idle))
-        .await
-    {
-        js::input_gate_lifecycle::WaitOutcome::StateChanged => Wake::CrossEntryGateChanged,
-        js::input_gate_lifecycle::WaitOutcome::Ordinary(wake) => wake,
+    let deadline = entry.background_deadline(crate::engine_api::background_budget());
+    let budget_wake = async {
+        match wait
+            .wait(wake(ops, entry, budget), |wake| matches!(wake, Wake::Idle))
+            .await
+        {
+            js::input_gate_lifecycle::WaitOutcome::StateChanged => Wake::CrossEntryGateChanged,
+            js::input_gate_lifecycle::WaitOutcome::Ordinary(wake) => wake,
+        }
+    };
+    // Post-response work must end when its budget does, even if no operation
+    // completes to wake the drive: without this arm an entry parked on a
+    // hung adopted op re-checks expiry only on the next wake, which may be
+    // minutes after the budget ran out. The timeout yields a Poll turn; the
+    // check above then ends expired background on its own terms.
+    match deadline {
+        Some(deadline) => asyncrt::select_biased! {
+            "a budget deadline wakes the drive so expiry is enforced on time";
+            wake = budget_wake => wake,
+            _ = tokio::time::sleep_until(deadline) => Wake::Poll,
+        },
+        None => budget_wake.await,
     }
 }
 
@@ -4128,6 +4158,13 @@ async fn drive_cell_inner(
             if entry.keeps_native_ops() {
                 let trailing = entry.take_handed_ops();
                 if trailing.is_empty() {
+                    // Close the mailbox in the same synchronous block: no
+                    // handoff can land between the take and the close, so
+                    // anything arriving after is refused loudly at the
+                    // source instead of parking for a driver that left.
+                    let late = entry.take_handed_ops_closed();
+                    debug_assert!(late.is_empty(), "no handoff lands mid-turn");
+                    drop(late);
                     break;
                 }
                 #[cfg(cello_internal_tests)]
