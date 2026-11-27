@@ -1,3 +1,4 @@
+// Modified by Ryuz Corp (Cello): variable-width year in `parse_minute` so year-10000 keys round-trip (upstream #293).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Immutable alarm publications and the retirement frontier, without I/O.
@@ -197,38 +198,62 @@ fn minute_bucket(due_ms: i64) -> String {
     format!("{y:04}-{mo:02}-{d:02}T{:02}:{:02}", m / 60, m % 60)
 }
 
-fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
-    let y = y - i64::from(m <= 2);
+fn days_from_civil(y: i64, m: u32, d: u32) -> i128 {
+    // `i128` throughout: a bucket year past ~292 million still converts to
+    // a day count, and the parser below must reject the unrepresentable
+    // millisecond value with `None` rather than wrap.
+    let y = i128::from(y) - i128::from(m <= 2);
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = y - era * 400;
-    let mp = i64::from(if m > 2 { m - 3 } else { m + 9 });
-    let doy = (153 * mp + 2) / 5 + i64::from(d) - 1;
+    let mp = i128::from(if m > 2 { m - 3 } else { m + 9 });
+    let doy = (153 * mp + 2) / 5 + i128::from(d) - 1;
     era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468
 }
 
 /// The due-minute floor a `YYYY-MM-DDTHH:MM` bucket names, in ms.
+///
+/// The year is at least four digits (`minute_bucket` pads with `{y:04}`),
+/// so years past 9999 run longer than 16 chars. The shape is therefore
+/// split on its separators instead of read at fixed indices; everything
+/// else keeps the old strictness (four-or-more-digit year, two-digit
+/// month/day/hour/minute, ASCII digits only), and the round-trip check
+/// below still rejects impossible dates like February 30th.
 fn parse_minute(minute: &str) -> Option<i64> {
-    if minute.len() != 16 {
+    let (date, time) = minute.split_once('T')?;
+    let h = two_digits(time.get(0..2)?)?;
+    if time.get(2..3)? != ":" {
         return None;
     }
-    let y: i64 = minute.get(0..4)?.parse().ok()?;
-    let mo: u32 = minute.get(5..7)?.parse().ok()?;
-    let d: u32 = minute.get(8..10)?.parse().ok()?;
-    let h: i64 = minute.get(11..13)?.parse().ok()?;
-    let mi: i64 = minute.get(14..16)?.parse().ok()?;
-    if minute.get(4..5)? != "-"
-        || minute.get(7..8)? != "-"
-        || minute.get(10..11)? != "T"
-        || minute.get(13..14)? != ":"
-        || !(1..=12).contains(&mo)
-        || !(1..=31).contains(&d)
-        || !(0..24).contains(&h)
-        || !(0..60).contains(&mi)
-    {
+    let mi = two_digits(time.get(3..5)?)?;
+    if time.len() != 5 || !(0..24).contains(&h) || !(0..60).contains(&mi) {
         return None;
     }
-    let ms = (days_from_civil(y, mo, d) * 1440 + h * 60 + mi) * 60_000;
+    let (year_month, d) = date.rsplit_once('-')?;
+    let (year, mo) = year_month.rsplit_once('-')?;
+    let mo = two_digits(mo)?;
+    let d = two_digits(d)?;
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let digits = year.strip_prefix('-').unwrap_or(year);
+    if digits.is_empty() || year.len() < 4 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let y: i64 = year.parse().ok()?;
+    let ms = (days_from_civil(y, mo as u32, d as u32) * 1440 + i128::from(h) * 60 + i128::from(mi))
+        * 60_000;
+    let ms = i64::try_from(ms).ok()?;
     (minute_bucket(ms) == minute).then_some(ms)
+}
+
+/// Exactly two ASCII digits. `str::parse` would take a leading `+`, which no
+/// bucket the waker writes ever contains.
+fn two_digits(text: &str) -> Option<i64> {
+    if text.len() == 2 && text.bytes().all(|b| b.is_ascii_digit()) {
+        text.parse().ok()
+    } else {
+        None
+    }
 }
 
 pub const ENTRY_PREFIX: &str = "wake/entries/";
