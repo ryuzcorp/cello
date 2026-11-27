@@ -9,6 +9,10 @@ ARG CELLO_COMMIT=unknown
 ARG ESBUILD_VERSION=0.28.2
 
 FROM rust:${RUST_VERSION}-bookworm AS build
+
+# The arm64 allocator build below sets JEMALLOC_SYS_WITH_LG_PAGE=16 so one
+# artifact starts on 4 KiB and 16 KiB page kernels (upstream
+# denoland/celld#298); amd64 keeps the jemalloc default.
 ARG TARGETARCH
 ARG ESBUILD_VERSION
 # `release` for shipped artifacts; a fast-loop caller passes `lab` to skip
@@ -25,7 +29,17 @@ RUN --mount=type=cache,id=cello-cargo-registry,target=/usr/local/cargo/registry,
     --mount=type=cache,id=cello-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=cello-target-${TARGETARCH},target=/src/target,sharing=locked \
     mkdir -p /out && \
+    if [ "${TARGETARCH}" = "arm64" ]; then export JEMALLOC_SYS_WITH_LG_PAGE=16; fi && \
     CELLO_VERSION="${CELLO_VERSION}" cargo build --profile "${CELLO_PROFILE}" --locked -p cello && \
+    if [ "${TARGETARCH}" = "arm64" ]; then \
+      grep -q -- '--with-lg-page=16' target/"${CELLO_PROFILE}"/build/tikv-jemalloc-sys-*/output || \
+        { echo "refusing: arm64 image needs jemalloc --with-lg-page=16 (16 KiB page kernels)" >&2; exit 1; }; \
+    else \
+      if ! ls target/"${CELLO_PROFILE}"/build/tikv-jemalloc-sys-*/output >/dev/null 2>&1 || \
+          grep -q -- '--with-lg-page=' target/"${CELLO_PROFILE}"/build/tikv-jemalloc-sys-*/output; then \
+        echo "refusing: amd64 image must keep the default jemalloc page size" >&2; exit 1; \
+      fi; \
+    fi && \
     install -m 755 "target/${CELLO_PROFILE}/cello" /out/cello
 # Self-contained esbuild for `cello dev`/`cello deploy` of Worker code: the
 # same repo-pinned npm tarballs (by version and sha512) the CI test job
