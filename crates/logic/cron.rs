@@ -1,3 +1,4 @@
+// Modified by Ryuz Corp (Cello): checked `next_after` arithmetic at `i64::MAX` (upstream #292); `L-xW` Monday/Friday mutual exclusion (upstream #294).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Cron trigger schedules, reified sans-IO.
@@ -496,8 +497,18 @@ fn day_of_month_matches(field: &DayOfMonth, day: u32, weekday: u32, last: u32) -
         DayOfMonth::LastOffsetWeekday(offset) => {
             let target = day + offset;
             (!is_weekend(weekday) && target == last)
-                || (weekday == 1 && target > last && target - last < 3)
                 || (weekday == 5 && target + 1 == last)
+                || (weekday == 1
+                    && target > last
+                    && target - last < 3
+                    // A Saturday nominal date belongs to the Friday before
+                    // it, not the Monday after: when that Friday is in-month
+                    // (`day > 3`, so `day - 3` is the Friday the arm above
+                    // matches) the Monday must not match too, or the month
+                    // fires twice (`L-2W` in August 2026 matched Friday the
+                    // 28th and Monday the 31st). The Monday still matches
+                    // when the Friday fell outside the month.
+                    && (target - last != 2 || day <= 3))
         }
         DayOfMonth::ClosestWeekday(target) => {
             (!is_weekend(weekday) && day == target)
@@ -523,7 +534,8 @@ fn day_of_week_matches(field: &DayOfWeek, day: u32, weekday: u32, last: u32) -> 
 }
 
 /// The first occurrence strictly after `after_ms`, or `None` when the
-/// expression cannot match within [`MAX_LOOKAHEAD_DAYS`].
+/// expression cannot match within [`MAX_LOOKAHEAD_DAYS`] or the next
+/// occurrence would fall past `i64::MAX` and is unrepresentable.
 ///
 /// Strictly after is what makes a re-arm from inside the handler terminate: an
 /// occurrence that returned itself would arm an alarm already due and spin.
@@ -533,7 +545,11 @@ pub fn next_after(cron: &Cron, after_ms: Ms) -> Option<Ms> {
     for day in (start.div_euclid(1440)..).take(MAX_LOOKAHEAD_DAYS) {
         if day_matches(cron, day) {
             if let Some(found) = next_time_of_day(cron, time) {
-                return Some((day * 1440 + found) * 60_000);
+                // Days only count up from here, so the first unrepresentable
+                // minute poisons every later one: report no occurrence rather
+                // than wrap to a negative timestamp.
+                let minute = day.checked_mul(1440)?.checked_add(found)?;
+                return minute.checked_mul(60_000);
             }
         }
         time = 0;
