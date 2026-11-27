@@ -282,15 +282,17 @@ async fn serve_do(
                 None
             };
             let (parts, body) = inner.into_parts();
+            // Values decode as UTF-8 with replacement, the way the ingress
+            // does, so a valid non-ASCII value is not dropped here (#295).
             let headers = parts
                 .headers
                 .iter()
                 .filter(|(name, _)| !CONTROL_HEADERS.contains(&name.as_str()))
-                .filter_map(|(name, value)| {
-                    value
-                        .to_str()
-                        .ok()
-                        .map(|value| (name.as_str().to_string(), value.to_string()))
+                .map(|(name, value)| {
+                    (
+                        name.as_str().to_string(),
+                        cello::header_bytes::header_value_to_js(value.as_bytes()),
+                    )
                 })
                 .collect();
             // An absent body crosses as absence, not as the empty stream its

@@ -68,6 +68,7 @@ pub(crate) mod facet_streams;
 pub mod fleet;
 pub mod generation;
 pub mod hardening;
+pub mod header_bytes;
 pub mod host_channels;
 pub mod host_services;
 pub mod http_streams;
