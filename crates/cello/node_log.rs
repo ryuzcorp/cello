@@ -4832,6 +4832,7 @@ mod degraded_resume_guard_tests {
                         peer_protocol: 1,
                         paced_handoff: false,
                         generation: "g".into(),
+                        serving: None,
                         log: None,
                         load: NodeLoadWire::default(),
                     })
@@ -4933,6 +4934,7 @@ mod degraded_resume_guard_tests {
                         peer_protocol: 1,
                         paced_handoff: false,
                         generation: "g".into(),
+                        serving: None,
                         log: None,
                         load: NodeLoadWire::default(),
                     })
@@ -5186,6 +5188,7 @@ mod recovery_heartbeat_tests {
             peer_protocol: 1,
             paced_handoff: false,
             generation: "gen9".into(),
+            serving: None,
             log: Some(NodeLogWire {
                 state: "recovering".into(),
                 epoch: 3,
@@ -8599,6 +8602,7 @@ mod seal_absent_log_tests {
             peer_protocol: 1,
             paced_handoff: false,
             generation: String::new(),
+            serving: None,
             log,
             load: NodeLoadWire::default(),
         }
@@ -9286,6 +9290,7 @@ mod bucket_executor_tests {
             peer_protocol: 1,
             paced_handoff: false,
             generation: "gen1".into(),
+            serving: None,
             log: Some(log_to_wire(&record, false)),
             load: NodeLoadWire::default(),
         };
@@ -9317,6 +9322,7 @@ mod bucket_executor_tests {
             peer_protocol: 1,
             paced_handoff: false,
             generation: "gen1".into(),
+            serving: None,
             log: Some(log_to_wire(&record, false)),
             load: NodeLoadWire::default(),
         };
@@ -10492,6 +10498,7 @@ mod bucket_recovery_tests {
             peer_protocol: 1,
             paced_handoff: false,
             generation: generation.into(),
+            serving: None,
             log: record.map(|(record, marker)| log_to_wire(record, marker)),
             load: NodeLoadWire::default(),
         };
@@ -10847,6 +10854,7 @@ mod bucket_recovery_tests {
                 peer_protocol: 1,
                 paced_handoff: false,
                 generation: "gen9".into(),
+                serving: None,
                 log: None,
                 load: NodeLoadWire::default(),
             };
@@ -11091,6 +11099,7 @@ mod fragment_gc_tests {
             peer_protocol: 1,
             paced_handoff: false,
             generation: generation.to_string(),
+            serving: None,
             log: Some(log_to_wire(&record, false)),
             load: Default::default(),
         };
@@ -11252,6 +11261,7 @@ mod fragment_gc_tests {
             peer_protocol: 1,
             paced_handoff: false,
             generation: generation.to_string(),
+            serving: None,
             log: None,
             load: Default::default(),
         };

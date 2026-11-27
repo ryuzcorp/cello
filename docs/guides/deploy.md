@@ -36,4 +36,4 @@ cello invoke app=VERSION --path /migrate --method POST --bucket "$CELLO_BUCKET"
 cello activate app=VERSION --bucket "$CELLO_BUCKET"
 ```
 
-`cello versions [SCRIPT]` lists the deployed versions, marking the serving generation `current`. `cello discard SCRIPT=VERSION` deletes a staged version no pointer names. See [stage versions](staged-versions.md) for the invoke contract and [CLI reference](../reference/cli.md) for every flag.
+`cello versions [SCRIPT]` lists the deployed versions, marking the serving generation `current`, then lists every node with the deployment it actually adopted (`stale` when behind the pointer, `unknown` for leases that predate serving reports). `cello discard SCRIPT=VERSION` deletes a staged version no pointer names. See [stage versions](staged-versions.md) for the invoke contract and [CLI reference](../reference/cli.md) for every flag.
