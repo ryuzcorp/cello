@@ -9726,7 +9726,7 @@ mod fanout_repro_tests {
         let runtime = asyncrt::shared_test_runtime();
         runtime.block_on(async {
             for (cells, writers, writes_each) in
-                [(1usize, 4usize, 8usize), (8usize, 8usize, 8usize)]
+                [(1usize, 8usize, 8usize), (8usize, 8usize, 8usize)]
             {
                 let _temp = test_watch();
                 let watch = _temp.path().to_path_buf();
@@ -9912,6 +9912,11 @@ mod fanout_repro_tests {
             let _temp = test_watch();
             let watch = _temp.path().to_path_buf();
             let store = Arc::new(ProbeStore::new(Duration::ZERO));
+            // Refuse uploads while the waiters park: with zero-latency
+            // success a background worker could credit the ticket before the
+            // first poll, so "still pending" would depend on scheduling.
+            // Under refusal no success path exists, so it cannot flake.
+            store.set_fail_puts(true);
             let repl = LtxRepl::start_with_store_for_test(&watch, store.clone());
             activate_epoch(&repl, "c", 1).await;
             for _ in 0..2 {
@@ -9923,6 +9928,7 @@ mod fanout_repro_tests {
             let mut waiter_b = Box::pin(repl.await_durable("c", 1, 0));
             assert!(waiter_b.as_mut().now_or_never().is_none());
             drop(waiter_a);
+            store.set_fail_puts(false);
             assert!(matches!(
                 repl.sync_wait("c", 1, Duration::from_secs(10)).await,
                 SyncWait::Durable
