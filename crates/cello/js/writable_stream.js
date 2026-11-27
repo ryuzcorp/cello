@@ -567,7 +567,9 @@ function __finishErroring(st) {
   const err = st.storedError;
   // Reject queued writes in order, then settle abort,
   // then reject close/closed -- the spec's promise
-  // resolution order. A plain TransformStream's readable cancel fails the
+  // resolution order, except on a plain TransformStream where workerd
+  // rejects close/closed before the abort promise settles (#290). A
+  // plain TransformStream's readable cancel fails the
   // writes it lands on with its own TypeError instead (#272).
   const writeErr = st.writeError ?? err;
   st.writeError = null;
@@ -587,6 +589,15 @@ function __finishErroring(st) {
     __rejectCloseAndClosed(st);
     return;
   }
+  // A plain TransformStream's writable runs the pair's sink abort, and
+  // workerd rejects writer.closed before that abort settles. Every other
+  // shape keeps the abort-first order: an idle plain WritableStream and a
+  // gated-sink in-flight abort already agree, and internal streams end in
+  // the closed shape with their own deferral below. The writable side of
+  // a plain TransformStream is the only one with the backpressure
+  // handshake and no closed-shape flag.
+  const plainTransformFirst =
+    !st.closesOnError && st.unblockWrite !== undefined;
   let result;
   try {
     result = st.abortFn
@@ -595,6 +606,11 @@ function __finishErroring(st) {
   } catch (e) { result = Promise.reject(e); }
   Promise.resolve(result).then(
     () => {
+      if (plainTransformFirst) {
+        __rejectCloseAndClosed(st);
+        abortReq.resolve();
+        return;
+      }
       abortReq.resolve();
       // Workerd's internal streams end an aborted writable in the closed
       // shape (desiredSize 0, later write()/close() report "has been
@@ -620,6 +636,11 @@ function __finishErroring(st) {
       }
     },
     (e) => {
+      if (plainTransformFirst) {
+        __rejectCloseAndClosed(st);
+        abortReq.reject(e);
+        return;
+      }
       abortReq.reject(e);
       // Same ordering as the fulfilling arm: chained writes settle before
       // closed does (#283).
