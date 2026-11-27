@@ -226,6 +226,11 @@ const COMPACTION_MAX_FILES: usize = 256;
 /// scratch files and bounded range reads instead of stalling the level.
 const COMPACTION_MAX_INPUT_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Single-key DELETEs in flight for one live-epoch L0 trim. The eviction
+/// trim paces itself the same way; the dev store answers each delete from
+/// its own connection, so the fold's run lock is held only for local I/O.
+const LIVE_L0_TRIM_DELETE_CONCURRENCY: usize = 8;
+
 /// One captured-but-not-yet-uploaded L0 segment, the log tier's
 /// replication unit (`crate::node_log`).
 pub struct ShipEntry {
@@ -779,6 +784,10 @@ struct CellCompaction {
     /// rather than only delaying the worker's own requeue task.
     retry_after_ms: AtomicU64,
     failures: AtomicU64,
+    /// Delete the live epoch's compacted L0 store objects after a successful
+    /// fold (dev only, #301). Copied from the replicator at activation, so
+    /// one residency keeps one policy for its whole lifetime.
+    live_l0_trim: bool,
     queued: AtomicBool,
     /// Set for good when the replica closes or a handoff completes. Nothing
     /// clears it.
@@ -967,7 +976,8 @@ struct Cell {
     /// per-cell prefix and got a success response. That response is the
     /// same evidence the eviction visibility LISTs look for: on the
     /// qualified stores the successor's LIST finds what our PUT acked, and
-    /// nothing deletes under a live epoch prefix, so the mark cannot go
+    /// nothing deletes a live epoch's newest coverage (the dev live-trim
+    /// removes only L0s a durable L1 supersedes), so the mark cannot go
     /// stale. Set only by this handle's own uploads — never by the restore
     /// seed, bundle credits, or recovered tails — so every other case keeps
     /// the LIST.
@@ -1210,10 +1220,10 @@ fn dirty_cells(cells: &Mutex<BTreeMap<(String, u64), CellHandle>>) -> usize {
 const EPOCH_UPLOAD_JOURNAL_MAX: usize = 8192;
 
 /// Remember one per-cell object key this residency uploaded, so the eviction
-/// trim can delete it from the journal alone, with no LIST. Call only after
-/// the PUT's success response: a journaled key names an object the successor
-/// restore provably finds, and the trim filter keeps only keys the handoff
-/// snapshot supersedes.
+/// trim — and the dev live-epoch trim (#301) — can delete it from the journal
+/// alone, with no LIST. Call only after the PUT's success response: a
+/// journaled key names an object the successor restore provably finds, and
+/// each trim filter keeps only keys its own superseding artifact covers.
 fn note_epoch_upload(handle: &Cell, level: i32, min_txid: u64, max_txid: u64) {
     let mut journal = handle
         .epoch_uploads
@@ -1519,6 +1529,10 @@ pub struct LtxRepl {
     compaction_queue: Option<mpsc::UnboundedSender<CompactionWork>>,
     compaction_min_txids: u64,
     compaction_min_bytes: u64,
+    /// Whether a successful fold may delete the live epoch's compacted L0
+    /// objects from the store (dev only, #301). Fixed at construction from
+    /// the storage backend; tests override it per replicator.
+    live_l0_trim: bool,
     /// Restore a taken-over cell by paging its pages in on demand (a fault-in
     /// SQLite VFS) instead of downloading the whole chain, and continue its
     /// chain from the cut. On unless `CELLO_LTX_PAGED=0`.
@@ -1705,6 +1719,7 @@ impl LtxRepl {
             vfs_name,
             DEFAULT_DURABILITY_TIMEOUT_SECS * 1_000,
             config,
+            false,
         )
     }
 
@@ -1735,6 +1750,7 @@ impl LtxRepl {
             None,
             DEFAULT_DURABILITY_TIMEOUT_SECS * 1_000,
             LtxConfig::from_env(),
+            false,
         )
     }
 
@@ -1799,6 +1815,7 @@ impl LtxRepl {
             None,
             durability_timeout_ms,
             LtxConfig::from_env(),
+            live_l0_trim_for_backend(&backend),
         );
         // Local retention at startup (upstream #311): drop live-named epoch
         // dirs a newer local epoch supersedes. Clean-reload boots already
@@ -1825,6 +1842,7 @@ impl LtxRepl {
         vfs_name: Option<String>,
         durability_timeout_ms: u64,
         config: LtxConfig,
+        live_l0_trim: bool,
     ) -> Self {
         let cells: Arc<Mutex<BTreeMap<(String, u64), CellHandle>>> = Arc::default();
         let dirty = Arc::new(Notify::new());
@@ -1902,6 +1920,7 @@ impl LtxRepl {
             compaction_queue,
             compaction_min_txids: compaction.map_or(0, |config| config.min_txids),
             compaction_min_bytes: compaction.map_or(u64::MAX, |config| config.min_bytes),
+            live_l0_trim,
             paged_restore: AtomicBool::new(config.paged_restore),
             paged_fleet: AtomicBool::new(false),
             bucket_bundles_fleet: AtomicBool::new(false),
@@ -3121,6 +3140,7 @@ impl LtxRepl {
                     base_txid: continuation.map_or(1, |(txid, _)| txid.0),
                     min_txids: self.compaction_min_txids,
                     min_bytes: self.compaction_min_bytes,
+                    live_l0_trim: self.live_l0_trim,
                     pending_bytes: AtomicU64::new(0),
                     compacted_txid: AtomicU64::new(0),
                     retry_after_ms: AtomicU64::new(0),
@@ -3679,6 +3699,15 @@ impl LtxRepl {
         self.snapshot_budget_bytes.store(bytes, Ordering::Relaxed);
     }
 
+    /// Enable the dev live-epoch L0 trim on a test replicator, which builds
+    /// with it off: production enables it only for the Local backend in
+    /// `start`, and no other test drives folds. Must run before activation:
+    /// the handle copies the policy when the cell activates.
+    #[cfg(any(test, cello_internal_tests))]
+    pub(crate) fn set_live_l0_trim_for_test(&mut self, enabled: bool) {
+        self.live_l0_trim = enabled;
+    }
+
     /// Close this cell after a final durability pass and install its database
     /// as the previous-epoch cache entry which the next activation consumes.
     ///
@@ -3930,7 +3959,7 @@ impl LtxRepl {
             // The snapshot PUT this residency just completed is itself the
             // visibility proof the LIST used to supply: on the qualified
             // stores the successor's LIST finds what our PUT acked, and
-            // nothing deletes under a live epoch prefix. The extra LIST
+            // nothing deletes a live epoch's newest coverage. The extra LIST
             // therefore goes; the L0 fallback below keeps its own.
             if matches!(published, Ok(Ok(()))) {
                 handle.uploaded_epoch_objects.store(true, Ordering::SeqCst);
@@ -4274,6 +4303,106 @@ impl LtxRepl {
                 ..Default::default()
             })
             .collect()
+    }
+
+    /// The live epoch's L0 journal entries a successful fold supersedes:
+    /// level-0 uploads at or below the fold's max, deduplicated by key. L1s
+    /// and newer L0s stay: the restore planner anchors on the newest
+    /// coverage and only extends past it, so a deleted object is in no
+    /// restore plan — whenever its DELETE lands. The epoch marker is never
+    /// journaled, so it can never be a candidate. Another epoch's objects
+    /// are never journaled either.
+    fn live_l0_trim_candidates(journal: &[(i32, u64, u64)], compacted_max: u64) -> Vec<(u64, u64)> {
+        let mut seen = std::collections::BTreeSet::new();
+        journal
+            .iter()
+            .filter(|(level, _, max_txid)| *level == 0 && *max_txid <= compacted_max)
+            .map(|(_, min_txid, max_txid)| (*min_txid, *max_txid))
+            .filter(|key| seen.insert(*key))
+            .collect()
+    }
+
+    /// Drop exactly the deleted candidates from the upload journal, so the
+    /// handoff bound counts the live chain instead of ghosts. Runs only when
+    /// every DELETE landed: a partial trim keeps its leftovers journaled for
+    /// an in-residency retry by the next fold or the eviction trim.
+    fn live_l0_trim_drain(journal: &mut Vec<(i32, u64, u64)>, deleted: &[(u64, u64)]) {
+        if deleted.is_empty() {
+            return;
+        }
+        let gone: std::collections::BTreeSet<(u64, u64)> = deleted.iter().copied().collect();
+        journal.retain(|(level, min_txid, max_txid)| {
+            *level != 0 || !gone.contains(&(*min_txid, *max_txid))
+        });
+    }
+
+    /// Delete this handle's live-epoch L0 store objects a successful fold
+    /// just proved durable in L1 (dev only, #301). The fold's PUT acked
+    /// inside the round, so the covering L1 is the newest coverage the
+    /// planner anchors on; the covered L0s are redundant. Best-effort: a
+    /// leftover L0 restores fine. Whatever stays journaled, the next fold
+    /// or the eviction trim retries in this residency; after a process crash
+    /// the journal is rebuilt empty, so orphaned L0s persist as
+    /// restore-correct store garbage until epoch/stream GC. Runs under the
+    /// fold's run lock, so no other fold interleaves, and the journal
+    /// snapshot is taken under its lock so a concurrent upload journals
+    /// either before (a candidate, and covered) or after (kept) the snapshot.
+    async fn trim_compacted_live_l0(handle: &CellHandle, compacted_max: u64) {
+        // The fold runs only with compaction installed, and a handle never
+        // loses it; read the log context before the delete anyway.
+        let Some(compaction) = &handle.compaction else {
+            return;
+        };
+        let cell = compaction.cell.clone();
+        let epoch = compaction.epoch;
+        let candidates = {
+            let journal = handle
+                .epoch_uploads
+                .lock()
+                .expect("epoch upload journal poisoned");
+            Self::live_l0_trim_candidates(&journal, compacted_max)
+        };
+        if candidates.is_empty() {
+            return;
+        }
+        let files: Vec<cello_ltx::FileInfo> = candidates
+            .iter()
+            .map(|(min_txid, max_txid)| cello_ltx::FileInfo {
+                level: 0,
+                min_txid: TXID(*min_txid),
+                max_txid: TXID(*max_txid),
+                ..Default::default()
+            })
+            .collect();
+        let failed = handle
+            .client
+            .delete_ltx_keys(&files, LIVE_L0_TRIM_DELETE_CONCURRENCY)
+            .await;
+        if failed == 0 {
+            Self::live_l0_trim_drain(
+                &mut handle
+                    .epoch_uploads
+                    .lock()
+                    .expect("epoch upload journal poisoned"),
+                &candidates,
+            );
+            info!(
+                event = "ltx_l0_live_trim",
+                cell = %cell,
+                epoch = epoch,
+                deleted = candidates.len(),
+                max_txid = compacted_max,
+                "deleted compacted live-epoch L0 objects"
+            );
+        } else {
+            warn!(
+                cell = %cell,
+                epoch = epoch,
+                failed,
+                max_txid = compacted_max,
+                "live-epoch L0 trim left garbage for the next fold or eviction"
+            );
+        }
     }
 
     /// Hand the trim keys to a background task and return at once, so an
@@ -5466,6 +5595,16 @@ async fn compact_cell(
                 }
             })
             .await;
+            // Live-epoch L0 retention (dev, #301): the fold just proved every
+            // covered TXID durable in L1, so this epoch's L0 store objects at
+            // or below the fold's max are redundant. Journal-enumerated, like
+            // the local retention above and the eviction trim: only keys this
+            // residency uploaded into this epoch are candidates. Best-effort,
+            // like the local retention: leftovers restore fine and the next
+            // fold or the eviction trim retries them.
+            if compaction.live_l0_trim {
+                LtxRepl::trim_compacted_live_l0(&handle, info.max_txid.0).await;
+            }
             info!(
                 event = "ltx_compaction",
                 trigger,
@@ -5602,6 +5741,17 @@ async fn compact_cell(
         });
     }
     outcome
+}
+
+/// Whether a successful fold may delete the live epoch's compacted L0 store
+/// objects (#301). Dev only: the SQLite store's PUTs are immediately
+/// listable, so an L1 the fold just PUT-acked is provably visible to any
+/// later restore. Bucket stores keep their compacted L0s until the handoff
+/// snapshot supersedes them, as today — their PUT-to-LIST visibility is a
+/// per-store property this trim must not assume. A new backend takes the
+/// closed default until it opts in.
+fn live_l0_trim_for_backend(backend: &crate::bucket::StorageBackend) -> bool {
+    matches!(backend, crate::bucket::StorageBackend::Local)
 }
 
 fn compaction_config_from_env() -> anyhow::Result<Option<CompactionConfig>> {
@@ -8691,6 +8841,415 @@ mod evict_trim_tests {
         });
     }
 }
+
+/// Live-epoch L0 retention for the dev store (#301). Plain `#[cfg(test)]`:
+/// deterministic, no sleeps or polling — folds run by direct `compact_cell`
+/// calls, and the replicator is built with unreachable compaction thresholds
+/// so no background fold can interleave. Each behaviour has a fail-before
+/// shown by reverting the `compact_cell` hook.
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)] // Test tempdirs live outside the injected filesystem.
+mod live_l0_trim_tests {
+    use super::*;
+    use cello_ltx::object_store::path::Path as ObjPath;
+    use cello_ltx::object_store::GetOptions;
+    use cello_ltx::object_store::GetResult;
+    use cello_ltx::object_store::ListResult;
+    use cello_ltx::object_store::MultipartUpload;
+    use cello_ltx::object_store::ObjectMeta;
+    use cello_ltx::object_store::PutMultipartOptions;
+    use cello_ltx::object_store::PutOptions;
+    use cello_ltx::object_store::PutPayload;
+    use cello_ltx::object_store::PutResult;
+    use cello_ltx::object_store::Result as StoreResult;
+    type ListStream = std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = StoreResult<ObjectMeta>> + Send + 'static>,
+    >;
+
+    fn test_watch() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    fn db_path(watch: &Path, cell: &str, epoch: u64) -> PathBuf {
+        watch
+            .join(cell)
+            .join("ltx")
+            .join(format!("e{epoch}"))
+            .join("db.sqlite")
+    }
+
+    /// Commit one row through a second connection, the way the isolate's own
+    /// connection writes beside the replicator's. The writer holds no open
+    /// transaction past the call, so the managed capture never blocks.
+    fn sql_write(db: &Path) {
+        let connection = rusqlite::Connection::open(db).unwrap();
+        connection.busy_timeout(Duration::from_secs(5)).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS t(x TEXT); INSERT INTO t(x) VALUES('hello');",
+            )
+            .unwrap();
+    }
+
+    fn row_count(db: &Path) -> i64 {
+        let connection = rusqlite::Connection::open(db).unwrap();
+        connection
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    async fn shutdown(repl: LtxRepl) {
+        let owner = repl.take_task_owner();
+        drop(repl);
+        owner.join().await;
+    }
+
+    async fn activate_epoch(repl: &LtxRepl, cell: &str, epoch: u64, fresh: bool) {
+        repl.activate(ActivationOptions {
+            cell,
+            epoch,
+            fresh,
+            took_over: false,
+            resume_local: false,
+            prior: None,
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn ltx_level_files(
+        repl: &LtxRepl,
+        cell: &str,
+        epoch: u64,
+        level: i32,
+    ) -> Vec<cello_ltx::FileInfo> {
+        repl.client_for(cell, epoch)
+            .ltx_files(level, TXID(0))
+            .await
+            .unwrap()
+    }
+
+    fn cell_handle(repl: &LtxRepl, cell: &str, epoch: u64) -> CellHandle {
+        repl.cells
+            .lock()
+            .unwrap()
+            .get(&(cell.to_string(), epoch))
+            .cloned()
+            .unwrap()
+    }
+
+    /// Run folds until one reports no work. Each fold strictly advances the
+    /// destination past the previous max, so the loop ends once the tail is
+    /// covered; a failed fold also ends it, loudly, at the assertions below.
+    async fn fold_idle(repl: &LtxRepl, cell: &str, epoch: u64) {
+        loop {
+            let handle = cell_handle(repl, cell, epoch);
+            if compact_cell(handle, asyncrt::mono_ms(), "live_l0_trim_test", false, None).await
+                != CompactionOutcome::Advanced
+            {
+                return;
+            }
+        }
+    }
+
+    /// A dev `LocalStore` that fails DELETEs on demand, so the trim tests can
+    /// prove a failed trim never fails the fold and leaves its leftovers
+    /// journaled for retry. Every other operation delegates untouched.
+    #[derive(Debug)]
+    struct FailDeletesStore {
+        inner: crate::local_store::LocalStore,
+        fail_deletes: AtomicBool,
+    }
+
+    impl std::fmt::Display for FailDeletesStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FailDeletesStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for FailDeletesStore {
+        async fn put_opts(
+            &self,
+            location: &ObjPath,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> StoreResult<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjPath,
+            opts: PutMultipartOptions,
+        ) -> StoreResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjPath,
+            options: GetOptions,
+        ) -> StoreResult<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn head(&self, location: &ObjPath) -> StoreResult<ObjectMeta> {
+            self.inner.head(location).await
+        }
+
+        async fn delete(&self, location: &ObjPath) -> StoreResult<()> {
+            if self.fail_deletes.load(Ordering::SeqCst) {
+                return Err(cello_ltx::object_store::Error::Generic {
+                    store: "FailDeletesStore",
+                    source: "injected delete failure".into(),
+                });
+            }
+            self.inner.delete(location).await
+        }
+
+        fn list(&self, prefix: Option<&ObjPath>) -> ListStream {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&ObjPath>) -> StoreResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &ObjPath, to: &ObjPath) -> StoreResult<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(&self, from: &ObjPath, to: &ObjPath) -> StoreResult<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    /// A replicator over a real dev store with folds driven by the test and
+    /// unreachable background thresholds, so only `fold_idle` folds.
+    fn dev_repl(watch: &Path, store: Arc<dyn ObjectStore>) -> LtxRepl {
+        let mut repl = LtxRepl::start_with_store(
+            watch,
+            store,
+            Some(CompactionConfig {
+                min_txids: u64::MAX,
+                min_bytes: u64::MAX,
+                concurrency: 1,
+            }),
+            0,
+        );
+        repl.set_live_l0_trim_for_test(true);
+        repl
+    }
+
+    /// #301: folds delete the live epoch's compacted L0 objects from the dev
+    /// store, so per-write object growth stops after compaction. 600 writes
+    /// fold into three L1s with no live L0s left; the journal then holds
+    /// exactly the three L1 entries, the eviction skips its snapshot on that
+    /// short chain, and the next epoch restores every row from the trimmed
+    /// chain and keeps accepting writes past it. Fail-before: without the
+    /// `compact_cell` hook the checkpoints find 200/400/600 L0s, the journal
+    /// holds 603 entries, and the eviction publishes a snapshot instead.
+    #[test]
+    fn live_l0_trim_bounds_dev_store_growth_and_restores() {
+        let runtime = asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let _temp = test_watch();
+            let watch = _temp.path().to_path_buf();
+            let repl = dev_repl(
+                &watch,
+                Arc::new(crate::local_store::LocalStore::open(watch.join("fleet.sqlite")).unwrap()),
+            );
+            activate_epoch(&repl, "c", 1, true).await;
+            const WRITES: i64 = 600;
+            const FOLD_EVERY: i64 = 200;
+            for i in 1..=WRITES {
+                sql_write(&db_path(&watch, "c", 1));
+                assert!(
+                    matches!(
+                        repl.sync_wait("c", 1, Duration::from_secs(10)).await,
+                        SyncWait::Durable
+                    ),
+                    "write {i} of {WRITES} lands durably"
+                );
+                if i % FOLD_EVERY == 0 {
+                    fold_idle(&repl, "c", 1).await;
+                    let folds = i / FOLD_EVERY;
+                    let l0 = ltx_level_files(&repl, "c", 1, 0).await.len();
+                    assert!(l0 <= 1, "fold {folds} leaves no live L0s, found {l0}");
+                    assert_eq!(
+                        ltx_level_files(&repl, "c", 1, 1).await.len(),
+                        folds as usize,
+                        "one L1 per fold"
+                    );
+                }
+            }
+            // Exactly the three L1 entries: every covered L0 drained from the
+            // journal as its DELETE landed.
+            assert_eq!(
+                cell_handle(&repl, "c", 1)
+                    .epoch_uploads
+                    .lock()
+                    .unwrap()
+                    .len(),
+                3,
+                "covered L0s drain from the journal as they are deleted"
+            );
+            repl.handoff_gate("c", 1, true).await.unwrap();
+            assert_eq!(
+                repl.evict("c", 1, false, None).await.unwrap(),
+                EvictionRestoreArtifact::L0Chain,
+                "the short journaled L1 chain skips the snapshot"
+            );
+            assert!(
+                ltx_level_files(&repl, "c", 1, 9).await.is_empty(),
+                "no snapshot is published"
+            );
+            activate_epoch(&repl, "c", 2, false).await;
+            assert_eq!(row_count(&db_path(&watch, "c", 2)), WRITES);
+            // The trimmed chain keeps accepting writes past the folds.
+            for _ in 0..3 {
+                sql_write(&db_path(&watch, "c", 2));
+                assert!(matches!(
+                    repl.sync_wait("c", 2, Duration::from_secs(10)).await,
+                    SyncWait::Durable
+                ));
+            }
+            assert_eq!(row_count(&db_path(&watch, "c", 2)), WRITES + 3);
+            shutdown(repl).await;
+        });
+    }
+
+    /// #301 crash order: a trim whose DELETEs all fail still reports the fold
+    /// Advanced — the L1 is durable — and leaves every L0 journaled. New
+    /// writes and one more fold then delete the leftovers with the new tail,
+    /// so a crash between the fold commit and its trim recovers by retry;
+    /// the epoch still hands off through its L0 chain with every row intact.
+    /// Fail-before: draining despite failed DELETEs would leave the retry fold
+    /// with nothing journaled and all 12 L0s stay; removing the hook fails the
+    /// retry the same way.
+    #[test]
+    fn live_l0_trim_failure_stays_journaled_for_retry() {
+        let runtime = asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let _temp = test_watch();
+            let watch = _temp.path().to_path_buf();
+            let store = Arc::new(FailDeletesStore {
+                inner: crate::local_store::LocalStore::open(watch.join("fleet.sqlite")).unwrap(),
+                fail_deletes: AtomicBool::new(false),
+            });
+            let repl = dev_repl(&watch, store.clone());
+            activate_epoch(&repl, "c", 1, true).await;
+            for _ in 0..10 {
+                sql_write(&db_path(&watch, "c", 1));
+                assert!(matches!(
+                    repl.sync_wait("c", 1, Duration::from_secs(10)).await,
+                    SyncWait::Durable
+                ));
+            }
+            store.fail_deletes.store(true, Ordering::SeqCst);
+            fold_idle(&repl, "c", 1).await;
+            assert_eq!(
+                ltx_level_files(&repl, "c", 1, 1).await.len(),
+                1,
+                "the fold still lands its L1"
+            );
+            assert_eq!(
+                ltx_level_files(&repl, "c", 1, 0).await.len(),
+                10,
+                "failed DELETEs leave the L0s"
+            );
+            assert_eq!(
+                cell_handle(&repl, "c", 1)
+                    .epoch_uploads
+                    .lock()
+                    .unwrap()
+                    .len(),
+                11,
+                "a failed trim drains nothing"
+            );
+            // New writes past the failed trim: the next fold deletes the old
+            // leftovers with the new tail.
+            store.fail_deletes.store(false, Ordering::SeqCst);
+            for _ in 0..2 {
+                sql_write(&db_path(&watch, "c", 1));
+                assert!(matches!(
+                    repl.sync_wait("c", 1, Duration::from_secs(10)).await,
+                    SyncWait::Durable
+                ));
+            }
+            fold_idle(&repl, "c", 1).await;
+            assert!(
+                ltx_level_files(&repl, "c", 1, 0).await.is_empty(),
+                "the retry deletes every covered L0"
+            );
+            assert_eq!(
+                ltx_level_files(&repl, "c", 1, 1).await.len(),
+                2,
+                "one L1 per fold"
+            );
+            repl.handoff_gate("c", 1, true).await.unwrap();
+            assert_eq!(
+                repl.evict("c", 1, false, None).await.unwrap(),
+                EvictionRestoreArtifact::L0Chain,
+                "the retried chain still skips the snapshot"
+            );
+            activate_epoch(&repl, "c", 2, false).await;
+            assert_eq!(row_count(&db_path(&watch, "c", 2)), 12);
+            shutdown(repl).await;
+        });
+    }
+
+    /// The candidate filter keeps only level-0 uploads the fold covers,
+    /// deduplicated: L1s, newer L0s, and unrelated ranges never trim.
+    #[test]
+    fn live_l0_trim_candidates_cover_only_superseded_l0() {
+        let journal = vec![(0, 1, 1), (1, 1, 5), (0, 2, 5), (0, 6, 9), (0, 2, 5)];
+        assert_eq!(
+            LtxRepl::live_l0_trim_candidates(&journal, 5),
+            vec![(1, 1), (2, 5)],
+        );
+        assert!(
+            LtxRepl::live_l0_trim_candidates(&journal, 0).is_empty(),
+            "nothing is covered before the first fold"
+        );
+    }
+
+    /// The drain drops exactly the deleted keys: newer L0s and the covering
+    /// L1 stay journaled, and an empty delete drains nothing.
+    #[test]
+    fn live_l0_trim_drain_keeps_undeleted_entries() {
+        let mut journal = vec![(0, 1, 1), (1, 1, 5), (0, 2, 5), (0, 6, 9)];
+        LtxRepl::live_l0_trim_drain(&mut journal, &[(1, 1), (2, 5)]);
+        assert_eq!(journal, vec![(1, 1, 5), (0, 6, 9)]);
+        LtxRepl::live_l0_trim_drain(&mut journal, &[]);
+        assert_eq!(
+            journal,
+            vec![(1, 1, 5), (0, 6, 9)],
+            "an empty delete drains nothing"
+        );
+    }
+
+    /// Production enables the trim only for the dev backend; every other
+    /// backend keeps its compacted L0s until the handoff snapshot supersedes
+    /// them, and a new backend takes the closed default.
+    #[test]
+    fn live_l0_trim_only_on_the_dev_backend() {
+        assert!(live_l0_trim_for_backend(
+            &crate::bucket::StorageBackend::Local
+        ));
+        assert!(!live_l0_trim_for_backend(
+            &crate::bucket::StorageBackend::S3
+        ));
+        assert!(!live_l0_trim_for_backend(
+            &crate::bucket::StorageBackend::Gcs
+        ));
+        assert!(!live_l0_trim_for_backend(
+            &crate::bucket::StorageBackend::Azure
+        ));
+    }
+}
+
 /// Bucket-posture group-commit unit tests (layer 2, executor policy). Plain
 /// `#[cfg(test)]`: CI runs without `cello_internal_tests`. Deterministic, no
 /// sleeps or polling; each behaviour has a fail-before shown by reverting.
