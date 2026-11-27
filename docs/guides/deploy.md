@@ -3,7 +3,7 @@ title: Deploy an application
 description: Deploy a Wrangler project to the fleet bucket, adopt releases, and invoke staged versions safely.
 ---
 
-You deploy from a Wrangler project directory. Install `esbuild` on `PATH` first if the project contains Worker code; asset-only projects do not need it.
+You deploy from a Wrangler project directory. Install `esbuild` on `PATH` first if the project contains Worker code (the official image already ships it at `/usr/local/bin/esbuild`); asset-only projects do not need it.
 
 ## Deploy the project
 

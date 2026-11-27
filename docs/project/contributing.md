@@ -31,6 +31,6 @@ If the `esbuild` on your `PATH` is a wrapper script (for example a mise shim), b
 CELLO_ESBUILD=/path/to/real/esbuild cargo test --profile ci --locked
 ```
 
-The Docker test stage needs no knob: it installs the real esbuild at `/usr/local/bin/esbuild`.
+The official image needs no knob: it ships the real esbuild at `/usr/local/bin/esbuild`.
 
 Every test spawn goes through the hermetic helper in [`crates/cello/tests/common/mod.rs`](https://github.com/ryuzcorp/cello/blob/main/crates/cello/tests/common/mod.rs). It clears the inherited environment and rebuilds it from `PATH`, `TMPDIR`, a fixture-scoped `HOME`, and `CELLO_ESBUILD` when set — nothing else. A stray `CELLD_*` in your shell makes `cello` refuse to start, which is how the harness proves the child sees nothing ambient. CI runs the suite in a hostile environment — `CELLD_HERMETIC_CANARY=1` set and `CELLO_DEV_STATE` pointed nowhere writable — so a test whose outcome depends on the harness environment, or a spawn that bypasses the cleared environment, fails in CI instead of on your machine.

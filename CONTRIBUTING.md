@@ -76,7 +76,7 @@ checks.
   mise shim), bundling tests fail with a permission error. Point the
   child at the real binary instead:
   `CELLO_ESBUILD=/path/to/real/esbuild cargo test --profile release`.
-  The Docker test stage needs no knob: it installs the real esbuild at
+  The official image needs no knob: it ships the real esbuild at
   `/usr/local/bin/esbuild`.
 - Long stream timelines are tested in **virtual time**, not wall time.
   `crates/cello/tests/virtual_clock_conformance.rs` runs the real driver

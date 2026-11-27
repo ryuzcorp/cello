@@ -29,7 +29,7 @@ Each check prints one `PASS`/`FAIL` line with its elapsed time and detail, then 
 
 ## Requirements and knobs
 
-The host needs Docker, `curl`, and Node.js 24 or newer. By default the gate runs `docker` directly; set `SMOKE_DOCKER_GROUP=docker` (or another group) to run each invocation through `sg GROUP -c`, for a shell that lacks the group. The client in `scripts/release-smoke/client.mjs` uses only Node built-ins; it needs no npm packages. The image itself needs nothing extra: the fixture sets `no_bundle`, so the image's missing esbuild is never invoked.
+The host needs Docker, `curl`, and Node.js 24 or newer. By default the gate runs `docker` directly; set `SMOKE_DOCKER_GROUP=docker` (or another group) to run each invocation through `sg GROUP -c`, for a shell that lacks the group. The client in `scripts/release-smoke/client.mjs` uses only Node built-ins; it needs no npm packages. The image ships the pinned esbuild at `/usr/local/bin/esbuild` (the gate probes `esbuild --version` before the first check); the fixture still sets `no_bundle`, so the remaining checks do not depend on bundling.
 
 | Variable | Effect |
 | --- | --- |
