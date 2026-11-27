@@ -2635,13 +2635,27 @@ async fn wake_with_cross_entry_gate(
     // Post-response work must end when its budget does, even if no operation
     // completes to wake the drive: without this arm an entry parked on a
     // hung adopted op re-checks expiry only on the next wake, which may be
-    // minutes after the budget ran out. The timeout yields a Poll turn; the
-    // check above then ends expired background on its own terms.
+    // minutes after the budget ran out. The deadline arm resolves to
+    // `BackgroundExpired` through the same predicate as the check above —
+    // never `Poll`, whose abort pass would retire the entry before the
+    // expiry path seals waitUntil and fails the work with the budget error.
+    // If the timer fires without expiry holding (clock granularity), the
+    // gate turn is a no-op: nothing changed, so there is nothing to finish.
     match deadline {
         Some(deadline) => asyncrt::select_biased! {
             "a budget deadline wakes the drive so expiry is enforced on time";
             wake = budget_wake => wake,
-            _ = tokio::time::sleep_until(deadline) => Wake::Poll,
+            _ = tokio::time::sleep_until(deadline) => {
+                if entry.remaining(budget).is_none()
+                    && entry.gated_reply_and_io_context().0.is_none()
+                    && (entry.has_background() || !entry.has_response_stream())
+                    && entry.background_expired(crate::engine_api::background_budget())
+                {
+                    Wake::BackgroundExpired
+                } else {
+                    Wake::CrossEntryGateChanged
+                }
+            }
         },
         None => budget_wake.await,
     }
