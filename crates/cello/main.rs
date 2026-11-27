@@ -886,6 +886,7 @@ async fn adopt_deployment(
     region: &str,
     pointer: DeployPointer,
     force: bool,
+    ownership: Option<&BucketOwnership>,
 ) -> ReloadOutcome {
     let Some(runtime) = app.runtime.as_ref() else {
         return ReloadOutcome::Failed {
@@ -927,6 +928,14 @@ async fn adopt_deployment(
     };
     let adopted = runtime.adopt(generation);
     drop(reservation);
+    // The lease names what this node adopted, not the pointer: a build that
+    // failed left the old generation serving and stamps nothing. The nudge
+    // renews the lease now so the adopted version becomes durable without
+    // waiting for the next TTL cadence.
+    if let Some(ownership) = ownership {
+        ownership.set_serving_identity(adopted.serving_identity().clone());
+        let _ = app.tx.send(Message::NudgeNodeLease);
+    }
     // Tell the core, so resident cells move to the new generation at their
     // safe points. The reserved cells move at once, ahead of the cron arm
     // below, which must reach a cron cell already running the new schedule.
@@ -959,6 +968,7 @@ fn start_pointer_watcher(
     node: String,
     region: String,
     mut requests: cello::generation::ReloadReceiver,
+    ownership: Option<Arc<BucketOwnership>>,
 ) {
     tokio::spawn(async move {
         let period = cello::generation::poll_interval();
@@ -994,8 +1004,16 @@ fn start_pointer_watcher(
                             outcome.clone()
                         }
                         _ => {
-                            adopt_deployment(&app, &bucket, &node, &region, pointer, request.force)
-                                .await
+                            adopt_deployment(
+                                &app,
+                                &bucket,
+                                &node,
+                                &region,
+                                pointer,
+                                request.force,
+                                ownership.as_deref(),
+                            )
+                            .await
                         }
                     };
                     (outcome, Some(identity))
@@ -4753,6 +4771,13 @@ async fn async_main(
             };
             (None, ownership, peer_key, None, None)
         };
+    // The lease names what this node serves, not the pointer: stamp the
+    // booted generation now so the first renewal already carries it.
+    // Later adoptions re-stamp through `adopt_deployment`. A node with no
+    // runtime (or no bucket lease) has nothing to stamp.
+    if let (Some(runtime), Some(Ownership::Bucket(ownership))) = (&runtime, &ownership) {
+        ownership.set_serving_identity(runtime.generation().serving_identity().clone());
+    }
     if let Some(config) = &telemetry_config {
         // Either signal can demand the bucket: traces via `CELLO_OTEL=1`,
         // logs via `CELLO_OTEL_LOGS=bucket` under any traces sink.
@@ -5382,6 +5407,7 @@ async fn async_main(
             node.clone(),
             settings.region.clone(),
             reload_rx,
+            ready_ownership.clone(),
         );
     }
     if let Some(client) = deploy_agent {

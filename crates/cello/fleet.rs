@@ -12,6 +12,7 @@
 
 use crate::bucket::{Bucket, StorageProbeVerdict};
 use crate::deploy;
+use crate::generation::ServingIdentity;
 use crate::js::{ModuleSource, WorkerConfigOptions};
 use crate::ownership_store::NodeLeaseWire;
 use crate::protocol::{DeployPointer, Manifest, ModuleKind, Rollout};
@@ -134,6 +135,65 @@ impl Record for Versioned {
         } else {
             format!("{} {}", self.script, self.version)
         })
+    }
+}
+
+/// What one fleet node is actually serving, from its lease — never the
+/// pointer. A node behind the pointer is stale; a node whose lease predates
+/// the `serving` field is unknown, not current.
+pub(crate) struct NodeServing {
+    pub node: String,
+    /// False once the lease expired: the node is gone, whatever it last served.
+    pub live: bool,
+    /// The identity the node adopted. `None` on records older releases
+    /// wrote, which read as unknown rather than as the pointer's version.
+    pub serving: Option<ServingIdentity>,
+    /// Whether the served identity differs from the fleet-wide pointer.
+    /// `None` when there is nothing to compare against: a legacy lease, an
+    /// expired lease, or a bucket with no pointer.
+    pub stale: Option<bool>,
+}
+
+impl NodeServing {
+    fn summary(&self) -> Option<String> {
+        let serving = self.serving.as_ref()?;
+        let script = serving.script_name.as_deref().unwrap_or("?");
+        let mut summary = format!("{script}@{}", serving.version);
+        if let Some(components) = serving.components.as_ref().filter(|map| !map.is_empty()) {
+            summary.push_str(&format!(" (+{} more)", components.len()));
+        }
+        Some(summary)
+    }
+}
+
+impl Record for NodeServing {
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "node": self.node,
+            "live": self.live,
+            "serving": self.serving,
+            "stale": self.stale,
+        })
+    }
+
+    fn text(&self) -> Cow<'_, str> {
+        if !self.live {
+            return Cow::Owned(match self.summary() {
+                Some(summary) => format!("{} expired (last served {summary})", self.node),
+                None => format!("{} expired", self.node),
+            });
+        }
+        match (self.summary(), self.stale) {
+            (None, _) => Cow::Owned(format!(
+                "{} unknown (lease predates serving reports)",
+                self.node
+            )),
+            (Some(summary), Some(false)) => {
+                Cow::Owned(format!("{} {summary} (current)", self.node))
+            }
+            (Some(summary), Some(true)) => Cow::Owned(format!("{} {summary} (stale)", self.node)),
+            (Some(summary), None) => Cow::Owned(format!("{} {summary} (no pointer)", self.node)),
+        }
     }
 }
 
@@ -713,6 +773,62 @@ pub(crate) async fn node_lease_ids(bucket: &Bucket) -> anyhow::Result<Vec<String
     Ok(nodes)
 }
 
+/// Per-node serving state for `cello versions`: every `nodes/<node>.json`
+/// lease with the deployment that node actually adopted, judged against the
+/// fleet-wide pointer. A node whose lease predates the `serving` field
+/// reports `serving: None` (unknown, never the pointer's version); an
+/// expired lease reports `live: false` with whatever it last served. One
+/// unreadable lease does not hide the fleet: it is skipped with a stderr
+/// note. Sorted by node.
+pub(crate) async fn list_node_serving(bucket: &Bucket) -> anyhow::Result<Vec<NodeServing>> {
+    let pointer = match bucket.get(CURRENT_POINTER_KEY).await? {
+        Some((body, _)) => Some(
+            serde_json::from_slice::<DeployPointer>(&body)
+                .with_context(|| format!("decode {CURRENT_POINTER_KEY}"))?,
+        ),
+        None => None,
+    };
+    let target = pointer.as_ref().map(ServingIdentity::of_pointer);
+    let mut nodes = Vec::new();
+    for node in node_lease_ids(bucket).await? {
+        let key = format!("nodes/{node}.json");
+        let Some((body, _)) = bucket
+            .get(&key)
+            .await
+            .with_context(|| format!("read {key}"))?
+        else {
+            continue;
+        };
+        let lease: NodeLeaseWire = match serde_json::from_slice(&body) {
+            Ok(lease) => lease,
+            Err(error) => {
+                note!("skipping unreadable node lease {key}: {error:#}");
+                continue;
+            }
+        };
+        if lease.node != node {
+            note!("skipping node lease {key}: names {:?}", lease.node);
+            continue;
+        }
+        let live = lease.expires_ms > crate::ownership_store::now_ms();
+        // An expired lease or a legacy one carries nothing to judge: only a
+        // live lease with a serving field answers "behind the pointer?".
+        // Unknown is not current, and it is not the pointer's version.
+        let stale = match (&lease.serving, &target) {
+            (Some(serving), Some(target)) if live => Some(serving != target),
+            _ => None,
+        };
+        nodes.push(NodeServing {
+            node,
+            live,
+            serving: lease.serving,
+            stale,
+        });
+    }
+    nodes.sort_by(|left, right| left.node.cmp(&right.node));
+    Ok(nodes)
+}
+
 pub(crate) fn resolve_storage_location(
     bucket: &mut Option<String>,
     endpoint: &mut Option<String>,
@@ -934,6 +1050,17 @@ pub async fn run_versions(arguments: Vec<String>) -> anyhow::Result<()> {
     }
     if entries.is_empty() {
         note!("No deployed versions.");
+    }
+    // What each node actually adopted, from its lease — never the pointer.
+    // A node behind the pointer shows stale; a node whose lease predates
+    // the serving field shows unknown. An orchestrator that only read the
+    // pointer could not tell a correct deploy from a stale fleet.
+    let nodes = list_node_serving(&store).await?;
+    if !nodes.is_empty() {
+        out.header("nodes:")?;
+        for node in &nodes {
+            out.row(node)?;
+        }
     }
     out.finish()
 }
@@ -1415,5 +1542,227 @@ mod serving_credential_tests {
             client.deploy_read().is_none(),
             "an unset trio keeps one credential for everything"
         );
+    }
+}
+
+#[cfg(test)]
+mod node_serving_tests {
+    use super::*;
+    use crate::ownership_store::NodeLoadWire;
+
+    const V1: &str = "aaaaaaaaaaaaaaaa";
+    const V2: &str = "bbbbbbbbbbbbbbbb";
+
+    fn identity(version: &str) -> ServingIdentity {
+        ServingIdentity {
+            script_name: Some("app".to_string()),
+            version: version.to_string(),
+            prefix: format!("deploy/app/{version}"),
+            components: None,
+        }
+    }
+
+    fn pointer(version: &str) -> DeployPointer {
+        DeployPointer {
+            script_name: Some("app".to_string()),
+            version: version.to_string(),
+            prefix: format!("deploy/app/{version}"),
+            rollout: Rollout { percent: 100 },
+            components: None,
+        }
+    }
+
+    fn lease(node: &str, expires_ms: u64, serving: Option<ServingIdentity>) -> NodeLeaseWire {
+        NodeLeaseWire {
+            node: node.to_string(),
+            expires_ms,
+            addr: "127.0.0.1:9".to_string(),
+            probe_public_key: "probe".to_string(),
+            peer_protocol: 1,
+            paced_handoff: true,
+            generation: "gen1".to_string(),
+            serving,
+            log: None,
+            load: NodeLoadWire::default(),
+        }
+    }
+
+    async fn seed(bucket: &Bucket) {
+        bucket
+            .put(
+                CURRENT_POINTER_KEY,
+                serde_json::to_vec(&pointer(V2)).expect("pointer encodes"),
+            )
+            .await
+            .expect("pointer publishes");
+        let live = crate::ownership_store::now_ms() + 3_600_000;
+        // A current node, a stale node, a legacy node without the field,
+        // and an expired node: the fleet a rolling update leaves behind.
+        for (node, expires, serving) in [
+            ("node-a", live, Some(identity(V2))),
+            ("node-b", live, Some(identity(V1))),
+            ("node-c", live, None),
+            ("node-d", 1, Some(identity(V1))),
+        ] {
+            bucket
+                .put(
+                    &format!("nodes/{node}.json"),
+                    serde_json::to_vec(&lease(node, expires, serving)).expect("lease encodes"),
+                )
+                .await
+                .expect("lease publishes");
+        }
+    }
+
+    /// Fail-before: without per-node serving state an orchestrator reads the
+    /// pointer (v2) and concludes the fleet serves v2, while node-b still
+    /// serves v1 and node-c reports nothing at all.
+    #[tokio::test]
+    async fn mixed_leases_report_per_node_serving_against_the_pointer() {
+        let bucket = Bucket::for_test();
+        seed(&bucket).await;
+        let nodes = list_node_serving(&bucket).await.expect("leases list");
+        assert_eq!(nodes.len(), 4);
+        let state = |node: &str| {
+            nodes
+                .iter()
+                .find(|entry| entry.node == node)
+                .unwrap_or_else(|| panic!("{node} listed"))
+        };
+        let current = state("node-a");
+        assert!(current.live);
+        assert_eq!(current.serving, Some(identity(V2)));
+        assert_eq!(current.stale, Some(false));
+        let stale = state("node-b");
+        assert!(stale.live);
+        // The node's lease names v1: the pointer's v2 is never misreported
+        // as node state.
+        assert_eq!(
+            stale
+                .serving
+                .as_ref()
+                .map(|serving| serving.version.as_str()),
+            Some(V1)
+        );
+        assert_eq!(stale.stale, Some(true));
+        let legacy = state("node-c");
+        assert!(legacy.live);
+        assert_eq!(legacy.serving, None);
+        assert_eq!(legacy.stale, None);
+        let expired = state("node-d");
+        assert!(!expired.live);
+        assert_eq!(expired.serving, Some(identity(V1)));
+        assert_eq!(expired.stale, None);
+    }
+
+    #[test]
+    fn node_rows_render_lease_state_never_pointer_state() {
+        let stale = NodeServing {
+            node: "node-b".to_string(),
+            live: true,
+            serving: Some(identity(V1)),
+            stale: Some(true),
+        };
+        assert_eq!(stale.text(), format!("node-b app@{V1} (stale)"));
+        assert_eq!(
+            stale.json(),
+            serde_json::json!({
+                "node": "node-b",
+                "live": true,
+                "serving": {
+                    "script_name": "app",
+                    "version": V1,
+                    "prefix": format!("deploy/app/{V1}"),
+                },
+                "stale": true,
+            })
+        );
+        let legacy = NodeServing {
+            node: "node-c".to_string(),
+            live: true,
+            serving: None,
+            stale: None,
+        };
+        assert_eq!(
+            legacy.text(),
+            "node-c unknown (lease predates serving reports)"
+        );
+        assert_eq!(legacy.json()["serving"], serde_json::Value::Null);
+        let expired = NodeServing {
+            node: "node-d".to_string(),
+            live: false,
+            serving: Some(identity(V1)),
+            stale: None,
+        };
+        assert_eq!(
+            expired.text(),
+            format!("node-d expired (last served app@{V1})")
+        );
+    }
+
+    /// A generation change is adoption-relevant even when the primary
+    /// version is unchanged: a node missing a component update is stale.
+    #[tokio::test]
+    async fn component_only_drift_is_stale() {
+        use std::collections::BTreeMap;
+        let bucket = Bucket::for_test();
+        let mut components = BTreeMap::new();
+        components.insert(
+            "api".to_string(),
+            crate::protocol::ComponentRef {
+                version: "cccccccccccccccc".to_string(),
+                prefix: "deploy/api/cccccccccccccccc".to_string(),
+            },
+        );
+        let mut generation = pointer(V2);
+        generation.components = Some(components);
+        bucket
+            .put(
+                CURRENT_POINTER_KEY,
+                serde_json::to_vec(&generation).expect("pointer encodes"),
+            )
+            .await
+            .expect("pointer publishes");
+        // Same primary, no components map: the component update never landed.
+        bucket
+            .put(
+                "nodes/node-a.json",
+                serde_json::to_vec(&lease(
+                    "node-a",
+                    crate::ownership_store::now_ms() + 3_600_000,
+                    Some(identity(V2)),
+                ))
+                .expect("lease encodes"),
+            )
+            .await
+            .expect("lease publishes");
+        let nodes = list_node_serving(&bucket).await.expect("leases list");
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].stale, Some(true));
+    }
+
+    /// Without a fleet pointer there is nothing to judge freshness
+    /// against: a live node with a serving identity renders unjudged,
+    /// never as current.
+    #[tokio::test]
+    async fn node_without_pointer_renders_unjudged() {
+        let bucket = Bucket::for_test();
+        bucket
+            .put(
+                "nodes/node-a.json",
+                serde_json::to_vec(&lease(
+                    "node-a",
+                    crate::ownership_store::now_ms() + 3_600_000,
+                    Some(identity(V2)),
+                ))
+                .expect("lease encodes"),
+            )
+            .await
+            .expect("lease publishes");
+        let nodes = list_node_serving(&bucket).await.expect("leases list");
+        assert_eq!(nodes.len(), 1);
+        assert!(nodes[0].live);
+        assert_eq!(nodes[0].stale, None);
+        assert_eq!(nodes[0].text(), format!("node-a app@{V2} (no pointer)"));
     }
 }

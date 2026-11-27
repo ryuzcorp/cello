@@ -8,6 +8,7 @@
 //! `cello-logic`.
 
 use crate::bucket::Bucket;
+use crate::generation::ServingIdentity;
 use crate::host_services::HostMetricsSample;
 use anyhow::Context;
 use cello_logic::{
@@ -53,6 +54,14 @@ pub(crate) struct NodeLeaseWire {
     /// a later format can omit the duplicate after mixed-version support ends.
     #[serde(default, rename = "ownership_index_generation")]
     pub(crate) generation: String,
+    /// The deployment this node is actually serving: the identity it adopted,
+    /// never the fleet-wide pointer. The pointer watcher stamps it after
+    /// every adoption and boot stamps the first generation, then each nudges
+    /// a renewal so the lease carries it. Absent on records older releases
+    /// wrote; those read as unknown rather than as the pointer's version,
+    /// and older readers ignore the key outright (no `deny_unknown_fields`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) serving: Option<ServingIdentity>,
     /// The folded node log: absent until the
     /// session's first fleet open. Every writer of this record carries it
     /// through unchanged except the log tier itself and recovery.
@@ -187,6 +196,8 @@ struct NodeLeaseWireRaw {
     #[serde(default, rename = "ownership_index_generation")]
     generation: String,
     #[serde(default)]
+    serving: Option<ServingIdentity>,
+    #[serde(default)]
     log: Option<NodeLogWire>,
     #[serde(default)]
     load: NodeLoadWire,
@@ -207,6 +218,7 @@ impl From<NodeLeaseWireRaw> for NodeLeaseWire {
             peer_protocol: raw.peer_protocol,
             paced_handoff: raw.paced_handoff,
             generation,
+            serving: raw.serving,
             log: raw.log,
             load: raw.load,
         }
@@ -436,6 +448,13 @@ pub struct BucketOwnership {
     /// (one publish outstanding at a time), >= S implies the applied body
     /// IS the waiter's object.
     applied: tokio::sync::watch::Sender<(String, u64)>,
+    /// The deployment this node is actually serving, stamped into every
+    /// lease write from here on. The pointer watcher sets it after each
+    /// adoption and boot sets the first generation; each then nudges a
+    /// renewal so the newly adopted version becomes durable without waiting
+    /// for the next TTL cadence. Plain lock, never held across an await:
+    /// the writer snapshots it while serializing, beside `own_log`.
+    serving: std::sync::Mutex<Option<ServingIdentity>>,
     /// Each cell whose record this node found lost, with the monotonic time
     /// at which its hold ends. See [`LOST_RECORD_RECHECK_MS`].
     lost_records: std::sync::Mutex<std::collections::BTreeMap<String, u64>>,
@@ -536,6 +555,7 @@ impl BucketOwnership {
             ambient_load_override: None,
             own_log: std::sync::Mutex::new((0, None)),
             applied: tokio::sync::watch::channel((String::new(), 0)).0,
+            serving: std::sync::Mutex::new(None),
             lost_records: std::sync::Mutex::default(),
         }
     }
@@ -1012,6 +1032,11 @@ impl BucketOwnership {
             // part 1 falls back to `probe_public_key`, which is the same
             // value. See the field's doc on `NodeLeaseWire`.
             generation: record.generation.clone(),
+            // What this node is actually serving, stamped at serialization
+            // like the folded log above. The core never sees it: `load_node_lease`
+            // maps the wire to a record without this field, so no core
+            // readback comparison can trip on an adoption racing a renewal.
+            serving: self.serving.lock().unwrap().clone(),
             load: self.process_load(),
             // The CORE's lease writes carry the folded log through
             // UNCHANGED: the full object lives in own_log, written only by
@@ -1106,6 +1131,22 @@ impl BucketOwnership {
         slot.0 += 1;
         slot.1 = log;
         slot.0
+    }
+
+    /// Record the deployment this node is actually serving. The next lease
+    /// write stamps it into the `serving` field; the caller (the pointer
+    /// watcher after an adoption, boot for the first generation) then nudges
+    /// a renewal so the adopted version becomes durable promptly. Unlike the
+    /// folded log this carries no publish sequence: it is advisory node
+    /// state, never authority, so a renewal that races an adoption simply
+    /// carries whichever identity was current when it serialized.
+    pub fn set_serving_identity(&self, identity: ServingIdentity) {
+        *self.serving.lock().unwrap() = Some(identity);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn serving_identity(&self) -> Option<ServingIdentity> {
+        self.serving.lock().unwrap().clone()
     }
 
     pub(crate) fn own_log(&self) -> Option<NodeLogWire> {
@@ -1320,4 +1361,162 @@ pub(crate) fn process_load(live: &LiveLoad) -> NodeLoadWire {
     // the first lease publish) instead of silently closing the fleet gate.
     cello_logic::format::assert_published_bucket_format(load.bucket_format);
     load
+}
+
+#[cfg(test)]
+mod serving_version_tests {
+    use super::*;
+
+    fn identity(version: &str) -> ServingIdentity {
+        ServingIdentity {
+            script_name: Some("app".to_string()),
+            version: version.to_string(),
+            prefix: format!("deploy/app/{version}"),
+            components: None,
+        }
+    }
+
+    fn lease(serving: Option<ServingIdentity>) -> NodeLeaseWire {
+        NodeLeaseWire {
+            node: "n1".to_string(),
+            expires_ms: now_ms() + 3_600_000,
+            addr: "127.0.0.1:9".to_string(),
+            probe_public_key: "probe".to_string(),
+            peer_protocol: 1,
+            paced_handoff: true,
+            generation: "gen1".to_string(),
+            serving,
+            log: None,
+            load: NodeLoadWire::default(),
+        }
+    }
+
+    #[test]
+    fn serving_identity_survives_a_lease_round_trip() {
+        let body =
+            serde_json::to_vec(&lease(Some(identity("aaaaaaaaaaaaaaaa")))).expect("lease encodes");
+        let decoded: NodeLeaseWire = serde_json::from_slice(&body).expect("lease decodes");
+        assert_eq!(decoded.serving, Some(identity("aaaaaaaaaaaaaaaa")));
+    }
+
+    /// A record an older release wrote carries no `serving` key. It must
+    /// still decode, reporting unknown rather than failing — or worse,
+    /// inheriting the pointer's version.
+    #[test]
+    fn legacy_lease_without_serving_reads_unknown() {
+        let body = serde_json::json!({
+            "node": "n1",
+            "expires_ms": now_ms() + 3_600_000,
+            "addr": "127.0.0.1:9",
+            "probe_public_key": "probe",
+            "peer_protocol": 1,
+            "paced_handoff": true,
+            "ownership_index_generation": "gen1",
+            "load": {
+                "sampled_ms": 1,
+                "resident_cells": 0,
+                "host_websockets": 0,
+                "rss_bytes": 1,
+                "cpu_percent_x100": 0,
+                "open_fds": 0,
+                "fd_limit": 0,
+                "pressured": false,
+                "shed_cells": 0,
+            },
+        });
+        let decoded: NodeLeaseWire = serde_json::from_value(body).expect("legacy lease decodes");
+        assert_eq!(decoded.serving, None);
+        assert_eq!(decoded.generation, "gen1");
+    }
+
+    /// The other direction of mixed-version safety: an old reader whose
+    /// shape has no `serving` field must still decode a new writer's body.
+    /// The lease wire carries no `deny_unknown_fields`, so this is a
+    /// structural guarantee, not a convention.
+    #[test]
+    fn new_writer_body_still_decodes_without_a_serving_field() {
+        #[derive(serde::Deserialize)]
+        struct LegacyLease {
+            node: String,
+        }
+        let body =
+            serde_json::to_vec(&lease(Some(identity("aaaaaaaaaaaaaaaa")))).expect("lease encodes");
+        assert!(String::from_utf8_lossy(&body).contains("\"serving\""));
+        let decoded: LegacyLease = serde_json::from_slice(&body).expect("legacy shape decodes");
+        assert_eq!(decoded.node, "n1");
+    }
+
+    fn lease_record() -> NodeLeaseRecord {
+        NodeLeaseRecord {
+            node: "n1".to_string(),
+            addr: "127.0.0.1:9".to_string(),
+            expires_ms: now_ms() + 3_600_000,
+            peer_protocol: 1,
+            generation: "gen1".to_string(),
+            log_state: None,
+            etag: String::new(),
+        }
+    }
+
+    async fn written_serving(bucket: &crate::bucket::Bucket) -> serde_json::Value {
+        let (body, _) = bucket
+            .get("nodes/n1.json")
+            .await
+            .expect("lease reads")
+            .expect("lease present");
+        serde_json::from_slice(&body).expect("lease body is JSON")
+    }
+
+    /// The shell stamps the adopted identity at serialization: after an
+    /// adoption the next renewal carries the new version without waiting
+    /// for any core change.
+    #[tokio::test]
+    async fn lease_write_stamps_the_adopted_identity() {
+        let bucket = crate::bucket::Bucket::for_test();
+        let ownership = BucketOwnership::new(
+            bucket.clone(),
+            bucket,
+            "n1".to_string(),
+            "probe".to_string(),
+        );
+        ownership.set_serving_identity(identity("bbbbbbbbbbbbbbbb"));
+        let mut stamped = None;
+        let outcome = ownership
+            .cas_node_lease(CasGuard::Absent, &lease_record(), &mut stamped)
+            .await
+            .expect("lease CAS applies");
+        assert!(matches!(outcome, LeaseCasOutcome::Applied { .. }));
+        let body = written_serving(&ownership.lease_bucket).await;
+        assert_eq!(body["serving"]["version"], "bbbbbbbbbbbbbbbb");
+        assert_eq!(body["serving"]["script_name"], "app");
+        // The core record is untouched: serving is shell-stamped state, not
+        // authority, so no core readback comparison can trip on it.
+        assert_eq!(
+            ownership.serving_identity(),
+            Some(identity("bbbbbbbbbbbbbbbb"))
+        );
+    }
+
+    /// Before any adoption the writer omits the field entirely, so the body
+    /// keeps the legacy shape byte for byte.
+    #[tokio::test]
+    async fn lease_write_without_adoption_omits_serving() {
+        let bucket = crate::bucket::Bucket::for_test();
+        let ownership = BucketOwnership::new(
+            bucket.clone(),
+            bucket,
+            "n1".to_string(),
+            "probe".to_string(),
+        );
+        let mut stamped = None;
+        ownership
+            .cas_node_lease(CasGuard::Absent, &lease_record(), &mut stamped)
+            .await
+            .expect("lease CAS applies");
+        let body = written_serving(&ownership.lease_bucket).await;
+        assert!(
+            body.get("serving").is_none(),
+            "no serving key before adoption"
+        );
+    }
 }

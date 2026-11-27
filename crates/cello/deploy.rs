@@ -485,9 +485,11 @@ Each `cello deploy` writes one immutable version directory per script. The\n\
 fleet-wide pointer names the serving generation; `cello activate SCRIPT=VERSION`\n\
 moves back to an earlier version for rollback, and `cello discard\n\
 SCRIPT=VERSION` deletes a version no pointer names. This command lists what\n\
-is there, marking the serving versions `current`.\n\n\
-OPTIONS:\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLO_BUCKET\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --json                 Print one JSON object per version\n  -h, --help             Show this help"
-    ;
+is there, marking the serving versions `current`, then lists every node\n\
+lease with the deployment that node actually adopted — `stale` when it is\n\
+behind the pointer, `unknown` when its lease predates serving reports, and\n\
+`(no pointer)` when the bucket holds no pointer to judge against.\n\n\
+OPTIONS:\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLO_BUCKET\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --json                 Print one JSON object per row: versions, then node leases\n  -h, --help             Show this help";
     let _ = crate::cli_output::Output::new(crate::cli_output::Format::Text).help(text);
 }
 

@@ -134,11 +134,18 @@ pub struct DeploymentGraph {
 /// primary's version and prefix. Comparing less pins a node to a stale
 /// generation forever: the pointer never moves again, so a skipped
 /// component-only change is never retried.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// A node's lease reuses this struct for its `serving` field, so a lease
+/// reader compares node state with the same equality the pointer watcher
+/// adopts by. `script_name` and `components` stay optional with serde
+/// defaults, so a future field added the same way keeps old readers working.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ServingIdentity {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub script_name: Option<String>,
     pub version: String,
     pub prefix: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub components: Option<BTreeMap<String, ComponentRef>>,
 }
 
