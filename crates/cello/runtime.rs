@@ -2495,20 +2495,20 @@ async fn drive_worker(
         // discards accepted work with nothing logged (denoland/celld#207).
         // Take once more before leaving; anything found rejoins the drive.
         if entry.keeps_native_ops() {
-            let trailing = entry.take_handed_ops();
-            if trailing.is_empty() {
-                // Close the mailbox in the same synchronous block: no
-                // handoff can land between the take and the close, so
-                // anything arriving after is refused loudly at the source
-                // instead of parking for a driver that already left.
-                let late = entry.take_handed_ops_closed();
-                debug_assert!(late.is_empty(), "no handoff lands mid-turn");
-                drop(late);
-                break;
+            // Close-if-empty-else-take under one mailbox hold: a handoff
+            // landing mid-exit is taken without closing and rejoins the
+            // drive, while an empty queue closes so anything arriving
+            // after is refused loudly at the source instead of parking
+            // for a driver that already left. Cross-thread turns can no
+            // longer interleave.
+            match entry.close_handed_ops_or_take() {
+                None => break,
+                Some(trailing) => {
+                    adopt(&mut ops, trailing);
+                    after_turn(&entry);
+                    continue;
+                }
             }
-            adopt(&mut ops, trailing);
-            after_turn(&entry);
-            continue;
         }
         // Finished with nothing keeping its native ops: nobody will poll
         // whatever the last take finds, so reject it inside the turn
@@ -2630,7 +2630,27 @@ async fn wake_with_cross_entry_gate(
     {
         return Wake::BackgroundExpired;
     }
-    let deadline = entry.background_deadline(crate::engine_api::background_budget());
+    // The backstop exists for one case: hung adopted work. An entry parked
+    // on an adopted op re-checks expiry only on a wake, which may never
+    // come, so the drive races the wait against the budget deadline. With
+    // no adopted work outstanding there is nothing hung to wake for: the
+    // deadline stays `None` and the drive parks. That kills two birds — a
+    // settled-waitUntil stream no longer hot-loops its elapsed deadline,
+    // and a detached timer is never retired by a backstop armed for work
+    // the budget must not reach. Either adopted signal arms it: ops the
+    // turn-end adopt routed from a retired origin (any op kind, including a
+    // plain fetch with no cancel id), or a still-registered adopted child
+    // call. The expiry predicate itself is unchanged: the arm still fires
+    // a grace past the deadline and re-checks inline, never `Poll`.
+    let deadline = if (entry.has_adopted_ops() || entry.io_context().has_adopted_child_cancels())
+        && entry.remaining(budget).is_none()
+        && entry.gated_reply_and_io_context().0.is_none()
+        && (entry.has_background() || !entry.has_response_stream())
+    {
+        entry.background_deadline(crate::engine_api::background_budget())
+    } else {
+        None
+    };
     let budget_wake = async {
         match wait
             .wait(wake(ops, entry, budget), |wake| matches!(wake, Wake::Idle))
@@ -4185,22 +4205,25 @@ async fn drive_cell_inner(
         // anything found rejoins the drive instead of the mailbox.
         if entry.finished() {
             if entry.keeps_native_ops() {
-                let trailing = entry.take_handed_ops();
-                if trailing.is_empty() {
-                    // Close the mailbox in the same synchronous block: no
-                    // handoff can land between the take and the close, so
-                    // anything arriving after is refused loudly at the
-                    // source instead of parking for a driver that left.
-                    let late = entry.take_handed_ops_closed();
-                    debug_assert!(late.is_empty(), "no handoff lands mid-turn");
-                    drop(late);
-                    break;
+                // Close-if-empty-else-take under one mailbox hold: a handoff
+                // landing mid-exit is taken without closing and rejoins the
+                // drive, while an empty queue closes so anything arriving
+                // after is refused loudly at the source. Cross-thread turns
+                // can no longer interleave.
+                match entry.close_handed_ops_or_take() {
+                    None => break,
+                    Some(trailing) => {
+                        #[cfg(cello_internal_tests)]
+                        adopt_cell_ops_for_test(
+                            &mut ops,
+                            trailing,
+                            &mut test_observers.native_op_dropped,
+                        );
+                        #[cfg(not(cello_internal_tests))]
+                        adopt(&mut ops, trailing);
+                        continue;
+                    }
                 }
-                #[cfg(cello_internal_tests)]
-                adopt_cell_ops_for_test(&mut ops, trailing, &mut test_observers.native_op_dropped);
-                #[cfg(not(cello_internal_tests))]
-                adopt(&mut ops, trailing);
-                continue;
             }
             // Finished with nothing keeping its native ops: nobody will
             // poll whatever the last take finds, so reject it inside the

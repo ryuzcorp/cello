@@ -4262,6 +4262,12 @@ pub struct InFlight {
     /// The subset of `ops` that can run while referenced work is live but
     /// cannot keep this event alive by themselves.
     unrefed_ops: std::collections::HashSet<u64>,
+    /// The subset of `ops` adopted from a retired same-cell origin (see
+    /// `adopt`). The background-expiry backstop arms only while this is
+    /// non-empty: with no adopted work outstanding there is nothing hung to
+    /// wake for, so the drive parks instead of hot-looping a settled stream
+    /// or retiring a detached timer the budget must not reach.
+    adopted_ops: std::collections::HashSet<u64>,
     /// The alarm bookkeeping this entry still owes, if it is one.
     alarm: Option<AlarmClaim>,
     started: tokio::time::Instant,
@@ -4804,6 +4810,15 @@ impl InFlight {
         self.background.is_some()
     }
 
+    /// Whether this entry still drives work adopted from a retired same-cell
+    /// origin. The background-expiry backstop arms only while this holds:
+    /// an entry parked on hung adopted work re-checks expiry only on a wake
+    /// that may never come, while an entry with no adopted work outstanding
+    /// parks properly — no hot-looped timer, no retired detached timer.
+    pub(crate) fn has_adopted_ops(&self) -> bool {
+        !self.adopted_ops.is_empty()
+    }
+
     /// Whether a native operation can still resume JavaScript for this event.
     ///
     /// A detached reply gate is host work. It cannot keep handler operations
@@ -4902,6 +4917,7 @@ impl InFlight {
             }
         }
         self.io_context_ops.clear();
+        self.adopted_ops.clear();
         // A handed op never reached `ops`, but its resolver is in the same
         // map. A refed one hangs its awaiters the same way pending ops do,
         // so it rejects alike; an unrefed one dies with its subscribing
@@ -4966,6 +4982,7 @@ impl InFlight {
         self.context.seal_wait_until();
         self.io_context_ops.clear();
         self.unrefed_ops.clear();
+        self.adopted_ops.clear();
         // Nothing will drive a live pump once this entry is gone, so its
         // promise must not stay rooted in the isolate (upstream #275).
         self.response_streams.clear();
@@ -5001,43 +5018,46 @@ impl InFlight {
     /// Give an op to the event whose continuation enqueued it.
     ///
     /// The owner's driver polls it, so the owner's retirement decides when it
-    /// is cancelled and this event's retirement cannot take it away. An owner
-    /// that is already gone — or whose mailbox closed while this turn ran —
-    /// will never poll the future: a refed promise rejects instead of hanging
+    /// is cancelled and this event's retirement cannot take it away. Reports
+    /// whether the owner's mailbox accepted the handoff; a refused handoff
+    /// hands the op back so the caller can adopt it into a live same-cell
+    /// ambient (the owner's mailbox may have closed between the adoption
+    /// sample and this push) or refuse it loudly. Either way nobody polls
+    /// a refused future: a refed promise rejects instead of hanging
     /// whoever awaits it (silently dropping the resolver wedged the waiter
     /// with nothing logged, denoland/celld#207, and a timer the harness
     /// fires early on rejection still settles its dependents,
     /// denoland/celld#309), while an unrefed one is dropped — its awaiters
     /// re-subscribe in a later event, and rejecting it would settle that
-    /// record fatally.
+    /// record fatally (see `adopt`).
     fn hand_op(
         &mut self,
-        tc: &mut v8::PinScope,
         owner: u64,
         id: u64,
         future: asyncrt::OpFuture,
         lifetime: asyncrt::OpLifetime,
-    ) {
+    ) -> Result<(), (asyncrt::OpFuture, asyncrt::OpLifetime)> {
         // One branch for both refusals — an owner that is already gone, and
         // one whose mailbox closed while this turn ran. Either way nobody
         // polls the future.
-        let delivered = self
-            .runtime_state
-            .io_context(owner)
-            .is_some_and(|context| context.hand_op(id, future, lifetime));
-        if delivered {
-            return;
-        }
-        // An unrefed op dies with its subscribing event by design: the
-        // stable promise re-subscribes in a later event (a retained exec
-        // read re-armed by the streams pull-again microtask, which runs
-        // under the captured slot of the event that started the pull, so
-        // its op names a retired owner), and the next event's refresh
-        // heals it. Rejecting it here would settle that record fatally
-        // and break the chain, so its resolver is dropped instead — the
-        // pre-#309 behavior, which only refed ops outgrew: their awaiters
-        // cannot recover, and silently dropping them wedged the waiter
-        // with nothing logged (denoland/celld#207).
+        let Some(context) = self.runtime_state.io_context(owner) else {
+            return Err((future, lifetime));
+        };
+        context.hand_op(id, future, lifetime)
+    }
+
+    /// Refuse an op no live driver will ever poll: reject its resolver, or
+    /// drop it when it is unrefed. An unrefed op dies with its subscribing
+    /// event by design: the stable promise re-subscribes in a later event
+    /// (a retained exec read re-armed by the streams pull-again microtask,
+    /// which runs under the captured slot of the event that started the
+    /// pull, so its op names a retired owner), and the next event's refresh
+    /// heals it. Rejecting it here would settle that record fatally
+    /// and break the chain, so its resolver is dropped instead — the
+    /// pre-#309 behavior, which only refed ops outgrew: their awaiters
+    /// cannot recover, and silently dropping them wedged the waiter
+    /// with nothing logged (denoland/celld#207).
+    fn refuse_handed_op(&mut self, tc: &mut v8::PinScope, id: u64, lifetime: asyncrt::OpLifetime) {
         if lifetime == asyncrt::OpLifetime::Unrefed {
             self.runtime_state.promises.lock().unwrap().remove(&id);
             return;
@@ -5067,6 +5087,18 @@ impl InFlight {
     /// unrefed half, like `reject_handed_ops` and `drop_handed_ops`.
     pub(crate) fn take_handed_ops_closed(&mut self) -> Vec<Op> {
         self.record_handed_ops(self.context.close_handed_ops())
+    }
+
+    /// The driver's exit take: close the mailbox if it is still empty, else
+    /// take its work — under one hold of the mailbox lock (see
+    /// `IoContext::close_handed_ops_or_take`). `None` closes the exit: the
+    /// queue was empty and is now closed, so nothing more can arrive.
+    /// `Some` keeps driving the taken work through the ordinary path.
+    pub(crate) fn close_handed_ops_or_take(&mut self) -> Option<Vec<Op>> {
+        match self.context.close_handed_ops_or_take() {
+            HandedExit::Closed => None,
+            HandedExit::Took(handed) => Some(self.record_handed_ops(handed)),
+        }
     }
 
     /// Record taken handoffs as this event's own ops so that `deliver`
@@ -5862,11 +5894,47 @@ fn adopt(tc: &mut v8::PinScope, entry: &mut InFlight) -> Vec<Op> {
                 None => retired_cell_scope(owner),
             };
             let adopted = unpollable
-                && origin_cell.is_some_and(|cell| adopt_same_cell(&cell, &entry.context).is_some());
+                && origin_cell
+                    .as_deref()
+                    .is_some_and(|cell| adopt_same_cell(cell, &entry.context).is_some());
             if !adopted {
-                entry.hand_op(tc, owner, id, future, lifetime);
-                continue;
+                // The mailbox can close between the sample above and the
+                // push below (the owner driver retires on another thread
+                // with no lock held across the two steps). A refused
+                // handoff re-runs the same-cell check against the already
+                // resolved origin cell: a live same-cell ambient takes the
+                // op locally, anything else keeps the loud refusal. The
+                // window stays bounded — either way the op settles loudly.
+                match entry.hand_op(owner, id, future, lifetime) {
+                    Ok(()) => continue,
+                    Err((future, lifetime)) => {
+                        if origin_cell
+                            .as_deref()
+                            .is_some_and(|cell| adopt_same_cell(cell, &entry.context).is_some())
+                        {
+                            // Adopted through the TOCTOU re-check: the owner
+                            // retired between the sample and the push, so this
+                            // live same-cell event drives the op — and the
+                            // backstop with it (see `adopted_ops`).
+                            entry.ops.insert(id);
+                            entry.adopted_ops.insert(id);
+                            if lifetime == asyncrt::OpLifetime::IoContext {
+                                entry.io_context_ops.insert(id);
+                            }
+                            if lifetime == asyncrt::OpLifetime::Unrefed {
+                                entry.unrefed_ops.insert(id);
+                            }
+                            ops.push((id, future));
+                        } else {
+                            entry.refuse_handed_op(tc, id, lifetime);
+                        }
+                        continue;
+                    }
+                }
             }
+            // Adopted from a retired same-cell origin: this event drives the
+            // op, so the backstop must cover it (see `adopted_ops`).
+            entry.adopted_ops.insert(id);
         }
         entry.ops.insert(id);
         if lifetime == asyncrt::OpLifetime::IoContext {
@@ -6021,6 +6089,7 @@ fn begin<'s>(
                 ops: std::collections::HashSet::new(),
                 io_context_ops: std::collections::HashSet::new(),
                 unrefed_ops: std::collections::HashSet::new(),
+                adopted_ops: std::collections::HashSet::new(),
                 alarm: None,
                 started: crate::asyncrt::mono_now(),
                 background_since: None,
@@ -6126,6 +6195,7 @@ fn begin_entrypoint_rpc(
                 ops: std::collections::HashSet::new(),
                 io_context_ops: std::collections::HashSet::new(),
                 unrefed_ops: std::collections::HashSet::new(),
+                adopted_ops: std::collections::HashSet::new(),
                 alarm: None,
                 started: event_started,
                 background_since: None,
@@ -6430,6 +6500,7 @@ fn begin_queue(
                 ops: std::collections::HashSet::new(),
                 io_context_ops: std::collections::HashSet::new(),
                 unrefed_ops: std::collections::HashSet::new(),
+                adopted_ops: std::collections::HashSet::new(),
                 alarm: None,
                 started: crate::asyncrt::mono_now(),
                 background_since: None,
@@ -6623,6 +6694,7 @@ fn start_cell_event<'s>(
                 ops: std::collections::HashSet::new(),
                 io_context_ops: std::collections::HashSet::new(),
                 unrefed_ops: std::collections::HashSet::new(),
+                adopted_ops: std::collections::HashSet::new(),
                 alarm: None,
                 started: event_started,
                 background_since: None,
@@ -6681,6 +6753,7 @@ fn start_cell_event<'s>(
                     ops: std::collections::HashSet::new(),
                     io_context_ops: std::collections::HashSet::new(),
                     unrefed_ops: std::collections::HashSet::new(),
+                    adopted_ops: std::collections::HashSet::new(),
                     alarm: None,
                     started: event_started,
                     background_since: None,
@@ -7149,6 +7222,7 @@ fn deliver(
     entry.ops.remove(&op);
     entry.io_context_ops.remove(&op);
     entry.unrefed_ops.remove(&op);
+    entry.adopted_ops.remove(&op);
     let guard = CurrentGuard::enter(entry.context.clone());
     resolve_res(tc, op, res);
     tc.perform_microtask_checkpoint();
@@ -10639,8 +10713,19 @@ fn op_do_call_impl(
     // in the order the script made the calls. The chain belongs to the entry
     // whose code is running, so a continuation resumed in a foreign
     // checkpoint keeps its own caller's order rather than joining the turn
-    // owner's. A retired event has no chain to join and goes unordered.
-    let order = reaction_or_current_context(scope).map(|caller| enter_call_order(caller, &cell));
+    // owner's. A retired event has no chain to join, so an adopted call
+    // takes its place in the adopter's chain instead: concurrent fetches
+    // to the same stub from one adopted continuation then share the
+    // adopter's order and cannot enter out of order. Sequential legs are
+    // unaffected — a live origin keeps its own chain as before.
+    let order = reaction_or_current_context(scope)
+        .map(|caller| enter_call_order(caller, &cell))
+        .or_else(|| {
+            let dead = reaction_continuation_id(scope)?;
+            let adopter = turn_owner()?;
+            live_ambient_adoption_for(dead, &adopter)?;
+            Some(enter_call_order(adopter, &cell))
+        });
     // Every host op needs an internal cancellation channel. A caller without
     // an AbortSignal cannot cancel from JavaScript, but its enclosing Worker
     // can still disappear and drop this op before routing completes.
@@ -10660,23 +10745,27 @@ fn op_do_call_impl(
     // A continuation resumed in a foreign checkpoint creates the call under
     // its dead origin token but executes inside this live turn: settle will
     // adopt the op into the turn owner's drive, so the adopter must also own
-    // the callee's abort. Record on the turn owner exactly when the token
-    // cannot drive the call (dead or already closed). A live token drives
-    // its own call even from a nested turn, so it never records here.
+    // the callee's abort. Record on the turn owner exactly when the origin
+    // token cannot drive the call (dead or already closed). A live token
+    // drives its own call even from a nested turn, so it never records here.
+    // Liveness comes from the reaction's own token — not the event's, which
+    // `event_context` already resolved to the live adopter for a dead
+    // origin. That is why the old `ptr_eq` early return skipped the adopted
+    // record for same-cell continuations: adopter and event are the same
+    // context there, while the origin token is dead.
     TURN_OWNER.with(|owner| {
         let Some(adopter) = owner.borrow().as_ref().cloned() else {
             return;
         };
-        if Arc::ptr_eq(&adopter, &event) {
+        let unpollable = match reaction_continuation_id(scope) {
+            Some(dead) => actor_runtime_state(scope)
+                .io_context(dead)
+                .is_none_or(|context| !context.accepts_handed_ops()),
+            None => false,
+        };
+        if Arc::ptr_eq(&adopter, &event) && !unpollable {
             return;
         }
-        let Some((token, runtime)) = event.continuation.as_ref() else {
-            return;
-        };
-        let unpollable = runtime
-            .upgrade()
-            .and_then(|runtime| runtime.io_context(*token))
-            .is_none_or(|context| !context.accepts_handed_ops());
         if unpollable {
             adopter.record_adopted_child_cancel(request_id);
         }
@@ -14337,6 +14426,18 @@ pub struct IoContext {
 /// promise id, the work, and its complete lifetime classification.
 type HandedOp = (u64, asyncrt::OpFuture, asyncrt::OpLifetime);
 
+/// The outcome of an atomic exit take: either the mailbox was empty and
+/// is now closed, or it held work that stays open for another drive pass.
+pub(crate) enum HandedExit {
+    /// The queue was empty under the lock and is now closed: no handoff
+    /// can land between the take and the close, so anything arriving
+    /// after is refused loudly at the source.
+    Closed,
+    /// The queue held work, taken without closing: the driver keeps
+    /// driving it through the ordinary path.
+    Took(Vec<HandedOp>),
+}
+
 impl IoContext {
     fn record_tail_log(&self, level: &str, body: &str) {
         if !self.tail_reporting {
@@ -14504,6 +14605,24 @@ impl IoContext {
             .get()
             .map(|cancels| std::mem::take(&mut *cancels.lock().unwrap()))
             .unwrap_or_default()
+    }
+
+    /// Whether this event still drives adopted child calls, without
+    /// draining them. Only still-registered calls count: a completed call
+    /// already disarmed its guard, so its stale id must not arm the
+    /// backstop (a settled stream would hot-loop its elapsed deadline
+    /// instead of parking). The expiry backstop arms only while adopted
+    /// work — this list or `InFlight::adopted_ops` — is outstanding.
+    pub(crate) fn has_adopted_child_cancels(&self) -> bool {
+        let Some(cancels) = self.adopted_child_cancels.get() else {
+            return false;
+        };
+        let cancels = cancels.lock().unwrap();
+        if cancels.is_empty() {
+            return false;
+        }
+        let live = do_call_cancels().lock().unwrap();
+        cancels.iter().any(|id| live.contains_key(id))
     }
 
     /// Start charging this turn's CPU to the entry that owns the turn.
@@ -14709,14 +14828,19 @@ impl IoContext {
 
     /// Take an op that another event's turn enqueued for this event.
     ///
-    /// Reports whether the mailbox accepted it. A closed mailbox refuses, and
-    /// the caller must then drop the op's resolver: this event will never run
+    /// Reports whether the mailbox accepted it. A closed mailbox refuses and
+    /// hands the op back, so the caller can adopt it into a live same-cell
+    /// ambient or drop the op's resolver: this event will never run
     /// the continuation waiting on it.
-    #[must_use]
-    fn hand_op(&self, id: u64, future: asyncrt::OpFuture, lifetime: asyncrt::OpLifetime) -> bool {
+    fn hand_op(
+        &self,
+        id: u64,
+        future: asyncrt::OpFuture,
+        lifetime: asyncrt::OpLifetime,
+    ) -> Result<(), (asyncrt::OpFuture, asyncrt::OpLifetime)> {
         let mut handed = self.handed.lock().unwrap();
         let Some(queue) = handed.as_mut() else {
-            return false;
+            return Err((future, lifetime));
         };
         queue.push((id, future, lifetime));
         // Published under the lock, so a reader that sees this count can take
@@ -14724,7 +14848,7 @@ impl IoContext {
         self.handed_len.store(queue.len(), Ordering::Release);
         drop(handed);
         self.handed_wake.notify_one();
-        true
+        Ok(())
     }
 
     /// Whether a foreign turn has left this event an op, without locking.
@@ -14796,6 +14920,30 @@ impl IoContext {
         let mut handed = self.handed.lock().unwrap();
         self.handed_len.store(0, Ordering::Release);
         handed.take().unwrap_or_default()
+    }
+
+    /// Close the mailbox if it is still empty, else take its work — under
+    /// one hold of the mailbox lock. A handoff landing between a separate
+    /// take and close would otherwise panic the debug assertion (or drop
+    /// an accepted future without settling its promise in release).
+    fn close_handed_ops_or_take(&self) -> HandedExit {
+        let mut handed = self.handed.lock().unwrap();
+        match handed.as_mut() {
+            None => {
+                self.handed_len.store(0, Ordering::Release);
+                HandedExit::Closed
+            }
+            Some(queue) if queue.is_empty() => {
+                *handed = None;
+                self.handed_len.store(0, Ordering::Release);
+                HandedExit::Closed
+            }
+            Some(queue) => {
+                let took = std::mem::take(queue);
+                self.handed_len.store(0, Ordering::Release);
+                HandedExit::Took(took)
+            }
+        }
     }
 
     fn begin_event(&self) {
@@ -15134,11 +15282,13 @@ impl IoContextRegistryForTest {
     /// only stores it, so nothing here polls it.
     #[doc(hidden)]
     pub fn hand_pending_op(&self, context: &Arc<IoContext>, id: u64) -> bool {
-        context.hand_op(
-            id,
-            Box::pin(std::future::pending()),
-            asyncrt::OpLifetime::Handler,
-        )
+        context
+            .hand_op(
+                id,
+                Box::pin(std::future::pending()),
+                asyncrt::OpLifetime::Handler,
+            )
+            .is_ok()
     }
 
     /// The op ids `context` still holds for a driver that has not taken them.
