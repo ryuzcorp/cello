@@ -21,6 +21,7 @@ use std::ffi::{CStr, CString};
 use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::{LazyLock, Mutex};
 
 pub(crate) mod wake_record;
 
@@ -316,8 +317,8 @@ fn sql_critical_errors<T>(f: impl FnOnce(&RefCell<HashMap<String, String>>) -> T
 }
 
 /// The heap memory one cell can hold in cached SQL statements. The budget
-/// counts the bytes SQLite reports for each compiled program, and
-/// `finish_open()` disables lookaside on every connection, so a reported byte
+/// counts the bytes SQLite reports for each compiled program, and every
+/// opener disables lookaside on its fresh connection, so a reported byte
 /// is a real heap byte and the budget bounds the cache.
 const SQL_STATEMENT_CACHE_MAX_SIZE: usize = 128 * 1024;
 
@@ -958,6 +959,7 @@ pub(crate) fn open_at_epoch(
         }
         None => Connection::open(path)?,
     };
+    disable_lookaside(&connection)?;
     finish_open(
         scope,
         connection,
@@ -974,9 +976,11 @@ pub(crate) fn open_at_epoch(
 
 #[cfg(cello_internal_tests)]
 pub fn open_with_fault_vfs_for_test(scope: &str, path: &str) -> anyhow::Result<()> {
+    let connection = crate::fault::open_database(path)?;
+    disable_lookaside(&connection)?;
     finish_open(
         scope,
-        crate::fault::open_database(path)?,
+        connection,
         1,
         true,
         crate::engine_api::Compat::default(),
@@ -996,27 +1000,8 @@ fn finish_open(
     compat: crate::engine_api::Compat,
     backing: StorageBacking,
 ) -> anyhow::Result<()> {
-    // SQLite's default lookaside arena reserves 48 KiB for every connection.
-    // A worker keeps one connection for every resident cell, so the arenas
-    // consume 48 MiB per 1,024 cells even when the application does no SQL.
-    // General allocations preserve the same behavior and measured hot-read
-    // throughput stays within 2%, so density is more valuable than the arena.
-    //
-    // SAFETY: `c` owns a live connection, and no SQLite operation has run on
-    // it yet. SQLite can replace lookaside only while no slot is in use.
-    let result = unsafe {
-        rusqlite::ffi::sqlite3_db_config(
-            c.handle(),
-            rusqlite::ffi::SQLITE_DBCONFIG_LOOKASIDE,
-            std::ptr::null_mut::<std::ffi::c_void>(),
-            0,
-            0,
-        )
-    };
-    anyhow::ensure!(
-        result == rusqlite::ffi::SQLITE_OK,
-        "failed to disable SQLite lookaside"
-    );
+    // Lookaside is already disabled: every opener runs `disable_lookaside`
+    // on the fresh connection before its first statement.
     if compat.sqlite_vec {
         register_vec0_extension(&c)?;
     }
@@ -1503,6 +1488,62 @@ fn replay_legacy_facet_image(connection: &Connection, image: &[u8]) -> anyhow::R
     Ok(tables)
 }
 
+/// One mutex per facet file, serializing concurrent first-opens across
+/// isolates (#302).
+///
+/// Two isolates opening one facet's file at once both read
+/// `LegacyImportStatus::Pristine` — the `facet_opening` short-circuit is
+/// per-isolate, so it cannot see the other isolate — and replay the 0.5.1
+/// image together. The loser then fails the deferred-transaction read→write
+/// upgrade (`SQLITE_BUSY`/`SQLITE_BUSY_SNAPSHOT`). The lock spans the whole
+/// `open_embedded`, so the second opener always arrives at a decided file.
+/// Same-file opens are rare (once per upgrade per facet) and millisecond
+/// scale; genuine BUSY from anywhere else still surfaces immediately.
+static FACET_FILE_OPENS: LazyLock<Mutex<HashMap<std::path::PathBuf, Arc<Mutex<()>>>>> =
+    LazyLock::new(Default::default);
+
+fn facet_file_lock(path: &std::path::Path) -> Arc<Mutex<()>> {
+    FACET_FILE_OPENS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(path.to_path_buf())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+/// Disable a fresh connection's lookaside arena, before its first SQL.
+///
+/// SQLite's default lookaside arena reserves 48 KiB for every connection. A
+/// worker keeps one connection for every resident cell, so the arenas
+/// consume 48 MiB per 1,024 cells even when the application does no SQL.
+/// General allocations preserve the same behavior and measured hot-read
+/// throughput stays within 2%, so density is more valuable than the arena.
+///
+/// This must run before the connection's first statement: SQLite replaces
+/// lookaside only while no slot is in use, and a peer connection's
+/// concurrent DDL strands slots on this one, failing a later disable with
+/// `SQLITE_BUSY` (#302). Every opener calls this on its fresh connection;
+/// `finish_open` only assumes it.
+///
+/// SAFETY: the caller passes a newly opened connection before its first
+/// SQLite operation, so no lookaside slot can be in use.
+fn disable_lookaside(connection: &Connection) -> anyhow::Result<()> {
+    let result = unsafe {
+        rusqlite::ffi::sqlite3_db_config(
+            connection.handle(),
+            rusqlite::ffi::SQLITE_DBCONFIG_LOOKASIDE,
+            std::ptr::null_mut::<std::ffi::c_void>(),
+            0,
+            0,
+        )
+    };
+    anyhow::ensure!(
+        result == rusqlite::ffi::SQLITE_OK,
+        "failed to disable SQLite lookaside"
+    );
+    Ok(())
+}
+
 /// Open a facet's own database file, which `crate::facet_streams`
 /// activated at `path`. A facet from before facets had streams of their own
 /// kept its database as an image in a row of its root's `_cf_FACETS`; the
@@ -1531,10 +1572,15 @@ pub(crate) fn open_embedded(
     compat: crate::engine_api::Compat,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(parent.facet_path.len() < 3, "Facet nesting depth limit exceeded. The maximum depth including the root Durable Object is 4.");
+    let file_lock = facet_file_lock(path);
+    let _file_guard = file_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut facet_path = parent.facet_path.clone();
     facet_path.push(name.to_string());
     let stream = crate::engine_api::facet_cell(&parent.root_scope, &facet_path);
     let connection = Connection::open(path)?;
+    disable_lookaside(&connection)?;
     // 0.5.1 → 0.6 upgrade repair (upstream #292): the first fixed-version
     // open replays the root's image as this file's first content, through
     // ordinary SQL writes, which commit beside a live replica's read lock
@@ -8108,6 +8154,108 @@ mod legacy_import_tests {
             &["child".to_string()],
         );
         assert!(absent.is_err(), "a missing root is loud, never empty");
+    }
+    /// Two barrier-synced first-opens of one facet file from two isolates
+    /// (#302): the per-isolate `facet_opening` check passes on both, so both
+    /// enter the pristine path together. The per-file lock serializes them:
+    /// both first attempts succeed, exactly one imports, and a third open
+    /// finds the import decided.
+    #[test]
+    fn concurrent_first_open_serializes() {
+        let (_root_dir, root_path) = temp_db("root.sqlite3");
+        let (_img_dir, img_path) = temp_db("img.sqlite3");
+        {
+            let image = Connection::open(&img_path).expect("open image");
+            image
+                .execute_batch(
+                    "CREATE TABLE items(id INTEGER PRIMARY KEY, v TEXT NOT NULL);
+                     INSERT INTO items(id, v) VALUES (5, 'a1'), (9, 'a2');
+                     CREATE TABLE log(n TEXT NOT NULL);
+                     INSERT INTO log(n) VALUES ('a1'), ('a2');",
+                )
+                .expect("seed image");
+        }
+        let image_bytes = std::fs::read(&img_path).expect("read image");
+        {
+            let root = Connection::open(&root_path).expect("open root");
+            root.execute_batch(
+                "CREATE TABLE _cf_FACETS(scope TEXT NOT NULL, path TEXT NOT NULL,
+                  image BLOB NOT NULL, PRIMARY KEY(scope, path)) WITHOUT ROWID;",
+            )
+            .expect("table");
+            root.execute(
+                "INSERT INTO _cf_FACETS(scope, path, image) VALUES (?1, ?2, ?3)",
+                rusqlite::params!["Root:test", "[\"child\"]", image_bytes],
+            )
+            .expect("insert");
+        }
+        let (_facet_dir, facet_path) = temp_db("facet.sqlite3");
+        // The replica holds the file the way activation leaves it.
+        let _replica = cello_ltx::Db::open(&facet_path).expect("replica open");
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = ["Child:a", "Child:b"]
+                .into_iter()
+                .map(|cell| {
+                    scope.spawn(|| {
+                        let cells = Cells::default();
+                        let _installed = cells.install();
+                        let parent = StorageIdentity {
+                            root_path: root_path.to_str().expect("utf-8").to_string(),
+                            root_scope: "Root:test".to_string(),
+                            facet_path: vec![],
+                            epoch: 1,
+                            root_position: 0,
+                            root_observed: None,
+                        };
+                        barrier.wait();
+                        open_embedded(
+                            cell,
+                            &parent,
+                            "child",
+                            &facet_path,
+                            crate::engine_api::Compat::default(),
+                        )
+                        .map_err(|error| format!("{error:#}"))
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle
+                    .join()
+                    .expect("join")
+                    .expect("both first opens succeed");
+            }
+        });
+        // Exactly one thread imported: the keyless log holds one copy.
+        let connection = Connection::open(&facet_path).expect("reopen");
+        assert_eq!(
+            table_rows(&connection, "items"),
+            vec![(5, "a1".to_string()), (9, "a2".to_string())]
+        );
+        let logs: i64 = connection
+            .query_row("SELECT COUNT(*) FROM log", [], |row| row.get(0))
+            .expect("log count");
+        assert_eq!(logs, 2, "one import, not two");
+        // A third open finds the import decided.
+        let cells = Cells::default();
+        let _installed = cells.install();
+        let parent = StorageIdentity {
+            root_path: root_path.to_str().expect("utf-8").to_string(),
+            root_scope: "Root:test".to_string(),
+            facet_path: vec![],
+            epoch: 1,
+            root_position: 0,
+            root_observed: None,
+        };
+        open_embedded(
+            "Child:c",
+            &parent,
+            "child",
+            &facet_path,
+            crate::engine_api::Compat::default(),
+        )
+        .expect("decided reopen succeeds");
     }
 }
 

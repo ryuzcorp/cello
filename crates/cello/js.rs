@@ -9989,7 +9989,7 @@ async fn prepare_facet(host: FacetHost, start: FacetStart) -> Result<LoadedFacet
                     start.props_sc,
                     file,
                 )
-                .map_err(|error| format!("{error}"))
+                .map_err(|error| format!("{error:#}"))
         })
         .await
         .map_err(|error| format!("worker loader facet: {error}"))?;
