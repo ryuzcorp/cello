@@ -287,9 +287,10 @@ fn adopted_outbound_cancels_with_adopting_event() {
         result.starts_with("cancelled:"),
         "adopted fetch was not cancelled with its adopter: {result}"
     );
-
-    // The cell still serves: dropping the adopted op wedged nothing.
-    let again = run_leg(&node, "/self?how=storage&name=safter", false, "safter");
+    // The cell still serves: dropping the adopted op wedged nothing. The
+    // control runs in the cancelled cell itself, so it proves the cell
+    // that held the adopted fetch is usable afterwards.
+    let again = run_leg(&node, "/self?how=storage&name=wcancel", false, "wcancel");
     assert_eq!(again, "ok stored", "{again}");
 }
 
